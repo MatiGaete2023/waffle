@@ -2286,7 +2286,7 @@ mod pruebas_interfaz {
             medidas: vec![flow_rust::descargador::TODAS_LAS_MEDIDAS.into()],
             ..Default::default()
         };
-        let mut flujo = Flujo {
+        let flujo = Flujo {
             por_hoja: true,
             resultados: vec![
                 serde_json::json!({"path": "C:/destino/Paquete CSMP A/Captura_CSMP.zip", "partial": false}),

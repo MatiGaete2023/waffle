@@ -548,17 +548,7 @@ fn enumerar(s: &mut Sesion<'_>, catalogo: &Catalogo, perfil: &Perfil, fechas: Op
             })
             .ok_or("El formulario no entregó parámetros válidos.".to_string())?;
         consulta.validar_consulta(&pares)?;
-        let campo = |k: &str| pares.iter().find(|(c, _)| c == k).map(|(_, v)| v.as_str());
-        if campo("FLG_Consulta") != Some(if fechas.is_some() { "1" } else { "0" }) {
-            return Err(Detencion::Consulta("El filtro de fechas no coincide.".into()));
-        }
-        if let Some((a, b)) = fechas {
-            if campo("FEC_Inicio") != Some(a.format("%d/%m/%Y").to_string().as_str())
-                || campo("FEC_Fin") != Some(b.format("%d/%m/%Y").to_string().as_str())
-                || campo("CHK_Consulta") != Some("on") {
-                return Err(Detencion::Consulta("Las fechas enviadas no coinciden con la selección.".into()));
-            }
-        }
+        lote::validar_fechas_formulario(&pares, fechas).map_err(Detencion::Consulta)?;
         let html = lote::cuerpo(&s.pedir("search", json!({"pairs": pares, "timeout": ESPERA_MS}))?, false)?;
         let primera = match sitfa::validar_respuesta(&html, &pares, &consulta, None)? {
             Respuesta::SinRegistros => {
@@ -1732,5 +1722,138 @@ mod tests {
         assert_eq!(escenarios.len(), 21, "el fixture cambió de tamaño: regenerar y revisar");
         assert_eq!(escenarios.iter().filter(|e| e.get("paquete").is_some()).count(), 5);
         assert!(fallos.is_empty(), "{} escenarios difieren de Flow Python", fallos.len());
+    }
+
+    #[test]
+    fn bitacoras_acepta_rango_valido_y_detiene_busqueda_ante_cada_discrepancia_de_fechas() {
+        let datos: Value = serde_json::from_str(include_str!("../../tests/datos/bitacoras.json")).unwrap();
+        let catalogo: Catalogo = serde_json::from_value(datos["catalogo"].clone()).unwrap();
+        let basico = datos["escenarios"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["escenario"] == "basico")
+            .unwrap();
+        let lista = |k: &str| -> Vec<String> { serde_json::from_value(basico["lote"][k].clone()).unwrap() };
+        let pasos_base = basico["guion"].as_array().unwrap();
+        let prepare_base = pasos_base.iter().find(|p| p["comando"] == "prepare").unwrap();
+        let d1 = NaiveDate::from_ymd_opt(2099, 3, 1).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2099, 3, 31).unwrap();
+
+        let ajustar_pares = |flg: Option<&str>, chk: Option<&str>, ini: Option<&str>, fin: Option<&str>| -> Value {
+            let mut pares: Vec<Value> = prepare_base["respuesta"]["pairs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|par| {
+                    !matches!(
+                        par.as_array().and_then(|a| a.first()).and_then(Value::as_str),
+                        Some("FLG_Consulta" | "CHK_Consulta" | "FEC_Inicio" | "FEC_Fin")
+                    )
+                })
+                .cloned()
+                .collect();
+            for (k, v) in [("FLG_Consulta", flg), ("CHK_Consulta", chk), ("FEC_Inicio", ini), ("FEC_Fin", fin)] {
+                if let Some(v) = v {
+                    pares.push(json!([k, v]));
+                }
+            }
+            Value::Array(pares)
+        };
+
+        let hacer_lote = |fechas: Option<(NaiveDate, NaiveDate)>| LoteBitacoras {
+            tribunales: lista("tribunales"),
+            modalidades: lista("modalidades"),
+            pestanas: lista("pestanas"),
+            fechas,
+        };
+
+        // 1) Rango correcto: avanza hasta search, completa y persiste el rango recuperable por guardado()
+        let pasos_ok: Vec<Value> = pasos_base
+            .iter()
+            .map(|p| {
+                let mut copia = p.clone();
+                if copia["comando"] == "prepare" {
+                    copia["respuesta"]["pairs"] = ajustar_pares(Some("1"), Some("on"), Some("01/03/2099"), Some("31/03/2099"));
+                }
+                copia
+            })
+            .collect();
+        let guion_ok = Guion { pasos: pasos_ok, pedidos: RefCell::default() };
+        let destino_ok = std::env::temp_dir().join(format!("flow-bit-fechas-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&destino_ok);
+        let r_ok = ejecutar_con_avance(
+            &guion_ok,
+            &catalogo,
+            &hacer_lote(Some((d1, d2))),
+            &destino_ok,
+            &Opciones { ahora: Some(chrono::DateTime::parse_from_rfc3339(basico["ahora"].as_str().unwrap()).unwrap()), ..Default::default() },
+            &AtomicBool::new(false),
+            &|_, _| {},
+        )
+        .unwrap();
+        assert_eq!(r_ok["estado"], "COMPLETA");
+        assert_eq!(r_ok["consultas_fallidas"], 0);
+        assert!(guion_ok.pedidos.borrow().iter().any(|p| p["comando"] == "search"));
+        let recuperado = LoteBitacoras::guardado(Path::new(r_ok["folder"].as_str().unwrap())).unwrap();
+        assert_eq!(recuperado.fechas, Some((d1, d2)));
+        let _ = std::fs::remove_dir_all(&destino_ok);
+
+        // 2) Cada discrepancia impide iniciar search y registra el campo exacto en el detalle de error
+        let casos_malos: [(&str, Option<(NaiveDate, NaiveDate)>, Option<&str>, Option<&str>, Option<&str>, Option<&str>, &str); 6] = [
+            ("flg_malo", Some((d1, d2)), Some("0"), Some("on"), Some("01/03/2099"), Some("31/03/2099"), "FLG_Consulta"),
+            ("chk_inactiva", Some((d1, d2)), Some("1"), None, Some("01/03/2099"), Some("31/03/2099"), "CHK_Consulta"),
+            ("ini_distinta", Some((d1, d2)), Some("1"), Some("on"), Some("02/03/2099"), Some("31/03/2099"), "FEC_Inicio"),
+            ("fin_distinta", Some((d1, d2)), Some("1"), Some("on"), Some("01/03/2099"), Some("30/03/2099"), "FEC_Fin"),
+            ("todas_flg_activo", None, Some("1"), None, None, None, "FLG_Consulta"),
+            ("todas_chk_activo", None, Some("0"), Some("on"), None, None, "CHK_Consulta"),
+        ];
+        for (etiqueta, fechas, flg, chk, ini, fin, campo_esperado) in casos_malos {
+            let guion = Guion {
+                pasos: vec![
+                    pasos_base[0].clone(),
+                    pasos_base[1].clone(),
+                    json!({"comando": "prepare", "respuesta": {"pairs": ajustar_pares(flg, chk, ini, fin)}}),
+                    json!({"comando": "unlock", "respuesta": {"restored": true}}),
+                ],
+                pedidos: RefCell::default(),
+            };
+            let destino = std::env::temp_dir().join(format!("flow-bit-fechas-{etiqueta}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&destino);
+            let r = ejecutar_con_avance(
+                &guion,
+                &catalogo,
+                &hacer_lote(fechas),
+                &destino,
+                &Opciones::default(),
+                &AtomicBool::new(false),
+                &|_, _| {},
+            )
+            .unwrap();
+            let _ = std::fs::remove_dir_all(&destino);
+            assert_eq!(r["consultas_fallidas"], 1, "{etiqueta}: debió fallar la consulta");
+            let detalle = r["detalle"].as_str().unwrap_or("");
+            assert!(detalle.contains(campo_esperado), "{etiqueta}: esperaba {campo_esperado}, obtuvo {detalle}");
+            assert!(
+                guion.pedidos.borrow().iter().all(|p| p["comando"] != "search"),
+                "{etiqueta}: no debía iniciar search"
+            );
+        }
+
+        // 3) Rango invertido se rechaza antes de consultar el puente
+        let guion_inv = Guion { pasos: vec![], pedidos: RefCell::default() };
+        let destino_inv = std::env::temp_dir().join(format!("flow-bit-fechas-inv-{}", std::process::id()));
+        let err_inv = ejecutar_con_avance(
+            &guion_inv,
+            &catalogo,
+            &hacer_lote(Some((d2, d1))),
+            &destino_inv,
+            &Opciones::default(),
+            &AtomicBool::new(false),
+            &|_, _| {},
+        )
+        .unwrap_err();
+        assert!(err_inv.contains("rango"), "{err_inv}");
+        assert!(guion_inv.pedidos.borrow().is_empty());
     }
 }
