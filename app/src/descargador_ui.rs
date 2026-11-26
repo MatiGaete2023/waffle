@@ -566,7 +566,6 @@ enum Trabajo {
 /// E-Q6 · Lecturas de contexto del lote (Integral, Seguimiento) y paquete del Asistente: `start_diary` y
 /// `create_package` de Flow Python. Lee con la sesión del usuario a través de la extensión; nada se escribe en SITFA.
 struct Contexto {
-    reutilizar: bool,
     rapido: preferencias::Rapido,
     calendarios: bool,
     historia: bool,
@@ -590,7 +589,6 @@ struct Contexto {
 impl Contexto {
     fn desde(p: &Preferencias) -> Self {
         Self {
-            reutilizar: false,
             rapido: p.rapido.limitado(),
             calendarios: p.leer_calendarios,
             historia: p.leer_historia,
@@ -1013,10 +1011,11 @@ impl Ejecucion {
         let conservar = lote::conservar_filtros(self.conservar_filtros, catalogo.pantalla);
         let pausa = preferencias::limitar_pausa(f64::from(self.pausa));
         self.pausa = pausa as f32;
+        let pausa_base = Duration::from_secs_f64(pausa);
         let opciones = Opciones {
             conservar_filtros: conservar,
             evidencia: self.evidencia,
-            pausa: Duration::from_secs_f64(pausa),
+            pausa: if edicion == Edicion::Integral { self.contexto.rapido.pausa_lote(pausa_base) } else { pausa_base },
         };
         let mut guardar = Preferencias::cargar(&Preferencias::ruta());
         guardar.destino = self.destino.trim().to_owned();
@@ -1546,18 +1545,31 @@ impl Descargador {
                                 None => plan_visible,
                             };
                             let previo = self.ejecucion.contexto.rapido;
+                            let ext_rapida = self.conexion.puente.as_ref().is_some_and(|p| p.soporta_rapido());
                             ui.add_enabled_ui(!ejecutando && self.edicion == Edicion::Integral, |ui| {
                                 let rapido = &mut self.ejecucion.contexto.rapido;
                                 ui.checkbox(&mut rapido.activado, "Modo Rápido Seguro (pausa adaptativa + tope 2–3)");
                                 if rapido.activado {
                                     ui.horizontal_wrapped(|ui| {
                                         ui.label("Pausa sana (ms)");
-                                        ui.add(egui::DragValue::new(&mut rapido.pausa_ms).range(200..=350));
+                                        ui.add(egui::DragValue::new(&mut rapido.pausa_ms).range(150..=350));
                                         ui.label("Máximo de lecturas simultáneas");
                                         for n in 1..=3 { ui.selectable_value(&mut rapido.concurrencia, n, n.to_string()); }
                                     });
+                                    if conectado && !ext_rapida {
+                                        ui.label(
+                                            RichText::new("Aviso: Chrome sigue usando la extensión 2.9.0 y el Modo Rápido quedará desactivado. Pulsa «Instalar extensión…» y recárgala (2.10.0) en chrome://extensions.")
+                                                .color(p.amber)
+                                                .strong(),
+                                        );
+                                    } else if conectado && ext_rapida {
+                                        ui.label(
+                                            RichText::new("Extensión Integral 2.10.0 activa · Modo Rápido listo.")
+                                                .color(p.green),
+                                        );
+                                    }
                                 }
-                                ui.label("Protección de sesión SITFA: aumenta la pausa ante lentitud y reduce a una lectura ante fallas. Requiere recargar la extensión Integral actualizada.");
+                                ui.label("Protección de sesión SITFA: aumenta la pausa ante lentitud real y reduce a una lectura ante fallas. Requiere la extensión Integral 2.10.0 recargada en Chrome.");
                             });
                             if previo != self.ejecucion.contexto.rapido {
                                 self.ejecucion.contexto.rapido = self.ejecucion.contexto.rapido.limitado();
@@ -2121,7 +2133,7 @@ mod pruebas_interfaz {
         h.run();
         // Flow Rust exige lecturas frescas por lote; calendario, historia e histórico no; 4 meses.
         let c = &h.state().contexto;
-        assert_eq!((c.reutilizar, c.calendarios, c.historia, c.historico, c.historia_en_paquete, c.meses, c.consolidado),
+        assert_eq!((c.rapido.activado, c.calendarios, c.historia, c.historico, c.historia_en_paquete, c.meses, c.consolidado),
                    (false, false, false, false, true, 4, true));
         assert!(h.query_by_label("Historia en el paquete").is_none(), "«Historia en el paquete» solo con la historia elegida");
         h.get_by_label("Historia de la causa (prueba)").click();

@@ -16,6 +16,12 @@ Una entrada por encargo, de diez líneas como máximo, la más reciente arriba:
 
 No se copian salidas completas ni listas de mutaciones: la prueba afirma sus conteos y la CI del commit es la evidencia.
 
+## 2026-11-26 · E-P2-OPT: calibración real de Modo Rápido Seguro, aviso extensión 2.10.0 y limpieza de rendimiento/clippy (Orquestador)
+- Cambió: `descargador/{preferencias.rs,bitacoras.rs,flujo_paquete.rs,puente.rs}`, `descargador.rs`, `descargador_ui.rs`, `descargador_resultados_ui.rs`, `lectura.rs`, `sincronizar.rs`, `captura_trabajo.rs`, `producto_excel.rs`, `productos.rs`, `trabajo.rs`, `ui.rs`, `util.rs`, `rust/crates/flow-meta4/src/plantilla.rs`.
+- Acredita: habilita concurrencia 2–3 de bitácoras también con `calendarios`/`historico` activos, calibra `PausaAdaptativa` para latencia real de SITFA (arranca en 150–350 ms con tope 2–3; solo frena en ≥ 4 s / ≥ 8 s o fallas), aplica pausa rápida en listados/informes, avisa en UI y evento `warning` si Chrome sigue en extensión `2.9.0`, elimina recompilación de `Regex` por celda HTML en `lectura.rs` y limpia advertencias de clippy; suite Linux completa y 6 verificadores PASA.
+- Diferencias declaradas: ninguna adicional sobre el contrato Python (Modo Rápido sigue siendo opt-in, solo lectura y sin caché entre lotes del día).
+- Pendiente: CI Windows en `waffle` y nueva medición real con extensión `2.10.0` recargada (no `ACEPTADO`).
+
 ## 2026-11-26 · E-P1-C2: puente HTTP chunked/acotado, extensión 2.10.0, Modo Rápido Seguro V-01..V-04 y display (Agente C · ChatGPT)
 - Cambió: `descargador/{puente.rs,extension.rs,preferencias.rs,bitacoras.rs,historia.rs,flujo_paquete.rs}`, nueva extensión propia `descargador/extension_integral/*` (2.10.0), `descargador_ui.rs`, `descargador_resultados_ui.rs`, `meta4_ui.rs` e informe `AGENTE_C_20261126_puente_rapido_display.md`.
 - Acredita: lector HTTP loopback con `chunked`, presupuestos diferenciados (256 KiB control / 112 MiB datos), timeouts y recuperación de `Mutex`; índice DOM por página (`V-01`), pipelining local (`V-02`), pausa adaptativa (`V-03`) y concurrencia acotada 1–3 con degradación (`V-04`), sin reutilización entre lotes del día; Descargador en 3 pasos + Dos Calendarios + índice de Resultados en memoria; suite Linux y 6 verificadores PASA.

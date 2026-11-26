@@ -396,10 +396,15 @@ pub fn ejecutar_con_avance(
         let version = s.pedir("capabilities", json!({}))?;
         super::comprobar_extension(Edicion::Integral, &version)?;
         // Una extensión antigua usa el contrato conservador, incluso si quedó marcada la preferencia rápida.
-        let config = if version["flow_rust_rapido"] == 1 && version["flow_rust_version"] == "2.10.0" { opciones.rapido.limitado() } else { Rapido::default() };
-        s.control_pausa.set(PausaAdaptativa::nueva(opciones.pausa, config));
-        s.rapido = config.activado && opciones.retomar.is_none() && !opciones.calendarios && !opciones.historico;
         let propia = version["flow_rust_version"] == "2.10.0" && version["flow_rust_rapido"] == 1;
+        let config = if propia { opciones.rapido.limitado() } else { Rapido::default() };
+        if opciones.rapido.activado && !propia {
+            (s.avance)("warning", json!(
+                "Modo Rápido desactivado: Chrome aún usa la extensión 2.9.0. Pulsa «Instalar extensión…» y recárgala (2.10.0) en chrome://extensions."
+            ));
+        }
+        s.control_pausa.set(PausaAdaptativa::nueva(opciones.pausa, config));
+        s.rapido = config.activado && opciones.retomar.is_none();
         if propia { s.estado["origen"]["version"] = json!("2.10.0"); }
         if let Some(h) = s.historia.as_mut() { h.configurar_rapido(config, propia); }
         conexion.habilitar_lecturas(true);
@@ -1533,6 +1538,51 @@ mod tests {
             salidas.push((s.estado.clone(), huellas));
         }
         assert_eq!(salidas[0], salidas[1]);
+        std::fs::remove_dir_all(raiz).unwrap();
+    }
+
+    #[test]
+    fn modo_rapido_avisa_en_29_y_activa_en_210_con_calendarios() {
+        let datos: Value = serde_json::from_str(include_str!("../../tests/datos/bitacoras.json")).unwrap();
+        let caso = datos["escenarios"].as_array().unwrap().iter().find(|e| e["escenario"] == "calendario").unwrap();
+        let catalogo: Catalogo = serde_json::from_value(datos["catalogo"].clone()).unwrap();
+        let lista = |k: &str| -> Vec<String> { serde_json::from_value(caso["lote"][k].clone()).unwrap() };
+        let lote = LoteBitacoras { tribunales: lista("tribunales"), modalidades: lista("modalidades"), pestanas: lista("pestanas"), fechas: None };
+        let ahora = chrono::DateTime::parse_from_rfc3339(caso["ahora"].as_str().unwrap()).unwrap();
+        let mut sal = [0u8; 8]; getrandom::fill(&mut sal).unwrap();
+        let raiz = std::env::temp_dir().join(format!("flow-rapido-ext-{}", sal.iter().map(|b| format!("{b:02x}")).collect::<String>()));
+        std::fs::create_dir(&raiz).unwrap();
+        // 1) Extensión 2.9.0 con Modo Rápido marcado: emite aviso explícito y conserva versión 2.9.0.
+        let d29 = raiz.join("ext29"); std::fs::create_dir(&d29).unwrap();
+        let guion29 = Guion { pasos: caso["guion"].as_array().unwrap().clone(), pedidos: RefCell::default() };
+        let avisos29 = RefCell::new(Vec::<String>::new());
+        let op = Opciones {
+            pausa: Duration::ZERO,
+            rapido: Rapido { activado: true, pausa_ms: 200, concurrencia: 3 },
+            calendarios: true,
+            historico: false,
+            ahora: Some(ahora),
+            ..Default::default()
+        };
+        let r29 = ejecutar_con_avance(&guion29, &catalogo, &lote, &d29, &op, &AtomicBool::new(false), &|n, v| {
+            if n == "warning" { avisos29.borrow_mut().push(v.as_str().unwrap_or("").to_string()); }
+        }).unwrap();
+        assert_eq!(r29["estado"], "COMPLETA");
+        assert!(avisos29.borrow().iter().any(|a| a.contains("2.9.0") && a.contains("2.10.0")), "avisos: {:?}", avisos29.borrow());
+        // 2) Extensión 2.10.0 con Modo Rápido + calendarios activos: sin aviso 2.9.0 y registra distribución 2.10.0.
+        let mut pasos210 = caso["guion"].as_array().unwrap().clone();
+        pasos210[0]["respuesta"]["flow_rust_rapido"] = json!(1);
+        pasos210[0]["respuesta"]["flow_rust_version"] = json!("2.10.0");
+        let d210 = raiz.join("ext210"); std::fs::create_dir(&d210).unwrap();
+        let guion210 = Guion { pasos: pasos210, pedidos: RefCell::default() };
+        let avisos210 = RefCell::new(Vec::<String>::new());
+        let r210 = ejecutar_con_avance(&guion210, &catalogo, &lote, &d210, &op, &AtomicBool::new(false), &|n, v| {
+            if n == "warning" { avisos210.borrow_mut().push(v.as_str().unwrap_or("").to_string()); }
+        }).unwrap();
+        assert_eq!(r210["estado"], "COMPLETA");
+        assert!(avisos210.borrow().iter().all(|a| !a.contains("2.9.0")), "avisos inesperados: {:?}", avisos210.borrow());
+        let m210: Value = serde_json::from_slice(&std::fs::read(r210["manifest"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(m210["origen"]["version"], "2.10.0");
         std::fs::remove_dir_all(raiz).unwrap();
     }
 

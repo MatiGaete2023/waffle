@@ -6,19 +6,14 @@ use std::sync::OnceLock;
 use unicode_normalization::UnicodeNormalization;
 
 /// Valor de una celda ya leído del libro.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Cell {
+    #[default]
     Empty,
     Text(String),
     Number(f64),
     Date(NaiveDate),
     Bool(bool),
-}
-
-impl Default for Cell {
-    fn default() -> Self {
-        Cell::Empty
-    }
 }
 
 impl Cell {

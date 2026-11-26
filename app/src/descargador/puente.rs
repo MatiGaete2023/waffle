@@ -233,6 +233,8 @@ struct Estado {
     cerrado: AtomicBool,
     /// La última verificación de la extensión fue Integral: habilita `LECTURAS_INTEGRAL`.
     integral: AtomicBool,
+    /// La extensión Integral conectada anuncia soporte `flow_rust_rapido` (2.10.0).
+    rapido_ext: AtomicBool,
 }
 
 pub struct Puente {
@@ -445,6 +447,7 @@ impl Puente {
             visto: Mutex::new(None),
             cerrado: AtomicBool::new(false),
             integral: AtomicBool::new(false),
+            rapido_ext: AtomicBool::new(false),
         });
         // Tres peticiones de trabajo como máximo, más polls y control; número fijo de hilos.
         let servidor = Arc::new(servidor);
@@ -466,13 +469,27 @@ impl Puente {
 
     /// Configura el tope para la próxima operación. Una degradación por fallas dura hasta reconectar.
     pub fn configurar_concurrencia(&self, maximo: usize) {
-        tomar(&self.estado.despacho).configurado = maximo.clamp(1, MAX_EN_VUELO);
-        self.estado.hay_tarea.notify_all();
+        let nuevo = maximo.clamp(1, MAX_EN_VUELO);
+        let mut d = tomar(&self.estado.despacho);
+        if d.configurado != nuevo {
+            d.configurado = nuevo;
+            drop(d);
+            self.estado.hay_tarea.notify_all();
+        }
     }
 
     /// La extensión verificada es Integral (habilita las lecturas de contexto) o no (Lite, o verificación fallida).
     pub(super) fn habilitar_lecturas(&self, integral: bool) {
         self.estado.integral.store(integral, Ordering::SeqCst);
+    }
+
+    pub(super) fn registrar_rapido(&self, soportado: bool) {
+        self.estado.rapido_ext.store(soportado, Ordering::SeqCst);
+    }
+
+    /// La extensión Integral conectada es 2.10.0 con soporte para Modo Rápido Seguro.
+    pub fn soporta_rapido(&self) -> bool {
+        self.estado.rapido_ext.load(Ordering::SeqCst)
     }
 
     #[cfg(test)]

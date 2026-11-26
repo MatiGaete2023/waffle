@@ -623,7 +623,7 @@ fn correr(
             if let Some(carpetas) = estado["carpetas"].as_object_mut() {
                 carpetas.remove("consultas");
             }
-            let opciones_lote = OpcionesLote { conservar_filtros: false, evidencia: op.pdf_vacias, pausa: op.pausa };
+            let opciones_lote = OpcionesLote { conservar_filtros: false, evidencia: op.pdf_vacias, pausa: op.rapido.pausa_lote(op.pausa) };
             let mut carpeta = None;
             let mut relé = |evento: EventoLote| match evento {
                 EventoLote::Carpeta(c) => carpeta = Some(c),
@@ -872,7 +872,7 @@ fn informes(
             estado["fase"] = json!(nombre);
             escribir_control(control, estado)?;
             let plan = plan_calendario(&catalogo, alcance, mes, anio, edicion)?;
-            let opciones_lote = OpcionesLote { conservar_filtros: false, evidencia: opciones.pdf_vacias, pausa: opciones.pausa };
+            let opciones_lote = OpcionesLote { conservar_filtros: false, evidencia: opciones.pdf_vacias, pausa: opciones.rapido.pausa_lote(opciones.pausa) };
             let mut carpeta = None;
             let mut relé = |evento: EventoLote| match evento {
                 EventoLote::Carpeta(c) => carpeta = Some(c),

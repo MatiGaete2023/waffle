@@ -471,7 +471,7 @@ pub fn leer_historico(datos: &[u8], fuente: &str, capturada: &str, persona_esper
             let originales: Vec<String> = celdas(*fila).iter().map(|e| texto(*e)).collect();
             let cabecera: Vec<String> = originales.iter().map(|h| normalizar(h)).collect();
             if egreso.iter().all(|e| cabecera.contains(e)) && programas.iter().any(|p| cabecera.contains(p)) {
-                let previo = titulos.iter().filter(|(idx, _)| *idx < orden[&fila.id()]).next_back();
+                let previo = titulos.iter().rfind(|(idx, _)| *idx < orden[&fila.id()]);
                 if !titulos.is_empty() && !previo.is_some_and(|(_, es)| *es) {
                     break; // tabla de otro historial (LRPA)
                 }

@@ -430,7 +430,7 @@ fn b64_lines(data: &[u8]) -> String {
 /// Guarda el borrador como .eml sin enviar (Outlook lo abre como correo nuevo, listo para revisar).
 /// El CC obligatorio siempre va. Devuelve la ruta del .eml.
 pub fn guardar_eml(b: &Borrador, dir: &Path) -> Result<PathBuf, String> {
-    if b.adjunto_obligatorio && b.nomina.as_ref().map_or(true, |n| !n.incluir.iter().any(|x| *x)) {
+    if b.adjunto_obligatorio && b.nomina.as_ref().is_none_or(|n| !n.incluir.iter().any(|x| *x)) {
         return Err(format!("«{}» necesita una nómina con al menos una fila.", b.titulo));
     }
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;

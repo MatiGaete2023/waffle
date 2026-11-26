@@ -198,7 +198,9 @@ fn fila_numero(ref_celda: &str) -> Option<usize> {
     ref_celda.bytes().skip_while(|b| b.is_ascii_alphabetic())
         .map(char::from).collect::<String>().parse::<usize>().ok().filter(|n| (1..=1_048_576).contains(n))
 }
-fn analizar_celdas(xml: &str) -> Result<(BTreeMap<(usize, usize), usize>, BTreeMap<usize, String>), String> {
+type CeldasAnalizadas = (BTreeMap<(usize, usize), usize>, BTreeMap<usize, String>);
+
+fn analizar_celdas(xml: &str) -> Result<CeldasAnalizadas, String> {
     let mut estilos = BTreeMap::new();
     let mut alturas = BTreeMap::new();
     let mut lector = Reader::from_str(xml);
@@ -248,8 +250,8 @@ fn muestra(hoja: &Hoja, xml: &str) -> Result<Muestra, String> {
     let mut e = [[0usize; 8]; 7];
     let mut h: [Option<String>; 7] = std::array::from_fn(|_| None);
     for (papel, numero) in filas.into_iter().enumerate() {
-        for col in 0..8 {
-            e[papel][col] = *estilos.get(&(numero, col)).unwrap_or(&0);
+        for (col, celda) in e[papel].iter_mut().enumerate() {
+            *celda = *estilos.get(&(numero, col)).unwrap_or(&0);
         }
         h[papel] = alturas.get(&numero).cloned();
     }
@@ -468,7 +470,7 @@ pub fn aplicar(plantilla: &Path, generado: &Path) -> Result<(), String> {
         muestras.insert(hoja.to_string(), muestra(contenido, &xml)?);
     }
     let mut fechas = BTreeSet::new();
-    for m in muestras.values() { fechas.extend(m.estilo[4].into_iter()); }
+    for m in muestras.values() { fechas.extend(m.estilo[4]); }
     let (estilos, fecha_ids) = estilos_con_fecha(&zip_leer(&mut zip, "xl/styles.xml")?, &fechas)?;
     let tema = zip.by_name("xl/theme/theme1.xml").ok().map(|e| leer_acotado(e, LIMITE_XML)).transpose()?;
 

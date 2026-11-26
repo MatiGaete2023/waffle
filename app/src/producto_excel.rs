@@ -303,7 +303,7 @@ pub fn hoja_datos(nombre: &str, h: &[String], datos: &[Vec<Cell>], excluidas: &[
         for (c, v) in fila.iter().enumerate() {
             let c = c as u16;
             if *excluido {
-                ws.write_string_with_format(n, c, &v.display(), &f.exclusion).map_err(err)?;
+                ws.write_string_with_format(n, c, v.display(), &f.exclusion).map_err(err)?;
                 continue;
             }
             match v {
@@ -327,11 +327,11 @@ pub fn hoja_datos(nombre: &str, h: &[String], datos: &[Vec<Cell>], excluidas: &[
         ws.set_freeze_panes(1, 0).map_err(err)?;
     }
     for oculta in ["NURUS_REGLAS", "NURUS_DECISIONES"] {
-        if let Some(i) = pos(&h, oculta) {
+        if let Some(i) = pos(h, oculta) {
             ws.set_column_hidden(i as u16).map_err(err)?;
         }
     }
-    if let (Some(i), true) = (pos(&h, "RES"), !datos.is_empty()) {
+    if let (Some(i), true) = (pos(h, "RES"), !datos.is_empty()) {
         let lista = DataValidation::new()
             .allow_list_strings(&TIPOS_RES)
             .map_err(err)?

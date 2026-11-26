@@ -122,7 +122,7 @@ fn libro_conjunto(carpeta: &Path, datos: &Value) -> Result<Option<PathBuf>, Stri
 /// Lo que `load` hace en el hilo: el lote verificado y, por consulta, su aptitud para CSMP.
 fn detalles(lote: &Lote) -> Result<Vec<Detalle>, String> {
     let mut aptitudes: Vec<(String, Vec<String>)> = Vec::new();
-    for t in resultados::tablas(&lote)? {
+    for t in resultados::tablas(lote)? {
         let r = resultados::compatibilidad(&t.cabecera, &t.seleccion, &t.filas)?;
         let faltan: Vec<&str> = r["faltan"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
         let texto = format!(
@@ -484,23 +484,23 @@ impl Resultados {
                     ui.label("La consulta de resoluciones firmadas se retiró de la descarga conjunta. No se acredita ausencia de movimientos.");
                     if let Some(fases) = datos["fases"].as_object() {
                         for (nombre, fase) in fases {
-                            if ui.button(format!("{} · {}", nombre, fase["estado"].as_str().unwrap_or(""))).clicked() {
-                                if fase["carpeta"].as_str().is_some_and(|s| !s.is_empty()) {
-                                    match archivo_local::ruta_fase(&carpeta, &fase["carpeta"]) {
-                                        Ok(ruta) => crate::ui::abrir_en_sistema(&ruta),
-                                        Err(error) => self.estado = Some(Err(error)),
-                                    }
+                            if ui.button(format!("{} · {}", nombre, fase["estado"].as_str().unwrap_or(""))).clicked()
+                                && fase["carpeta"].as_str().is_some_and(|s| !s.is_empty())
+                            {
+                                match archivo_local::ruta_fase(&carpeta, &fase["carpeta"]) {
+                                    Ok(ruta) => crate::ui::abrir_en_sistema(&ruta),
+                                    Err(error) => self.estado = Some(Err(error)),
                                 }
                             }
                         }
                     }
-                    if datos["archivo"].as_str().is_some_and(|s| !s.is_empty()) {
-                        if ui.button("Abrir libro para CSMP").clicked() {
-                            match libro_conjunto(&carpeta, &datos) {
-                                Ok(Some(ruta)) => crate::ui::abrir_en_sistema(&ruta),
-                                Ok(None) => {},
-                                Err(error) => self.estado = Some(Err(error)),
-                            }
+                    if datos["archivo"].as_str().is_some_and(|s| !s.is_empty())
+                        && ui.button("Abrir libro para CSMP").clicked()
+                    {
+                        match libro_conjunto(&carpeta, &datos) {
+                            Ok(Some(ruta)) => crate::ui::abrir_en_sistema(&ruta),
+                            Ok(None) => {},
+                            Err(error) => self.estado = Some(Err(error)),
                         }
                     }
                     if ui.button("Abrir carpeta").clicked() { crate::ui::abrir_en_sistema(&carpeta); }

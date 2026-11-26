@@ -139,6 +139,7 @@ pub fn read_html(html: &str) -> Result<Vec<Sheet>, String> {
     static TABLE: OnceLock<Regex> = OnceLock::new();
     static TR: OnceLock<Regex> = OnceLock::new();
     static TD: OnceLock<Regex> = OnceLock::new();
+    static COLSPAN: OnceLock<Regex> = OnceLock::new();
     let mut total = 0usize;
     let mut out = Vec::new();
     if html.len() as u64 > MAX_ENTRADA { return Err("El HTML supera el límite de lectura.".into()); }
@@ -149,7 +150,7 @@ pub fn read_html(html: &str) -> Result<Vec<Sheet>, String> {
             let mut cells = Vec::new();
             for td in re(&TD, r#"(?is)<t([dh])([^>]*)>(.*?)</t[dh]>"#).captures_iter(&tr[1]) {
                 cells.push(text_cell(strip_tags(&td[3])));
-                if let Some(span) = Regex::new(r#"(?i)colspan\s*=\s*"?(\d+)"#).unwrap().captures(&td[2]) {
+                if let Some(span) = re(&COLSPAN, r#"(?i)colspan\s*=\s*"?(\d+)"#).captures(&td[2]) {
                     let k: usize = span[1].parse().unwrap_or(1);
                     for _ in 1..k.min(50) {
                         cells.push(Cell::Empty);
