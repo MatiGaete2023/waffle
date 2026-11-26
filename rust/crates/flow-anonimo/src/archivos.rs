@@ -92,6 +92,7 @@ fn validar_campos(r: &BTreeMap<String, String>) -> Result<(), String> {
             "origin_verified" | "history_complete" | "institutional_verified" | "recoverable" | "content_read" => {
                 ["true", "false"].contains(&v.as_str())
             }
+            "ownership" => ["VERIFICADA", "INCIERTA"].contains(&v.as_str()),
             "scope" => ["INGRESO", "CAUSA"].contains(&v.as_str()),
             "time_precision" => ["DIA", "MINUTO", "SEGUNDO", "DESCONOCIDA"].contains(&v.as_str()),
             "expected_pages" | "saved_pages" | "original_row" => v.bytes().all(|b| b.is_ascii_digit()),
@@ -119,6 +120,8 @@ fn referencias(tablas: &BTreeMap<String, Filas>) -> Result<(), String> {
     let queries = ids("consultas", "query_id")?;
     let records = ids("registros", "record_id")?;
     let docs = ids("documentos", "document_id")?;
+    let escritos = ids("escritos", "escrito_id")?;
+    let historicos = ids("historico_proteccion", "historico_id")?;
     let mut events = ids("bitacoras", "event_id")?;
     for id in ids("historia_tramites", "event_id")? {
         if !events.insert(id) {
@@ -127,7 +130,8 @@ fn referencias(tablas: &BTreeMap<String, Filas>) -> Result<(), String> {
     }
     for (tabla, (_, rows)) in tablas {
         for r in rows {
-            for (key, set) in [("query_id", &queries), ("record_id", &records), ("parent_event_id", &events), ("document_id", &docs)] {
+            for (key, set) in [("query_id", &queries), ("record_id", &records), ("parent_event_id", &events), ("document_id", &docs),
+                ("escrito_id", &escritos), ("historico_id", &historicos)] {
                 if let Some(id) = r.get(key).filter(|s| !s.is_empty()) {
                     if !set.contains(id) {
                         return Err("Referencia de captura sin destino.".into());
@@ -148,15 +152,22 @@ pub fn leer(entries: Vec<(String, Vec<u8>)>, nivel: usize, presupuesto: &mut usi
         .and_then(|(_, r)| serde_json::from_slice::<Value>(r).ok())
         .filter(|m| m["schema_id"] == "CSMP_CAPTURE");
     if let Some(m) = manifest {
-        if !m["schema_version"].as_str().unwrap_or("").starts_with("1.")
-            || m["required_features"].as_array().is_some_and(|x| !x.is_empty())
+        let extendida = match m["schema_version"].as_str() {
+            Some("1.0.0" | "1.1.0") => false,
+            Some("1.2.0") => true,
+            _ => return Err("Versión de captura no admitida.".into()),
+        };
+        let admitida = |k: &str| CONTRATO["tablas"].get(k).is_some()
+            && (extendida || !matches!(k, "escritos" | "historico_proteccion"));
+        if m["required_features"].as_array().is_some_and(|x| !x.is_empty())
             || !m["table_states"].is_object()
         {
             return Err("Contrato de captura no admitido.".into());
         }
         let estados = m["table_states"].as_object().unwrap();
-        if estados.len() != CONTRATO["tablas"].as_object().unwrap().len()
-            || estados.iter().any(|(k, v)| CONTRATO["tablas"].get(k).is_none() || !estado(v.as_str().unwrap_or("")))
+        // El contrato enumera todos los estados, aunque las tablas no solicitadas no tengan CSV.
+        if estados.len() != (if extendida { 9 } else { 7 })
+            || estados.iter().any(|(k, v)| !admitida(k) || !estado(v.as_str().unwrap_or("")))
         {
             return Err("Estados de tablas de captura inválidos.".into());
         }
@@ -179,6 +190,7 @@ pub fn leer(entries: Vec<(String, Vec<u8>)>, nivel: usize, presupuesto: &mut usi
             match f["type"].as_str() {
                 Some("normalized_table") => {
                     let tipo = f["table"].as_str().ok_or("Tabla sin tipo.")?;
+                    if !admitida(tipo) { return Err("Tabla incompatible con la versión de captura.".into()); }
                     let t = tabla(raw, tipo)?;
                     for r in &t.1 {
                         validar_campos(r)?;
@@ -242,7 +254,7 @@ pub fn semillar(sesion: &mut Sesion, a: &Archivo) -> Result<(), String> {
                 for r in filas {
                     for (k, v) in r {
                         sesion.reservar(v);
-                        if k == "author" && !v.is_empty() {
+                        if (k == "author" || en("identidad", k)) && !v.is_empty() {
                             sesion.persona(v);
                         }
                         if k.ends_with("_json") {
@@ -311,7 +323,20 @@ fn campo(sesion: &mut Sesion, key: &str, value: &str, capture_id: &str, textos: 
         "capture_id" => capture_id.into(),
         "rit_original" => sesion.pseudo("rit", value),
         "author" => sesion.valor("Nombre", value)?,
-        "text" | "response" | "description" | "reference" | "message" | "error" => sesion.valor("observacion", value)?,
+        // La asociación debe sobrevivir con la misma identidad ficticia de ingreso.
+        "linked_ingreso_id" => sesion.token("ingreso_id", value),
+        _ if en("identidad", key) => sesion.pseudo("persona", value),
+        _ if en("token", key) => sesion.token(key, value),
+        _ if en("tiempo_literal", key) => {
+            if fecha_valida(value) || chrono::NaiveDate::parse_from_str(value, "%d-%m-%Y").is_ok()
+                || chrono::NaiveDate::parse_from_str(value, "%d/%m/%Y").is_ok() || value == "--" {
+                sesion.desplazar(value, false)
+            } else {
+                // La fuente puede entregar literales no interpretables; no conservar texto arbitrario.
+                String::new()
+            }
+        },
+        _ if en("libre", key) => sesion.valor("observacion", value)?,
         "source_sha256" | "sha256" => sesion.pseudo("hash", value),
         "original_file" | "original_sheet" | "local_file" => sesion.valor(key, value)?,
         _ if key.ends_with("_id") => sesion.token(key, value),
@@ -349,6 +374,42 @@ fn json_control(sesion: &mut Sesion, v: &Value, key: &str, filtros: bool, textos
         _ => formatos::json(sesion, v, key, 0, textos)?,
     })
 }
+// Los literales de Escritos/Histórico pueden contener identificadores numéricos cortos,
+// nombres y columnas libres. Solo conservar claves conocidas; tratar el resto como texto libre.
+fn json_extendido(sesion: &mut Sesion, v: &Value, key: &str, id: &str, textos: &mut Vec<(String, bool)>, nivel: usize) -> Result<Value, String> {
+    if nivel > 60 { return Err("JSON demasiado profundo.".into()); }
+    Ok(match v {
+        Value::Object(m) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in m {
+                let normal = k.trim().to_lowercase();
+                let campo_key = match normal.as_str() {
+                    "doc" | "documento" | "folio" => "doc",
+                    "solicitante" | "requester" => "requester",
+                    "tipo" | "tipo escrito" | "escrito_type" => "escrito_type",
+                    "estado" | "escrito_status" => "escrito_status",
+                    "programa" | "program_name" => "program_name",
+                    "fecha egreso" | "egreso_date" => "egreso_date",
+                    "causal egreso" | "egreso_cause" => "egreso_cause",
+                    "linked_ingreso_id" => "linked_ingreso_id",
+                    "linked_projection" => "linked_projection",
+                    "reference" => "reference",
+                    _ => "",
+                };
+                let mut nuevo = if campo_key.is_empty() { format!("campo_{}", out.len() + 1) } else { k.clone() };
+                while out.contains_key(&nuevo) { nuevo.push('_'); }
+                out.insert(nuevo, json_extendido(sesion, v, campo_key, id, textos, nivel + 1)?);
+            }
+            Value::Object(out)
+        }
+        Value::Array(xs) => Value::Array(xs.iter().map(|x| json_extendido(sesion, x, key, id, textos, nivel + 1)).collect::<Result<Vec<_>, _>>()?),
+        Value::String(s) if !key.is_empty() => Value::String(campo(sesion, key, s, id, textos)?),
+        Value::Number(n) if !key.is_empty() => Value::String(campo(sesion, key, &n.to_string(), id, textos)?),
+        Value::String(_) | Value::Number(_) => Value::String("[dato omitido]".into()),
+        otro => otro.clone(),
+    })
+}
+
 pub fn transformar(sesion: &mut Sesion, a: &Archivo, textos: &mut Vec<(String, bool)>) -> Result<Vec<u8>, String> {
     let previas = sesion.rutas.clone();
     let resultado = procesar(sesion, a, textos);
@@ -400,7 +461,12 @@ fn procesar(sesion: &mut Sesion, a: &Archivo, textos: &mut Vec<(String, bool)>) 
             for fila in filas {
                 let mut nueva = BTreeMap::new();
                 for (k, v) in fila {
-                    nueva.insert(k.clone(), campo(sesion, k, v, &id, textos)?);
+                    let valor = if matches!(tipo.as_str(), "escritos" | "historico_proteccion") && k == "raw_json" && !v.is_empty() {
+                        let raw: Value = serde_json::from_str(v).map_err(|_| "JSON de captura inválido.")?;
+                        serde_json::to_string(&json_extendido(sesion, &raw, "", &id, textos, 0)?)
+                            .map_err(|_| "No se pudo reconstruir JSON de captura.")?
+                    } else { campo(sesion, k, v, &id, textos)? };
+                    nueva.insert(k.clone(), valor);
                 }
                 if let Some(original) = fila.get("original_file").filter(|s| incluidos.contains_key(*s)) {
                     if let Some(Entrada::Excel(libro, ..)) =
@@ -435,7 +501,7 @@ fn procesar(sesion: &mut Sesion, a: &Archivo, textos: &mut Vec<(String, bool)>) 
                 .push(json!({"path":path,"table":tipo,"type":"normalized_table","rows":filas.len(),"bytes":raw.len(),"sha256":hash(&raw)}));
             payload.insert(path, raw);
         }
-        let manifest = json!({"schema_id":"CSMP_CAPTURE","schema_version":if payload.contains_key("consolidado/consolidado.xlsx"){"1.1.0"}else{"1.0.0"},"capture_id":id,"captured_at":sesion.desplazar(manifest["captured_at"].as_str().unwrap_or(""),false),"downloader":{"version":"anonimizador-local","commit":"COPIA_LOCAL"},"contains_sensitive_data":true,"originals_authorized":!incluidos.is_empty(),"queries":consultas,"table_states":manifest["table_states"],"mapping_version":"anonimizado-local","required_features":[],"files":files});
+        let manifest = json!({"schema_id":"CSMP_CAPTURE","schema_version":if manifest["schema_version"] == "1.2.0"{"1.2.0"}else if payload.contains_key("consolidado/consolidado.xlsx"){"1.1.0"}else{"1.0.0"},"capture_id":id,"captured_at":sesion.desplazar(manifest["captured_at"].as_str().unwrap_or(""),false),"downloader":{"version":"anonimizador-local","commit":"COPIA_LOCAL"},"contains_sensitive_data":true,"originals_authorized":!incluidos.is_empty(),"queries":consultas,"table_states":manifest["table_states"],"mapping_version":"anonimizado-local","required_features":[],"files":files});
         payload.insert("manifest.json".into(), serde_json::to_vec_pretty(&manifest).map_err(|_| "No se pudo reconstruir el manifiesto.")?);
     } else {
         let estado = match a {

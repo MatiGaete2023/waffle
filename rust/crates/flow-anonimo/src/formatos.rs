@@ -155,11 +155,15 @@ fn nombre_zip(nombre: &str) -> Option<String> {
     Some(partes.join("/"))
 }
 pub fn validar_zip(datos: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    validar_zip_con_limite(datos, 200 * 1024 * 1024)
+}
+
+fn validar_zip_con_limite(datos: &[u8], limite_total: u64) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut zip = zip::ZipArchive::new(Cursor::new(datos)).map_err(|_| "El ZIP no se reconoce.")?;
     if zip.len() > 4000 {
         return Err("El ZIP contiene demasiados archivos.".into());
     }
-    let (mut total, mut vistos, mut out) = (0u64, BTreeSet::new(), vec![]);
+    let (mut total_real, mut vistos, mut out) = (0u64, BTreeSet::new(), vec![]);
     for i in 0..zip.len() {
         let mut miembro = zip.by_index(i).map_err(|_| "El ZIP está cifrado o contiene una entrada no admitida.")?;
         if miembro.is_dir() {
@@ -172,14 +176,19 @@ pub fn validar_zip(datos: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
         if miembro.unix_mode().is_some_and(|m| m & 0o170000 != 0 && m & 0o170000 != 0o100000) {
             return Err("El ZIP contiene enlaces u objetos especiales.".into());
         }
-        total = total.checked_add(miembro.size()).ok_or("Expansión de ZIP excesiva.")?;
-        if miembro.size() > MAX_ARCHIVO as u64 || total > 200 * 1024 * 1024 || miembro.size() > miembro.compressed_size().max(1) * 300 {
+        let limite_ratio = miembro.compressed_size().max(1).saturating_mul(300);
+        let restante = limite_total.checked_sub(total_real).ok_or("Expansión de ZIP excesiva.")?;
+        let limite = (MAX_ARCHIVO as u64).min(restante).min(limite_ratio);
+        if miembro.size() > limite {
             return Err("La expansión del ZIP excede los límites.".into());
         }
         let mut raw = vec![];
-        miembro.by_ref().take(MAX_ARCHIVO as u64 + 1).read_to_end(&mut raw).map_err(|_| "No se pudo leer un miembro del ZIP.")?;
-        if raw.len() > MAX_ARCHIVO {
-            return Err("Un miembro del ZIP excede los límites.".into());
+        miembro.by_ref().take(limite.saturating_add(1)).read_to_end(&mut raw)
+            .map_err(|_| "No se pudo leer un miembro del ZIP.")?;
+        let real = raw.len() as u64;
+        total_real = total_real.checked_add(real).ok_or("Expansión de ZIP excesiva.")?;
+        if real > limite || total_real > limite_total || real != miembro.size() {
+            return Err("La expansión real del ZIP excede los límites o no coincide con su encabezado.".into());
         }
         if nombre.to_lowercase().ends_with(".xml") && !xml_seguro(&raw) {
             return Err("El XML contiene declaraciones no admitidas.".into());
@@ -808,4 +817,21 @@ pub fn anonimizar(nombre: &str, datos: &[u8], opciones: Opciones) -> Result<Sali
     let entrada = cargar(nombre, datos)?;
     let mut sesion = Sesion::nueva(opciones)?;
     transformar(&mut sesion, &entrada)
+}
+
+#[cfg(test)]
+mod cuota_zip_pruebas {
+    use super::*;
+
+    #[test]
+    fn suma_real_de_miembros_respeta_cuota_y_rechaza_encabezado_alterado() {
+        let zip = crate::documentos::zip(&[("a.txt".into(), b"123456".to_vec()), ("b.txt".into(), b"abcdef".to_vec())]).unwrap();
+        assert!(validar_zip_con_limite(&zip, 12).is_ok());
+        assert!(validar_zip_con_limite(&zip, 11).is_err());
+        // Tamaño no comprimido declarado en la primera entrada del directorio central.
+        let mut alterado = zip;
+        let central = alterado.windows(4).position(|b| b == b"PK\x01\x02").unwrap();
+        alterado[central + 24..central + 28].copy_from_slice(&1u32.to_le_bytes());
+        assert!(validar_zip_con_limite(&alterado, 12).is_err());
+    }
 }

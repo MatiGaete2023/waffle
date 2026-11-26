@@ -439,7 +439,7 @@ impl Sesion {
             return false;
         }
         let n = normal(s);
-        if en("PLACEHOLDERS", &n) || n.chars().filter(|c| c.is_ascii_alphabetic()).count() < 3 {
+        if en("PLACEHOLDERS", &n) || en("STATE_WORDS", &n) || n.chars().filter(|c| c.is_ascii_alphabetic()).count() < 3 {
             return false;
         }
         if self.nombres.contains_key(&n) {

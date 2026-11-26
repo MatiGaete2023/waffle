@@ -290,3 +290,104 @@ fn a10_zip_conserva_estado_conocido_y_nada_mas_del_manifiesto() {
     let indice = String::from_utf8(entries.iter().find(|(n, _)| n == "INDICE.txt").unwrap().1.clone()).unwrap();
     assert!(indice.starts_with("VERIFICADO\n"));
 }
+
+// B · contrato versionado: construir paquetes sintéticos sin depender de datos institucionales.
+#[test]
+fn captura_versionada_conserva_tablas_huellas_y_asociaciones_sin_pii() {
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+    let contrato: Value = serde_json::from_str(include_str!("../../../datos/captura_anonima.json")).unwrap();
+    for version in ["1.0.0", "1.1.0", "1.2.0"] {
+        let mut entries = Vec::new();
+        let mut files = Vec::new();
+        let mut estados = serde_json::Map::new();
+        for (tabla, campos) in contrato["tablas"].as_object().unwrap() {
+            if version != "1.2.0" && matches!(tabla.as_str(), "escritos" | "historico_proteccion") { continue; }
+            let datos: Vec<(&str, &str)> = match tabla.as_str() {
+                "consultas" => vec![("query_id", "CONSULTA_CANARIO"), ("captured_at", "2026-01-01T12:00:00Z")],
+                "registros" => vec![("query_id", "CONSULTA_CANARIO"), ("record_id", "REGISTRO_CANARIO"), ("ingreso_id", "INGRESO_CANARIO"), ("person_id", "PERSONA_CANARIO")],
+                "escritos" => vec![("query_id", "CONSULTA_CANARIO"), ("escrito_id", "ESCRITO_CANARIO"), ("linked_ingreso_id", "INGRESO_CANARIO"), ("linked_projection", "2026-01-02"), ("scope", "CAUSA"), ("doc", "DOC_CANARIO"), ("requester", "Identcanario Apelcanario"), ("raw_json", r#"{"Doc":"DOC_CANARIO","Solicitante":"Identcanario Apelcanario","campo privado":"PRIVADO_CANARIO"}"#)],
+                "historico_proteccion" => vec![("query_id", "CONSULTA_CANARIO"), ("historico_id", "HISTORICO_CANARIO"), ("person_id", "PERSONA_CANARIO"), ("program_name", "PRM FICTICIO"), ("egreso_date", "02-01-2026"), ("egreso_cause", "identcanario@example.test"), ("ownership", "VERIFICADA"), ("raw_json", r#"{"Programa":"PRM FICTICIO","Fecha egreso":"02-01-2026","Causal egreso":"identcanario@example.test"}"#)],
+                _ => vec![],
+            };
+            estados.insert(tabla.clone(), json!(if datos.is_empty() { "NO_SOLICITADA" } else { "COMPLETA" }));
+            let campos: Vec<_> = campos.as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+            let mut w = csv::Writer::from_writer(vec![]);
+            w.write_record(&campos).unwrap();
+            if !datos.is_empty() {
+                w.write_record(campos.iter().map(|k| datos.iter().find(|(c, _)| c == k).map(|(_, v)| *v).unwrap_or(""))).unwrap();
+            }
+            let raw = w.into_inner().unwrap();
+            let path = format!("data/{tabla}.csv");
+            let filas = if datos.is_empty() { 0 } else { 1 };
+            files.push(json!({"path":path,"table":tabla,"type":"normalized_table","rows":filas,"bytes":raw.len(),"sha256":format!("{:x}",Sha256::digest(&raw))}));
+            entries.push((path, raw));
+        }
+        if version == "1.1.0" {
+            let mut libro = rust_xlsxwriter::Workbook::new();
+            let hoja = libro.add_worksheet();
+            hoja.write_string(0, 0, "Nombre").unwrap();
+            hoja.write_string(1, 0, "Identcanario Apelcanario").unwrap();
+            let raw = libro.save_to_buffer().unwrap();
+            let path = "consolidado/consolidado.xlsx".to_string();
+            files.push(json!({"path":path,"type":"consolidated_workbook","bytes":raw.len(),"sha256":format!("{:x}",Sha256::digest(&raw))}));
+            entries.push((path, raw));
+        }
+        let mut manifest = json!({"schema_id":"CSMP_CAPTURE","schema_version":version,"capture_id":"CAPTURA_CANARIO","captured_at":"2026-01-01T12:00:00Z","required_features":[],"table_states":estados,"files":files});
+        entries.push(("manifest.json".into(), serde_json::to_vec(&manifest).unwrap()));
+        let zip = documentos::zip(&entries).unwrap();
+        for modo in [Modo::Estricto, Modo::Conservador] {
+            let out = formatos::anonimizar("captura.zip", &zip, Opciones { modo, desplazar_dias: 1, ..estricto() }).unwrap();
+            let resultado = formatos::validar_zip(out.datos()).unwrap();
+            let m: Value = serde_json::from_slice(&resultado.iter().find(|(n, _)| n == "manifest.json").unwrap().1).unwrap();
+            assert_eq!(m["schema_version"], version);
+            assert_eq!(m["table_states"], manifest["table_states"]);
+            for f in m["files"].as_array().unwrap() {
+                let raw = &resultado.iter().find(|(n, _)| Some(n.as_str()) == f["path"].as_str()).unwrap().1;
+                assert_eq!(f["bytes"], raw.len());
+                assert_eq!(f["sha256"], format!("{:x}", Sha256::digest(raw)));
+            }
+            for (n, raw) in &resultado {
+                if !n.ends_with(".xlsx") {
+                    sin(&String::from_utf8_lossy(raw), &["Identcanario", "Apelcanario", "identcanario@example.test", "_CANARIO"]);
+                }
+            }
+            let valor = |tabla: &str, campo: &str| {
+                let path = format!("data/{tabla}.csv");
+                let raw = &resultado.iter().find(|(n, _)| n == &path).unwrap().1;
+                let mut r = csv::Reader::from_reader(raw.as_slice());
+                let i = r.headers().unwrap().iter().position(|c| c == campo).unwrap();
+                r.records().next().unwrap().unwrap()[i].to_string()
+            };
+            assert_eq!(valor("consultas", "query_id"), valor("registros", "query_id"));
+            if version == "1.2.0" {
+                assert_eq!(valor("escritos", "linked_ingreso_id"), valor("registros", "ingreso_id"));
+                assert_eq!(valor("historico_proteccion", "person_id"), valor("registros", "person_id"));
+                assert_eq!(valor("escritos", "query_id"), valor("consultas", "query_id"));
+                assert_eq!(valor("historico_proteccion", "egreso_date"), "03-01-2026");
+                assert_eq!(valor("historico_proteccion", "ownership"), "VERIFICADA");
+                let raw: Value = serde_json::from_str(&valor("escritos", "raw_json")).unwrap();
+                assert_eq!(raw["Doc"], valor("escritos", "doc"));
+                assert_eq!(raw["Solicitante"], valor("escritos", "requester"));
+            }
+            assert!(matches!(formatos::cargar("copia.zip", out.datos()).unwrap(), formatos::Entrada::Zip(_)));
+        }
+        if version == "1.2.0" {
+            let mut duplicada = entries.clone();
+            let mut m = manifest.clone();
+            let raw = &mut duplicada.iter_mut().find(|(n, _)| n == "data/escritos.csv").unwrap().1;
+            let fila = raw.splitn(2, |b| *b == b'\n').nth(1).unwrap().to_vec();
+            raw.extend_from_slice(&fila);
+            let f = m["files"].as_array_mut().unwrap().iter_mut().find(|f| f["table"] == "escritos").unwrap();
+            f["rows"] = json!(2);
+            f["bytes"] = json!(raw.len());
+            f["sha256"] = json!(format!("{:x}", Sha256::digest(raw.as_slice())));
+            duplicada.last_mut().unwrap().1 = serde_json::to_vec(&m).unwrap();
+            assert!(formatos::anonimizar("captura.zip", &documentos::zip(&duplicada).unwrap(), estricto()).is_err());
+        }
+        // Una declaración de versión incompatible debe fallar aun con huellas correctas.
+        manifest["schema_version"] = json!("1.3.0");
+        entries.last_mut().unwrap().1 = serde_json::to_vec(&manifest).unwrap();
+        assert!(formatos::anonimizar("captura.zip", &documentos::zip(&entries).unwrap(), estricto()).is_err());
+    }
+}
