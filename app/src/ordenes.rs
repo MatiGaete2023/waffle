@@ -76,6 +76,10 @@ pub struct OrdenConAvisos {
     pub avisos: Vec<String>,
 }
 
+fn valores_normalizados(datos: &serde_json::Map<String, Value>) -> BTreeMap<String, String> {
+    datos.iter().map(|(k, v)| (k.clone(), if v.is_null() { String::new() } else { v.as_str().map_or_else(|| v.to_string(), str::to_string) })).collect()
+}
+
 /// Filas de las consultas de Litigantes del paquete que tienen algún aviso OB.
 pub fn ordenes_del_paquete(w: &Trabajo, como_de: NaiveDate) -> Vec<OrdenConAvisos> {
     let Some(p) = &w.paquete else { return Vec::new() };
@@ -85,7 +89,7 @@ pub fn ordenes_del_paquete(w: &Trabajo, como_de: NaiveDate) -> Vec<OrdenConAviso
         .filter(|r| pantallas.get(r.get("query_id")) == Some(&"litigantes"))
         .filter_map(|r| {
             let datos: serde_json::Map<String, Value> = serde_json::from_str(r.get("normalized_json")).ok()?;
-            let valores: BTreeMap<String, String> = datos.iter().map(|(k, v)| (k.clone(), v.as_str().map_or_else(|| v.to_string(), str::to_string))).collect();
+            let valores = valores_normalizados(&datos);
             let avisos = avisos_orden(&valores, como_de);
             let dato = |opciones: &[&str]| opciones.iter().find_map(|o| valores.iter().find(|(k, _)| clave_columna(k) == *o).map(|(_, v)| v.clone())).unwrap_or_default();
             (!avisos.is_empty()).then(|| OrdenConAvisos { rit: dato(&["RIT"]), nombre: dato(&["NOMBRE", "NOMBRE MENOR", "NOMBRE LITIGANTE"]), avisos })
@@ -96,6 +100,15 @@ pub fn ordenes_del_paquete(w: &Trabajo, como_de: NaiveDate) -> Vec<OrdenConAviso
 #[cfg(test)]
 mod pruebas {
     use super::*;
+
+    #[test]
+    fn null_equivale_a_celda_vacia_en_ordenes() {
+        let d = serde_json::json!({"ESTADO O B":"Activa","RESULTADO":null,"FECHA TRAMITE":"01/01/2099","ESTADO ENVIO":null,"TIPO LITIGANTE":"NINO","CURADOR":null});
+        let valores = valores_normalizados(d.as_object().unwrap());
+        let avisos = avisos_orden(&valores,NaiveDate::from_ymd_opt(2099,4,1).unwrap());
+        for id in ["OB-01","OB-03","OB-04"] { assert!(avisos.iter().any(|a| a.starts_with(id))); }
+        assert!(!avisos.iter().any(|a| a.contains("null")));
+    }
 
     fn comparar(corte: NaiveDate, caso: &Value) -> Vec<String> {
         let valores: BTreeMap<String, String> = caso["valores"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect();

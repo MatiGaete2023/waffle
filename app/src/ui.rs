@@ -2027,7 +2027,7 @@ impl App {
                         ui.set_width(ui.available_width());
                         egui::Grid::new("cab").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                             ui.label(RichText::new("Para").color(p.muted));
-                            ui.add(egui::TextEdit::singleline(&mut b.para).desired_width(f32::INFINITY).hint_text("correo@example.invalid; otro@example.invalid"));
+                            if ui.add(egui::TextEdit::singleline(&mut b.para).desired_width(f32::INFINITY).hint_text("correo@example.invalid; otro@example.invalid")).changed() { b.para_automatico = None; }
                             ui.end_row();
                             ui.label(RichText::new("CC").color(p.muted));
                             ui.add(egui::TextEdit::singleline(&mut b.cc).desired_width(f32::INFINITY));
@@ -2134,8 +2134,9 @@ impl App {
         let mut out = Vec::new();
         for mut b in nuevos {
             if let Some(v) = self.borradores.iter().find(|v| v.kind == b.kind && v.titulo == b.titulo && v.guardado.is_none()) {
-                if !v.para.trim().is_empty() {
+                if v.para_automatico.as_deref() != Some(v.para.as_str()) {
                     b.para = v.para.clone();
+                    b.para_automatico = None;
                 }
                 b.cc = v.cc.clone();
                 b.asunto = v.asunto.clone();
@@ -3725,7 +3726,12 @@ mod pruebas_vigencia {
         app.preparar_correos();
         let i = informativo(&app);
         assert_eq!(app.borradores[i].para, "directorio@example.invalid");
+        for tribunal in app.cfg.tribunales.values_mut() { tribunal.para = "actualizado@example.test".into(); }
+        app.preparar_correos();
+        assert_eq!(app.borradores[informativo(&app)].para, "actualizado@example.test");
+        let i = informativo(&app);
         app.borradores[i].para = "elegido@example.invalid".into();
+        for tribunal in app.cfg.tribunales.values_mut() { tribunal.para = "nuevo@example.test".into(); }
         app.preparar_correos();
         assert_eq!(app.borradores[informativo(&app)].para, "elegido@example.invalid");
     }
