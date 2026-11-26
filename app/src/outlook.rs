@@ -35,49 +35,65 @@ impl ErrorOutlook {
 
 /// Script de Outlook clásico. Cada paso informa su avance por la salida estándar: `PREPARADO` justo antes de `Save()` y
 /// `GUARDADO|<EntryID>|<StoreID>` solo si Outlook devolvió la identidad completa.
+pub const TIMEOUT_COM: std::time::Duration = std::time::Duration::from_secs(90);
 pub const SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
 $d = Get-Content -Raw -Encoding UTF8 -LiteralPath $env:FLOW_BORRADOR | ConvertFrom-Json
-$o = New-Object -ComObject Outlook.Application
-$s = $o.Session
-$cuenta = ([string]$d.cuenta).Trim().ToLower()
-$acc = $null
-if ($cuenta) {
-  $coinc = @()
-  foreach ($a in $s.Accounts) {
-    foreach ($v in @($a.SmtpAddress, $a.DisplayName)) {
-      if ($v -and ([string]$v).Trim().ToLower() -eq $cuenta) { $coinc += $a; break }
-    }
-  }
-  if ($coinc.Count -ne 1) { Write-Output 'NOCUENTA'; exit 3 }
-  $acc = $coinc[0]
-  $carpeta = $acc.DeliveryStore.GetDefaultFolder(16)
-} else {
-  $carpeta = $s.GetDefaultFolder(16)
-}
-$m = $carpeta.Items.Add('IPM.Note')
-if ($acc) { $m.SendUsingAccount = $acc }
-$m.To = [string]$d.to
-$m.CC = [string]$d.cc
-$m.Subject = [string]$d.subject
-$m.BodyFormat = 2
+$rcw = New-Object System.Collections.ArrayList
+function Tomar($obj) { if ($null -ne $obj) { [void]$rcw.Add($obj) }; return ,$obj }
+$m = $null
 try {
+  $o = Tomar (New-Object -ComObject Outlook.Application)
+  $s = Tomar $o.Session
+  $cuenta = ([string]$d.cuenta).Trim().ToLower()
+  $acc = $null
+  if ($cuenta) {
+    $coinc = @()
+    $cuentas = Tomar $s.Accounts
+    for ($i = 1; $i -le $cuentas.Count; $i++) {
+      $a = Tomar ($cuentas.Item($i))
+      foreach ($v in @($a.SmtpAddress, $a.DisplayName)) {
+        if ($v -and ([string]$v).Trim().ToLower() -eq $cuenta) { $coinc += $a; break }
+      }
+    }
+    if ($coinc.Count -ne 1) { Write-Output 'NOCUENTA'; exit 3 }
+    $acc = $coinc[0]
+    $almacen = Tomar $acc.DeliveryStore
+    $carpeta = Tomar ($almacen.GetDefaultFolder(16))
+  } else {
+    $carpeta = Tomar ($s.GetDefaultFolder(16))
+  }
+  $items = Tomar $carpeta.Items
+  $m = Tomar ($items.Add('IPM.Note'))
+  if ($acc) { $m.SendUsingAccount = $acc }
+  $m.To = [string]$d.to
+  $m.CC = [string]$d.cc
+  $m.Subject = [string]$d.subject
+  $m.BodyFormat = 2
   # Outlook inserta la firma de la cuenta al abrir el editor con el cuerpo vacío.
   $m.Display($false)
-  $documento = $m.GetInspector.WordEditor
-  $inicio = $documento.Range(0, 0)
+  $inspector = Tomar $m.GetInspector
+  $documento = Tomar $inspector.WordEditor
+  $inicio = Tomar ($documento.Range(0, 0))
   $salto = [string][char]13
   $cuerpo = ([string]$d.body) -replace '\r\n?|\n', $salto
   [void]$inicio.InsertBefore($cuerpo + $salto + $salto)
-  foreach ($a in $d.attachments) { [void]$m.Attachments.Add([string]$a) }
+  $adjuntos = Tomar $m.Attachments
+  foreach ($a in $d.attachments) { $adjunto = Tomar ($adjuntos.Add([string]$a)) }
   Write-Output 'PREPARADO'
   $m.Save()
   $id = [string]$m.EntryID
-  $st = [string]$carpeta.Store.StoreID
+  $store = Tomar $carpeta.Store
+  $st = [string]$store.StoreID
   if (-not $id.Trim() -or -not $st.Trim()) { Write-Output 'SIN_IDENTIDAD'; exit 4 }
   Write-Output "GUARDADO|$id|$st"
 } finally {
-  # olDiscard evita un segundo guardado o dejar abierta la ventana del borrador.
-  try { $m.Close(1) } catch {}
+  # olDiscard evita un segundo guardado. No cerrar Outlook, que puede pertenecer al usuario.
+  if ($m) { try { $m.Close(1) } catch {} }
+  for ($i = $rcw.Count - 1; $i -ge 0; $i--) {
+    try { if ([Runtime.InteropServices.Marshal]::IsComObject($rcw[$i])) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($rcw[$i]) } } catch {}
+  }
+  $rcw.Clear()
+  [GC]::Collect(); [GC]::WaitForPendingFinalizers()
 }
 "#;
 
@@ -144,12 +160,15 @@ pub fn guardar_outlook(b: &Borrador, cuenta: &str) -> Result<ReciboOutlook, Erro
         std::fs::write(&json, serde_json::to_vec(&datos(b, cuenta, &adjuntos)).unwrap_or_default()).map_err(|e| no(e.to_string()))?;
         let utf16: Vec<u8> = SCRIPT.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
         let enc = base64::engine::general_purpose::STANDARD.encode(utf16);
-        let salida = std::process::Command::new("powershell")
+        let salida = crate::util::output_timeout(std::process::Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &enc])
             .env("FLOW_BORRADOR", &json)
-            .creation_flags(0x0800_0000)
-            .output()
-            .map_err(|e| no(format!("No se pudo iniciar PowerShell: {e}")))?;
+            .creation_flags(0x0800_0000), TIMEOUT_COM)
+            .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound {
+                no(format!("No se pudo iniciar PowerShell: {e}"))
+            } else {
+                ErrorOutlook::Incierto(format!("PowerShell no confirmó el resultado; revisa Borradores de Outlook antes de repetir. {e}"))
+            })?;
         interpretar(salida.status.success(), &String::from_utf8_lossy(&salida.stdout), &String::from_utf8_lossy(&salida.stderr), &b.titulo)
     })();
     let _ = std::fs::remove_dir_all(&tmp);
@@ -184,6 +203,8 @@ mod pruebas {
 
     #[test]
     fn el_script_solo_guarda_y_nunca_envia() {
+        assert!(TIMEOUT_COM.as_secs() > 0 && TIMEOUT_COM.as_secs() <= 120);
+        assert!(SCRIPT.contains("finally") && SCRIPT.contains("ReleaseComObject"));
         assert!(SCRIPT.contains(".Save()"));
         assert!(!SCRIPT.to_lowercase().contains(".send("), "el script no puede enviar correos");
         assert!(SCRIPT.contains("PREPARADO") && SCRIPT.contains("GUARDADO|"));
@@ -198,7 +219,7 @@ mod pruebas {
         let insertar = SCRIPT.find("$inicio.InsertBefore(").unwrap();
         let guardar = SCRIPT.find("$m.Save()").unwrap();
         assert!(cuenta < mostrar && mostrar < insertar && insertar < guardar);
-        assert!(SCRIPT.contains("$m.GetInspector.WordEditor"));
+        assert!(SCRIPT.contains("$m.GetInspector") && SCRIPT.contains("$inspector.WordEditor"));
         assert!(SCRIPT.contains(".Range(0, 0)") && SCRIPT.contains("$m.Close(1)"));
         assert!(!SCRIPT.contains("$m.Body =") && !SCRIPT.contains("$m.HTMLBody ="));
     }

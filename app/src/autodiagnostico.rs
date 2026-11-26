@@ -11,6 +11,8 @@ pub struct Comprobacion {
     pub nombre: &'static str,
     pub ok: bool,
     pub detalle: String,
+    pub estado: &'static str,
+    pub requerida: bool,
 }
 
 pub struct Informe {
@@ -19,24 +21,27 @@ pub struct Informe {
 
 impl Informe {
     pub fn ok(&self) -> bool {
-        self.comprobaciones.iter().all(|c| c.ok)
+        self.comprobaciones.iter().all(|c| !c.requerida || c.ok)
     }
 
     pub fn json(&self) -> Value {
         json!({
             "version": env!("CARGO_PKG_VERSION"),
+            "version_ejecutable": env!("CARGO_PKG_VERSION"),
+            "version_extension_integral": flow_rust::descargador::extension::version(flow_rust::descargador::Edicion::Integral),
+            "version_extension_lite": flow_rust::descargador::extension::version(flow_rust::descargador::Edicion::Lite),
             "commit": option_env!("GITHUB_SHA").unwrap_or("desarrollo"),
             "ok": self.ok(),
             "outlook_disponible": cfg!(target_os = "windows"),
-            "comprobaciones": self.comprobaciones.iter().map(|c| json!({"nombre": c.nombre, "ok": c.ok, "detalle": c.detalle})).collect::<Vec<_>>(),
+            "comprobaciones": self.comprobaciones.iter().map(|c| json!({"nombre": c.nombre, "ok": c.ok, "estado": c.estado, "requerida": c.requerida, "detalle": c.detalle})).collect::<Vec<_>>(),
         })
     }
 }
 
 fn paso(nombre: &'static str, r: Result<String, String>) -> Comprobacion {
     match r {
-        Ok(detalle) => Comprobacion { nombre, ok: true, detalle },
-        Err(detalle) => Comprobacion { nombre, ok: false, detalle },
+        Ok(detalle) => Comprobacion { nombre, ok: true, detalle, estado: "comprobado", requerida: true },
+        Err(detalle) => Comprobacion { nombre, ok: false, detalle, estado: "indisponible", requerida: true },
     }
 }
 
@@ -101,6 +106,15 @@ pub fn ejecutar() -> Informe {
     }
     v.push(paso("Anonimizador", anonimizador(&tmp)));
     let _ = std::fs::remove_dir_all(&tmp);
+    for nombre in ["Outlook COM", "Excel COM"] {
+        v.push(Comprobacion { nombre, ok: false, requerida: false,
+            estado: if cfg!(target_os = "windows") { "sin probar" } else { "indisponible" },
+            detalle: "No se abrió ni automatizó Office en este diagnóstico.".into() });
+    }
+    for (nombre, edicion) in [("Extensión integral", flow_rust::descargador::Edicion::Integral), ("Extensión lite", flow_rust::descargador::Edicion::Lite)] {
+        v.push(Comprobacion { nombre, ok: false, requerida: false, estado: "sin probar",
+            detalle: format!("Versión incluida {}; instalación y ejecución en Chrome no comprobadas.", flow_rust::descargador::extension::version(edicion)) });
+    }
     Informe { comprobaciones: v }
 }
 
@@ -145,7 +159,10 @@ mod tests {
         assert_eq!(por_linea_de_comandos(&informe), 0, "{}", std::fs::read_to_string(&informe).unwrap_or_default());
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&informe).unwrap()).unwrap();
         assert_eq!(v["ok"], true);
-        assert_eq!(v["comprobaciones"].as_array().unwrap().len(), 7);
+        assert_eq!(v["version_ejecutable"], env!("CARGO_PKG_VERSION"));
+        assert!(v["version_extension_integral"].is_string());
+        assert!(v["comprobaciones"].as_array().unwrap().iter().any(|c| c["estado"] == "sin probar"));
+        assert_eq!(v["comprobaciones"].as_array().unwrap().len(), 11);
         let antes = std::fs::read(&informe).unwrap();
         assert_eq!(por_linea_de_comandos(&informe), 2);
         assert_eq!(std::fs::read(&informe).unwrap(), antes);
@@ -156,6 +173,8 @@ mod tests {
     fn una_comprobacion_fallida_se_informa() {
         let inf = Informe { comprobaciones: vec![paso("a", Ok("x".into())), paso("b", Err("y".into()))] };
         assert!(!inf.ok());
+        assert_eq!(inf.comprobaciones[0].estado, "comprobado");
+        assert_eq!(inf.comprobaciones[1].estado, "indisponible");
         assert_eq!(inf.json()["ok"], false);
     }
 

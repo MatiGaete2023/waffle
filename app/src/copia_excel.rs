@@ -172,6 +172,47 @@ pub fn base(w: &Trabajo) -> Result<Base, String> {
     })
 }
 
+/// Registra la línea base de las celdas efectivamente guardadas sin reconstruir el libro original.
+pub(crate) fn recordar_copia_guardada(w: &mut Trabajo, hoja: &str, ruta: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(ruta).map_err(|e| e.to_string())?;
+    let hojas = lectura::read_sheets(&bytes)?;
+    let tabla = hojas.iter().find(|s| s.name == hoja).ok_or("Hoja exportada no encontrada")?;
+    let (inicio, encabezados, col_id) = tabla.rows.iter().enumerate().find_map(|(i, fila)| {
+        let h = lectura::headers_of(fila);
+        let c = h.iter().position(|v| normalizar(v) == normalizar("NURUS_ID_REGISTRO"))?;
+        Some((i, h, c))
+    }).ok_or("Falta identificador de la copia")?;
+    let ids = identificadores(w, hoja);
+    let esperados: HashSet<_> = ids.iter().cloned().collect();
+    if esperados.len() != ids.len() { return Err("Identificadores de trabajo duplicados".into()); }
+    let mut bases = HashMap::new();
+    for fila in &tabla.rows[inicio+1..] {
+        let id = fila.get(col_id).map(|c| c.display().trim().to_string()).unwrap_or_default();
+        if !esperados.contains(&id) { continue; }
+        let base: std::collections::BTreeMap<String, String> = crate::sincronizar::CAMPOS.iter().map(|campo| {
+            let v = encabezados.iter().position(|h| normalizar(h) == normalizar(campo))
+                .and_then(|i| fila.get(i)).map(|c| c.display().trim().to_string()).unwrap_or_default();
+            (campo.to_string(), v)
+        }).collect();
+        if bases.insert(id, base).is_some() { return Err("Identificadores duplicados en la copia".into()); }
+    }
+    if bases.len() != ids.len() { return Err("Faltan identificadores de trabajo en la copia".into()); }
+    for (r, id) in w.registros.iter_mut().zip(ids) {
+        let base = bases.remove(&id).expect("identificador previamente validado");
+        let local = crate::sincronizar::CAMPOS.iter().map(|&campo| {
+            let v = match campo { "OBSERVACION" => r.editada.clone(), "RES" => Some(r.res.clone()), _ => r.campos.get(campo).cloned() };
+            (campo.to_string(), v.unwrap_or_else(|| base.get(campo).cloned().unwrap_or_default()))
+        }).collect();
+        r.sync_local = Some(local);
+        r.sync_base = Some(base);
+        r.sync_correo = Some(serde_json::to_string(&r.gestiones_correo).unwrap_or_default());
+        r.sync_anulaciones = Some(serde_json::to_string(&r.anulaciones).unwrap_or_default());
+        r.sync_decisiones = Some(decisiones(r));
+        r.id_excel = id;
+    }
+    Ok(())
+}
+
 /// `Work.export`: hay etapa revisada si alguna fila tiene una edición humana.
 pub(crate) fn revisada(r: &Registro) -> bool {
     r.revisada || r.editada.as_ref().is_some_and(|e| *e != r.propuesta)
@@ -350,31 +391,41 @@ fn filas_bitacora<'a>(
 }
 
 /// Script de Excel de escritorio. Solo abre la copia temporal y guarda otra copia; nunca toca el original.
+pub const TIMEOUT_COM: std::time::Duration = std::time::Duration::from_secs(180);
 pub const SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
 $d = Get-Content -Raw -Encoding UTF8 -LiteralPath $env:FLOW_COPIA | ConvertFrom-Json
 function Norm($v) { if ($null -eq $v) { return '' }; return ((([string]$v).Trim().ToUpper().Replace('_', ' ')) -split '\s+' | Where-Object { $_ }) -join ' ' }
+$rcw = New-Object System.Collections.ArrayList
+function Tomar($obj) { if ($null -ne $obj) { [void]$rcw.Add($obj) }; return ,$obj }
+function Liberar($obj) { if ($null -ne $obj) { try { if ([Runtime.InteropServices.Marshal]::IsComObject($obj)) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($obj) } } catch {} } }
 function Vacia($v) { return ($null -eq $v) -or (([string]$v).Trim() -eq '') }
 function Escribir($ws, $col, $celdas, $conservar) {
   $items = @($celdas)
+  $cells = $ws.Cells
+  try {
   $i = 0
   while ($i -lt $items.Count) {
     $j = $i
     while (($j + 1) -lt $items.Count -and [int]$items[$j + 1].f -eq ([int]$items[$j].f + 1) -and ($j + 1 - $i) -lt 500) { $j++ }
     if ($conservar) {
       for ($k = $i; $k -le $j; $k++) {
-        $c = $ws.Cells.Item([int]$items[$k].f, $col)
-        if (Vacia $c.Value2) { $c.NumberFormat = '@'; $c.Value2 = [string]$items[$k].v }
+        $c = $cells.Item([int]$items[$k].f, $col)
+        try { if (Vacia $c.Value2) { $c.NumberFormat = '@'; $c.Value2 = [string]$items[$k].v } } finally { Liberar $c }
       }
     } else {
       $n = $j - $i + 1
       $a = New-Object 'object[,]' $n, 1
       for ($k = 0; $k -lt $n; $k++) { $a[$k, 0] = [string]$items[$i + $k].v }
-      $r = $ws.Range($ws.Cells.Item([int]$items[$i].f, $col), $ws.Cells.Item([int]$items[$j].f, $col))
-      $r.NumberFormat = '@'
-      $r.Value2 = $a
+      $c1 = $null; $c2 = $null; $r = $null
+      try {
+        $c1 = $cells.Item([int]$items[$i].f, $col); $c2 = $cells.Item([int]$items[$j].f, $col)
+        $r = $ws.Range($c1, $c2)
+        $r.NumberFormat = '@'; $r.Value2 = $a
+      } finally { Liberar $r; Liberar $c2; Liberar $c1 }
     }
     $i = $j + 1
   }
+  } finally { Liberar $cells }
 }
 $xl = $null; $wb = $null; $etapa = 'iniciar Excel'
 try {
@@ -382,16 +433,22 @@ try {
   $xl.Visible = $false; $xl.DisplayAlerts = $false; $xl.EnableEvents = $false; $xl.AskToUpdateLinks = $false
   $xl.AutomationSecurity = 3
   $etapa = 'abrir el libro de trabajo'
-  $wb = $xl.Workbooks.Open([string]$d.origen, 0, $false)
+  $libros = Tomar $xl.Workbooks
+  $wb = $libros.Open([string]$d.origen, 0, $false)
   $etapa = 'preparar la hoja procesada'
-  $ws = $wb.Worksheets.Item([string]$d.hoja)
+  $hojas = Tomar $wb.Worksheets
+  $ws = Tomar ($hojas.Item([string]$d.hoja))
+  $cells = Tomar $ws.Cells
+  $columns = Tomar $ws.Columns
   $h = [int]$d.encabezado
-  $ur = $ws.UsedRange
-  $ultimaCol = $ur.Column + $ur.Columns.Count - 1
-  $ultimaFila = $ur.Row + $ur.Rows.Count - 1
+  $ur = Tomar $ws.UsedRange
+  $urcols = Tomar $ur.Columns; $urrows = Tomar $ur.Rows
+  $ultimaCol = $ur.Column + $urcols.Count - 1
+  $ultimaFila = $ur.Row + $urrows.Count - 1
   $pos = @{}
   for ($c = 1; $c -le $ultimaCol; $c++) {
-    $k = Norm $ws.Cells.Item($h, $c).Value2
+    $celda = $cells.Item($h, $c)
+    try { $k = Norm $celda.Value2 } finally { Liberar $celda }
     if ($k -ne '') { if (-not $pos.ContainsKey($k)) { $pos[$k] = @() }; $pos[$k] += $c }
   }
   $cols = @{}; $ultima = $ultimaCol
@@ -400,13 +457,15 @@ try {
     if ($pos.ContainsKey($k) -and $pos[$k].Count -gt 1) { throw "Hay más de una columna $k; no se puede anotar sin ambigüedad." }
     if ($pos.ContainsKey($k)) { $c = $pos[$k][0] } else { $c = $ultima + 1 }
     $cols[$t] = $c; if ($c -gt $ultima) { $ultima = $c }
-    if (Vacia $ws.Cells.Item($h, $c).Value2) { $ws.Cells.Item($h, $c).Value2 = [string]$t }
+    $celda = $cells.Item($h, $c)
+    try { if (Vacia $celda.Value2) { $celda.Value2 = [string]$t } } finally { Liberar $celda }
   }
   $etapa = 'escribir observaciones y estados'
   if ($d.bitacoras) {
     foreach ($t in $d.bitacoras.columnas) {
       $c = $cols[[string]$t]
-      [void]$ws.Range($ws.Cells.Item($h + 1, $c), $ws.Cells.Item($ultimaFila, $c)).ClearContents()
+      $r = Tomar ($ws.Range((Tomar ($cells.Item($h + 1, $c))), (Tomar ($cells.Item($ultimaFila, $c)))))
+      [void]$r.ClearContents()
     }
   }
   foreach ($e in $d.escrituras) {
@@ -414,30 +473,35 @@ try {
     if (@($e.celdas).Count -gt 0) { Escribir $ws $cols[[string]$e.titulo] @($e.celdas) ([bool]$e.conservar) }
   }
   if (@($d.res_sugerida).Count -gt 0) { Escribir $ws $cols['RES'] @($d.res_sugerida) $true }
-  foreach ($t in $d.ocultas) { $ws.Columns.Item($cols[[string]$t]).Hidden = $true }
+  foreach ($t in $d.ocultas) { $columna = Tomar ($columns.Item($cols[[string]$t])); $columna.Hidden = $true }
   $etapa = 'configurar selector RES'
   if ($ultimaFila -gt $h) {
-    try { $lista = $wb.Worksheets.Item('NURUS_LISTAS') } catch { $lista = $wb.Worksheets.Add(); $lista.Name = 'NURUS_LISTAS' }
+    try { $lista = Tomar ($hojas.Item('NURUS_LISTAS')) } catch { $lista = Tomar ($hojas.Add()); $lista.Name = 'NURUS_LISTAS' }
     $lista.Visible = 0
-    $lista.Cells.Item(1, 1).Value2 = 'TIPOS_RES'
-    for ($i = 0; $i -lt $d.tipos_res.Count; $i++) { $lista.Cells.Item($i + 2, 1).Value2 = [string]$d.tipos_res[$i] }
-    try { $wb.Names.Item('NURUS_RES_TIPOS').Delete() } catch {}
-    [void]$wb.Names.Add('NURUS_RES_TIPOS', "='NURUS_LISTAS'!`$A`$2:`$A`$4")
+    $listaCells = Tomar $lista.Cells
+    $celda = Tomar ($listaCells.Item(1, 1)); $celda.Value2 = 'TIPOS_RES'
+    for ($i = 0; $i -lt $d.tipos_res.Count; $i++) { $celda = Tomar ($listaCells.Item($i + 2, 1)); $celda.Value2 = [string]$d.tipos_res[$i] }
+    $names = Tomar $wb.Names
+    try { $nm = Tomar ($names.Item('NURUS_RES_TIPOS')); $nm.Delete() } catch {}
+    $nm = Tomar ($names.Add('NURUS_RES_TIPOS', "='NURUS_LISTAS'!`$A`$2:`$A`$4"))
     $rc = $cols['RES']
-    $rango = $ws.Range($ws.Cells.Item($h + 1, $rc), $ws.Cells.Item($ultimaFila, $rc))
-    try { $rango.Validation.Delete() } catch {}
-    [void]$rango.Validation.Add(3, 1, 1, '=NURUS_RES_TIPOS')
-    $rango.Validation.IgnoreBlank = $true; $rango.Validation.InCellDropdown = $true; $rango.Validation.ShowError = $true
-    $rango.Validation.ErrorTitle = 'Tipo RES no válido'
-    $rango.Validation.ErrorMessage = 'Usa PC_IE, PC_INFO o NOMENCL, o deja la celda vacía.'
-    $rango.Validation.ShowInput = $true
-    $rango.Validation.InputTitle = 'Tipo de resolución'
-    $rango.Validation.InputMessage = 'Selecciona PC_IE, PC_INFO o NOMENCL. Vacío: sin proyecto.'
-    $ancho = [double]$ws.Columns.Item($rc).ColumnWidth; if ($ancho -lt 14) { $ws.Columns.Item($rc).ColumnWidth = 14 }
+    $rango = Tomar ($ws.Range((Tomar ($cells.Item($h + 1, $rc))), (Tomar ($cells.Item($ultimaFila, $rc)))))
+    $validacion = Tomar $rango.Validation
+    try { $validacion.Delete() } catch {}
+    [void]$validacion.Add(3, 1, 1, '=NURUS_RES_TIPOS')
+    $validacion.IgnoreBlank = $true; $validacion.InCellDropdown = $true; $validacion.ShowError = $true
+    $validacion.ErrorTitle = 'Tipo RES no válido'
+    $validacion.ErrorMessage = 'Usa PC_IE, PC_INFO o NOMENCL, o deja la celda vacía.'
+    $validacion.ShowInput = $true
+    $validacion.InputTitle = 'Tipo de resolución'
+    $validacion.InputMessage = 'Selecciona PC_IE, PC_INFO o NOMENCL. Vacío: sin proyecto.'
+    $columna = Tomar ($columns.Item($rc)); $ancho = [double]$columna.ColumnWidth; if ($ancho -lt 14) { $columna.ColumnWidth = 14 }
   }
   $etapa = 'marcar filas excluidas'
   $color = 255 + 242 * 256 + 204 * 65536
-  foreach ($f in @($d.excluidas)) { $ws.Range($ws.Cells.Item([int]$f, 1), $ws.Cells.Item([int]$f, $ultima)).Interior.Color = $color }
+  foreach ($f in @($d.excluidas)) { $c1 = $null; $c2 = $null; $r = $null; $interior = $null
+    try { $c1 = $cells.Item([int]$f, 1); $c2 = $cells.Item([int]$f, $ultima); $r = $ws.Range($c1, $c2); $interior = $r.Interior; $interior.Color = $color }
+    finally { Liberar $interior; Liberar $r; Liberar $c2; Liberar $c1 } }
   if ($d.bitacoras) {
     $etapa = 'aplicar la selección de bitácoras'
     if ($ws.FilterMode) { $ws.ShowAllData() }
@@ -445,22 +509,23 @@ try {
     $primera = $h + 1
     foreach ($f in $d.bitacoras.filas) {
       $f = [int]$f
-      if ($f -gt $primera) { $ws.Range($ws.Cells.Item($primera, 1), $ws.Cells.Item($f - 1, 1)).EntireRow.Hidden = $true }
-      $ws.Cells.Item($f, 1).EntireRow.Hidden = $false
+      if ($f -gt $primera) { $r = Tomar ($ws.Range((Tomar ($cells.Item($primera, 1))), (Tomar ($cells.Item($f - 1, 1))))); $entera = Tomar $r.EntireRow; $entera.Hidden = $true }
+      $c = Tomar ($cells.Item($f, 1)); $entera = Tomar $c.EntireRow; $entera.Hidden = $false
       $primera = $f + 1
     }
     if ($primera -le $ultimaFila) {
-      $ws.Range($ws.Cells.Item($primera, 1), $ws.Cells.Item($ultimaFila, 1)).EntireRow.Hidden = $true
+      $r = Tomar ($ws.Range((Tomar ($cells.Item($primera, 1))), (Tomar ($cells.Item($ultimaFila, 1))))); $entera = Tomar $r.EntireRow; $entera.Hidden = $true
     }
   }
   $etapa = 'crear la trazabilidad'
-  $nombres = @{}; for ($i = 1; $i -le $wb.Worksheets.Count; $i++) { $nombres[$wb.Worksheets.Item($i).Name] = $true }
+  $nombres = @{}; for ($i = 1; $i -le $hojas.Count; $i++) { $sh = Tomar ($hojas.Item($i)); $nombres[$sh.Name] = $true }
   $nombre = 'NURUS_TRAZABILIDAD'; $n = 2; while ($nombres.ContainsKey($nombre)) { $nombre = "NURUS_TRAZABILIDAD_$n"; $n++ }
-  $traza = $wb.Worksheets.Add(); $traza.Name = $nombre; $traza.Visible = 0
+  $traza = Tomar ($hojas.Add()); $traza.Name = $nombre; $traza.Visible = 0
   $filas = @($d.traza); $ancho = 1; foreach ($f in $filas) { if (@($f).Count -gt $ancho) { $ancho = @($f).Count } }
   $a = New-Object 'object[,]' $filas.Count, $ancho
   for ($i = 0; $i -lt $filas.Count; $i++) { $f = @($filas[$i]); for ($j = 0; $j -lt $ancho; $j++) { if ($j -lt $f.Count) { $a[$i, $j] = [string]$f[$j] } else { $a[$i, $j] = '' } } }
-  $rt = $traza.Range($traza.Cells.Item(1, 1), $traza.Cells.Item($filas.Count, $ancho)); $rt.NumberFormat = '@'; $rt.Value2 = $a
+  $trazaCells = Tomar $traza.Cells
+  $rt = Tomar ($traza.Range((Tomar ($trazaCells.Item(1, 1))), (Tomar ($trazaCells.Item($filas.Count, $ancho))))); $rt.NumberFormat = '@'; $rt.Value2 = $a
   $ws.Activate()
   $etapa = 'guardar la copia'
   $wb.SaveCopyAs([string]$d.destino)
@@ -469,8 +534,11 @@ try {
   [Console]::Error.WriteLine("Excel no pudo completar la copia durante «$etapa». El original no fue modificado. Detalle: $($_.Exception.Message)")
   exit 1
 } finally {
-  if ($wb) { try { $wb.Close($false) } catch {} ; [void][Runtime.InteropServices.Marshal]::ReleaseComObject($wb) }
-  if ($xl) { try { $xl.Quit() } catch {} ; [void][Runtime.InteropServices.Marshal]::ReleaseComObject($xl) }
+  if ($wb) { try { $wb.Close($false) } catch {} }
+  for ($i = $rcw.Count - 1; $i -ge 0; $i--) { Liberar $rcw[$i] }
+  $rcw.Clear(); Liberar $wb
+  if ($xl) { try { $xl.Quit() } catch {}; Liberar $xl }
+  [GC]::Collect(); [GC]::WaitForPendingFinalizers()
 }
 "#;
 
@@ -488,9 +556,15 @@ pub fn nombre_salida(w: &Trabajo, base: &Base) -> String {
 pub fn exportar(w: &Trabajo, dir: &Path) -> Result<PathBuf, String> {
     crate::sincronizar::validar_longitud_decisiones(w)?;
     let base = base(w)?;
+    exportar_con_base(w, dir, &base)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn exportar_con_base(w: &Trabajo, dir: &Path, base: &Base) -> Result<PathBuf, String> {
+    crate::sincronizar::validar_longitud_decisiones(w)?;
     std::fs::create_dir_all(dir).map_err(|e| format!("No se pudo crear la carpeta de productos: {e}"))?;
-    let destino = dir.join(nombre_salida(w, &base));
-    guardar_copia(&base, &destino, |o, d| instrucciones(w, &base, o, d))
+    let destino = dir.join(nombre_salida(w, base));
+    guardar_copia(base, &destino, |o, d| instrucciones(w, base, o, d))
 }
 
 pub fn exportar_bitacoras(
@@ -533,13 +607,12 @@ fn guardar_copia(
     }
     let utf16: Vec<u8> = SCRIPT.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     let enc = base64::engine::general_purpose::STANDARD.encode(utf16);
-    let salida = std::process::Command::new("powershell")
+    let salida = crate::util::output_timeout(std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &enc])
         .env("FLOW_COPIA", &datos)
-        .creation_flags(0x0800_0000)
-        .output();
+        .creation_flags(0x0800_0000), TIMEOUT_COM);
     let resultado = (|| {
-        let out = salida.map_err(|e| format!("No se pudo iniciar PowerShell: {e}"))?;
+        let out = salida.map_err(|e| format!("Excel no confirmó la copia: {e}"))?;
         let texto = String::from_utf8_lossy(&out.stdout);
         let creada = std::fs::metadata(&temporal).map(|m| m.len() > 0).unwrap_or(false);
         if !(out.status.success() && texto.contains("GUARDADO") && creada) {
@@ -568,10 +641,22 @@ pub fn exportar(w: &Trabajo, _dir: &Path) -> Result<PathBuf, String> {
     Err("La copia preservada requiere Windows y Excel de escritorio.".into())
 }
 
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn exportar_con_base(_: &Trabajo, _: &Path, _: &Base) -> Result<PathBuf, String> {
+    Err("La copia preservada requiere Windows y Excel de escritorio.".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::motor::Mode;
+
+    #[test]
+    fn plazo_y_limpieza_com() {
+        assert!(TIMEOUT_COM.as_secs() > 0 && TIMEOUT_COM.as_secs() <= 180);
+        assert!(SCRIPT.contains("finally") && SCRIPT.contains("ReleaseComObject") && SCRIPT.contains("$xl.Quit()"));
+        assert!(!SCRIPT.to_lowercase().contains(".send("));
+    }
 
     fn trabajo() -> Trabajo {
         let mut w = Trabajo {

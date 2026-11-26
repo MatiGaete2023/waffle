@@ -425,6 +425,11 @@ pub fn rut_clave(rut: &str) -> String {
     rut.to_uppercase().chars().filter(|c| c.is_ascii_digit() || *c == 'K').collect()
 }
 
+/// Conserva exclusivamente caracteres admitidos por XML 1.0 (quinta edición).
+pub fn sanitizar_xml_10(txt: &str) -> String {
+    txt.chars().filter(|&c| matches!(c as u32, 0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF)).collect()
+}
+
 /// Nombre de archivo seguro.
 pub fn safe_filename(txt: &str) -> String {
     let s: String = txt
@@ -432,13 +437,60 @@ pub fn safe_filename(txt: &str) -> String {
         .map(|c| if c.is_alphanumeric() || " -_.".contains(c) { c } else { '_' })
         .collect();
     let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let s = s.trim_matches('.').to_string();
-    if s.is_empty() { "archivo".into() } else { s.chars().take(80).collect() }
+    let s: String = s.trim_matches(['.', ' ']).chars().take(80).collect();
+    let s = s.trim_end_matches(['.', ' ']);
+    let base = s.split('.').next().unwrap_or_default().trim_end().to_ascii_uppercase();
+    let reservado = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (base.len() == 4 && (base.starts_with("COM") || base.starts_with("LPT")) && matches!(base.as_bytes()[3], b'1'..=b'9'));
+    if s.is_empty() { "archivo".into() }
+    else if reservado { format!("_{}", s.chars().take(79).collect::<String>()) }
+    else { s.to_string() }
+}
+
+/// Ejecuta un proceso con salida drenada en paralelo y plazo máximo. Nunca mata procesos Office ajenos.
+#[cfg(target_os = "windows")]
+pub(crate) fn output_timeout(cmd: &mut std::process::Command, plazo: std::time::Duration) -> std::io::Result<std::process::Output> {
+    use std::{io::{self, Read}, process::{Output, Stdio}, sync::mpsc, thread, time::{Duration, Instant}};
+    let mut hijo = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let (tx, rx) = mpsc::channel();
+    fn drenar<R: Read + Send + 'static>(mut r: R, tx: mpsc::Sender<io::Result<Vec<u8>>>) {
+        thread::spawn(move || {
+            let mut b = Vec::new();
+            let res = r.read_to_end(&mut b).map(|_| b);
+            let _ = tx.send(res);
+        });
+    }
+    let (err_tx, err_rx) = mpsc::channel();
+    drenar(hijo.stdout.take().expect("stdout piped"), tx);
+    drenar(hijo.stderr.take().expect("stderr piped"), err_tx);
+    let limite = Instant::now() + plazo;
+    let timeout = || io::Error::new(io::ErrorKind::TimedOut, "PowerShell excedió el plazo; no hay confirmación suficiente.");
+    let status = loop {
+        match hijo.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < limite => thread::sleep(Duration::from_millis(50)),
+            Ok(None) => { let _ = hijo.kill(); return Err(timeout()); }
+            Err(e) => { let _ = hijo.kill(); return Err(e); }
+        }
+    };
+    let stdout = rx.recv_timeout(limite.saturating_duration_since(Instant::now())).map_err(|_| timeout())??;
+    let stderr = err_rx.recv_timeout(limite.saturating_duration_since(Instant::now())).map_err(|_| timeout())??;
+    Ok(Output { status, stdout, stderr })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xml_y_nombres_reservados() {
+        assert_eq!(sanitizar_xml_10("a\u{0}\u{b}\t\n\r\u{fffe}\u{ffff}é🌳"), "a\t\n\ré🌳");
+        for n in ["CON", "prn.txt", "Aux", "nul", "COM1.xlsx", "LPT9", "COM9", "LPT1.txt", "CON .docx"] {
+            assert!(safe_filename(n).starts_with('_'), "{n}");
+        }
+        assert_eq!(safe_filename("COM10"), "COM10");
+        assert_eq!(safe_filename("Nómina normal"), "Nómina normal");
+    }
 
     #[test]
     fn textos() {

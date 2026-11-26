@@ -77,6 +77,11 @@ pub fn nueva_ruta(dir: &Path, nombre: &str, ext: &str) -> PathBuf {
 }
 
 pub(crate) fn xlsx_libro(hojas: &[(&str, Vec<String>, Vec<Vec<String>>)], path: &Path) -> Result<(), String> {
+    let mut wb = construir_libro(hojas)?;
+    wb.save(path).map_err(|e| format!("No se pudo guardar {}: {e}", path.display()))
+}
+
+fn construir_libro(hojas: &[(&str, Vec<String>, Vec<Vec<String>>)]) -> Result<Workbook, String> {
     let mut wb = Workbook::new();
     let head = Format::new().set_bold().set_background_color(rust_xlsxwriter::Color::RGB(0xDDE7F5)).set_border_bottom(rust_xlsxwriter::FormatBorder::Thin);
     let wrap = Format::new().set_text_wrap().set_align(rust_xlsxwriter::FormatAlign::Top);
@@ -104,7 +109,7 @@ pub(crate) fn xlsx_libro(hojas: &[(&str, Vec<String>, Vec<Vec<String>>)], path: 
             ws.set_freeze_panes(1, 0).map_err(|e| e.to_string())?;
         }
     }
-    wb.save(path).map_err(|e| format!("No se pudo guardar {}: {e}", path.display()))
+    Ok(wb)
 }
 
 fn estado_export(r: &Registro) -> &'static str {
@@ -445,10 +450,7 @@ pub fn guardar_eml(b: &Borrador, dir: &Path) -> Result<PathBuf, String> {
         let rows: Vec<Vec<String>> = n.rows.iter().zip(&n.incluir).filter(|(_, i)| **i).map(|(r, _)| r.clone()).collect();
         if !rows.is_empty() {
             let nombre_adj = format!("{}.xlsx", safe_filename(if b.programa.is_empty() { &b.titulo } else { &b.programa }));
-            let tmp = std::env::temp_dir().join(format!("flow_nomina_{}.xlsx", std::process::id()));
-            xlsx_libro(&[("Nómina", n.headers.clone(), rows)], &tmp)?;
-            let data = std::fs::read(&tmp).map_err(|e| e.to_string())?;
-            let _ = std::fs::remove_file(&tmp);
+            let data = construir_libro(&[("Nómina", n.headers.clone(), rows)])?.save_to_buffer().map_err(|e| e.to_string())?;
             out.push_str(&format!(
                 "--{boundary}\r\nContent-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet; name=\"{0}\"\r\nContent-Disposition: attachment; filename=\"{0}\"\r\nContent-Transfer-Encoding: base64\r\n\r\n",
                 enc_word(&nombre_adj)
@@ -783,7 +785,7 @@ fn llenar(t: &str, vars: &BTreeMap<String, String>) -> String {
 }
 
 fn xml_esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    crate::util::sanitizar_xml_10(s).replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 fn parrafo(t: &str, bold: bool, center: bool) -> String {
