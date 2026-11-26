@@ -64,6 +64,8 @@ pub fn dependencia(w: &Trabajo, cfg: &Config, registros: &[usize], tipo: &str) -
                 "fila": r.fila_excel,
                 "observacion": r.observacion(),
                 "res": r.res,
+                "resolucion": r.resolucion,
+                "gestiones_correo": r.gestiones_correo,
                 "excluido": r.excluido,
                 "campos": r.campos,
                 "anulaciones": r.anulaciones,
@@ -134,7 +136,13 @@ impl Preparados {
     }
 
     pub fn anotar(&mut self, tipo: &str, estado: &str, registros: Vec<String>, huella: &str, ruta: &str) {
-        let clave = format!("{:x}", Sha256::digest(format!("{tipo}|{huella}|{ruta}|{}", self.recibos.len()).as_bytes()));
+        // El tamaño no es un contador monotónico: conciliar puede eliminar recibos intermedios.
+        let mut ordinal = self.recibos.len();
+        let clave = loop {
+            let candidata = sha(&json!([tipo, huella, ruta, ordinal]));
+            if !self.recibos.contains_key(&candidata) { break candidata; }
+            ordinal = ordinal.checked_add(1).expect("no caben más recibos");
+        };
         self.recibos.insert(
             clave,
             Recibo {
@@ -146,5 +154,35 @@ impl Preparados {
                 ruta: ruta.into(),
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod pruebas {
+    use super::*;
+
+    #[test]
+    fn decisiones_invalidan_preparados() {
+        let mut w = Trabajo::default();
+        w.registros.push(crate::trabajo::Registro::default());
+        let cfg = Config::default();
+        let mut b = Borrador { registros: vec![0], ..Default::default() };
+        sellar_borrador(&w, &cfg, &mut b);
+        assert!(!borrador_obsoleto(&w, &cfg, &b));
+        w.registros[0].gestiones_correo.insert("medidas".into(), "omit".into());
+        assert!(borrador_obsoleto(&w, &cfg, &b));
+        sellar_borrador(&w, &cfg, &mut b);
+        w.registros[0].resolucion = "none".into();
+        assert!(borrador_obsoleto(&w, &cfg, &b));
+    }
+
+    #[test]
+    fn recibos_no_colisionan_tras_conciliar() {
+        let mut p = Preparados::default();
+        p.anotar("borrador", "incierto", vec![], "otra", "Outlook");
+        p.anotar("borrador", "creado", vec![], "misma", "Outlook");
+        p.conciliar_incierto("otra");
+        p.anotar("borrador", "creado", vec![], "misma", "Outlook");
+        assert_eq!(p.recibos.len(), 2);
     }
 }

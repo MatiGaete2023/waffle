@@ -48,6 +48,12 @@ impl eframe::App for FlowApp {
         self.app.screenshot.is_none()
     }
 
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if !self.app.guardar_pendiente() {
+            eprintln!("No se pudieron persistir todos los cambios pendientes de Flow.");
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.app.screenshot.as_ref().is_some_and(|s| s.frames == 0) {
             // Una pantalla virtual pequeña debe mostrar la composición completa de referencia.

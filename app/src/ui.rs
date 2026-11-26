@@ -28,14 +28,14 @@ pub enum Vista {
 }
 
 pub(crate) const VISTAS: [(Vista, &str, &str); 9] = [
+    (Vista::Descargador, "↓", "Descargador"),
+    (Vista::Meta4, "📅", "Meta 4"),
     (Vista::Trabajo, "🗂", "Trabajo"),
     (Vista::Correos, "✉", "Correos"),
     (Vista::Resoluciones, "⚖", "Resoluciones"),
     (Vista::Resultados, "📊", "Resultados"),
     (Vista::Contactos, "👥", "Contactos"),
     (Vista::Anonimizador, "🛡", "Anonimizador"),
-    (Vista::Descargador, "↓", "Descargador"),
-    (Vista::Meta4, "📅", "Meta 4"),
     (Vista::Ajustes, "⚙", "Ajustes"),
 ];
 
@@ -66,11 +66,230 @@ struct DialogoSincronia {
     filas: Vec<Vec<Cell>>,
 }
 
+// Un canal de resultados y otro de progreso. No se hace join en el hilo de egui.
+#[derive(Clone)]
+struct Progreso {
+    tx: std::sync::mpsc::Sender<String>,
+    ctx: egui::Context,
+}
+impl Progreso {
+    fn emitir(&self, estado: impl Into<String>) {
+        let _ = self.tx.send(estado.into());
+        self.ctx.request_repaint();
+    }
+}
+struct BackgroundJob<T> {
+    progreso: std::sync::mpsc::Receiver<String>,
+    resultado: std::sync::mpsc::Receiver<Result<T, String>>,
+    estado: String,
+}
+impl<T: Send + 'static> BackgroundJob<T> {
+    fn iniciar(ctx: &egui::Context, estado: &str, f: impl FnOnce(Progreso) -> T + Send + 'static) -> Self {
+        let (tx, progreso) = std::sync::mpsc::channel();
+        let (fin, resultado) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(Progreso { tx, ctx })))
+                .map_err(|_| "La operación terminó de manera inesperada; revisa los productos antes de repetir.".to_string());
+            let _ = fin.send(r);
+            repaint.request_repaint();
+        });
+        Self { progreso, resultado, estado: estado.into() }
+    }
+    fn sondear(&mut self) -> Option<Result<T, String>> {
+        for estado in self.progreso.try_iter() { self.estado = estado; }
+        match self.resultado.try_recv() {
+            Ok(r) => Some(r),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err("El trabajador se desconectó sin resultado.".into())),
+        }
+    }
+}
+
+// La operación de escritura tiene posesión exclusiva de Trabajo y preparados hasta entregar sus recibos.
+// Se conserva una referencia al estado para recuperar incluso ante un panic. El trabajador no accede a widgets.
+struct OperacionProductos {
+    work: Option<Trabajo>,
+    cfg: Config,
+    borradores: Vec<Borrador>,
+    proyectos: Vec<Proyecto>,
+    productos: Vec<(PathBuf, String)>,
+    avisos: Vec<(String, bool)>,
+    sucio: bool,
+    anon_inf: Option<anon::Informe>,
+    estado_prueba: Option<Result<crate::outlook::ReciboOutlook, crate::outlook::ErrorOutlook>>,
+    manual_estado: Option<Result<String, String>>,
+}
+impl OperacionProductos {
+    fn aviso(&mut self, texto: impl Into<String>, error: bool) { self.avisos.push((texto.into(), error)); }
+    fn registrar(&mut self, ruta: PathBuf, tipo: &str) { self.productos.push((ruta, tipo.into())); }
+    fn marcar_sucio(&mut self) { self.sucio = true; }
+    fn guardar_excel(&mut self, dir: PathBuf, progreso: &Progreso) {
+        if self.work.is_none() {
+            self.aviso("Primero abre un Excel de RUS o un paquete CSMP.", true);
+            return;
+        }
+        let w = self.work.as_ref().unwrap();
+        // Como Flow Python: copia del Excel original (o del consolidado del paquete) con las columnas de revisión.
+        // Sin libro que preservar, una tabla nueva de fidelidad reducida, con el aviso visible.
+        progreso.emitir("Preparando libro y exportando…");
+        let (r, hoja) = match crate::copia_excel::base(w) {
+            Ok(base) => (crate::copia_excel::exportar_con_base(w, &dir, &base).map(|p| (p, None)), base.hoja),
+            Err(aviso) => (crate::producto_excel::exportar(w, &dir, Some(&aviso)).map(|p| (p, Some(aviso))), w.mode().label().to_uppercase()),
+        };
+        match r {
+            Ok((p, aviso)) => {
+                let texto = format!("Excel revisable guardado: {}", p.display());
+                self.aviso(aviso.map_or(texto.clone(), |a| format!("{texto} · {a}")), false);
+                if let Some(w) = self.work.as_mut() {
+                    // Leer las celdas efectivamente guardadas evita volver a reconstruir la base original.
+                    match crate::copia_excel::recordar_copia_guardada(w, &hoja, &p) {
+                        Ok(()) => w.copia = Some(p.clone()),
+                        Err(e) => self.avisos.push((format!("Copia creada, pero no se vinculó para sincronización: {e}"), true)),
+                    }
+                }
+                crate::estadisticas::registrar_exportacion(&crate::estadisticas::directorio_metricas(), self.cfg.metricas_locales);
+                self.registrar(p, "Excel de observaciones");
+                self.marcar_sucio();
+            }
+            Err(e) => self.aviso(e, true),
+        }
+    }
+
+    fn guardar_borradores(&mut self, solo: Option<usize>, dir: PathBuf, progreso: &Progreso) {
+        let dir = dir.join(format!("Borradores_{}", chrono::Local::now().format("%Y-%m-%d")));
+        let mut ok = 0;
+        let mut duplicados = 0;
+        let mut errores = Vec::new();
+        let idx: Vec<usize> = match solo {
+            Some(j) => vec![j],
+            None => (0..self.borradores.len()).filter(|j| self.borradores[*j].incluir && self.borradores[*j].guardado.is_none()).collect(),
+        };
+        let outlook = self.cfg.destino_outlook;
+        let total = idx.len();
+        for (paso, j) in idx.into_iter().enumerate() {
+            progreso.emitir(format!("Borrador {} de {total}", paso + 1));
+            let huella = crate::preparados::huella_borrador(&self.borradores[j]);
+            if let Some(w) = self.work.as_ref() {
+                if crate::preparados::borrador_obsoleto(w, &self.cfg, &self.borradores[j]) {
+                    errores.push(format!("«{}»: {}", self.borradores[j].titulo, crate::preparados::OBSOLETO));
+                    continue;
+                }
+                // Un borrador con el mismo contenido que otro ya guardado no se crea dos veces.
+                if w.preparados.incierto(&huella) {
+                    errores.push(format!("«{}»: Outlook pudo haber guardado este borrador sin confirmarlo. Revisa Borradores de Outlook y marca «Ya lo revisé en Outlook» antes de repetir.", self.borradores[j].titulo));
+                    continue;
+                }
+                if let Some(r) = w.preparados.guardado(&huella) {
+                    self.borradores[j].guardado = Some(PathBuf::from(&r.ruta));
+                    duplicados += 1;
+                    self.marcar_sucio();
+                    continue;
+                }
+            }
+            let mut guardado: Option<(String, bool)> = None;
+            if outlook {
+                match crate::outlook::guardar_outlook(&self.borradores[j], &self.cfg.cuenta_outlook) {
+                    Ok(_) => {
+                        self.borradores[j].guardado = Some(PathBuf::from("Outlook: Borradores"));
+                        guardado = Some(("Outlook: Borradores".into(), true));
+                        ok += 1;
+                    }
+                    // Falló antes de guardar: queda una copia .eml de respaldo y se sigue con los demás.
+                    Err(crate::outlook::ErrorOutlook::NoGuardado(e)) => errores.push(e),
+                    // Pudo haberse guardado: no hay respaldo ni reintento hasta que la persona lo revise.
+                    Err(crate::outlook::ErrorOutlook::Incierto(e)) => {
+                        errores.push(e);
+                        if let Some(w) = self.work.as_mut() {
+                            let ids = crate::preparados::ids_registros(w, &self.borradores[j].registros);
+                            w.preparados.anotar("borrador", "incierto", ids, &huella, "Outlook: Borradores");
+                        }
+                        self.marcar_sucio();
+                        continue;
+                    }
+                }
+            }
+            match productos::guardar_eml(&self.borradores[j], &dir) {
+                Ok(pth) => {
+                    if !outlook {
+                        self.borradores[j].guardado = Some(pth.clone());
+                        guardado = Some((pth.display().to_string(), true));
+                        ok += 1;
+                    }
+                    self.registrar(pth, if outlook { "Copia .eml de respaldo" } else { "Borrador de correo" });
+                }
+                Err(e) => errores.push(e),
+            }
+            if let Some((ruta, _)) = guardado {
+                if let Some(w) = self.work.as_mut() {
+                    let ids = crate::preparados::ids_registros(w, &self.borradores[j].registros);
+                    w.preparados.anotar("borrador", "creado", ids, &huella, &ruta);
+                }
+                self.marcar_sucio();
+            }
+        }
+        let sin_destinatario = (0..self.borradores.len())
+            .filter(|j| self.borradores[*j].guardado.is_some() && self.borradores[*j].para.trim().is_empty())
+            .count();
+        if sin_destinatario > 0 {
+            self.aviso(format!("{sin_destinatario} borrador(es) quedaron sin destinatario: complétalo en Outlook antes de enviar."), false);
+        }
+        if ok > 0 {
+            crate::estadisticas::registrar_borrador(&crate::estadisticas::directorio_metricas(), self.cfg.metricas_locales);
+        }
+        if duplicados > 0 {
+            self.aviso(format!("{duplicados} borrador(es) ya estaban guardados con el mismo contenido y no se crearon de nuevo."), false);
+        }
+        if ok > 0 && outlook {
+            self.aviso(format!("{ok} borradores guardados en Borradores de Outlook. Revísalos y envíalos tú."), false);
+        } else if ok > 0 {
+            self.aviso(format!("{ok} borradores guardados en {}. Ábrelos con Outlook, revísalos y envíalos tú.", dir.display()), false);
+        } else if errores.is_empty() && duplicados == 0 {
+            self.aviso("No hay borradores pendientes marcados (los ya guardados se omiten).", false);
+        }
+        for e in errores {
+            self.aviso(e, true);
+        }
+    }
+
+    fn generar_word(&mut self, dir: PathBuf, corte: NaiveDate, formato: FormatoWord) {
+        match productos::generar_word_formato(&self.proyectos, &dir, corte, formato) {
+            Ok(res) => {
+                let n_archivos = res.archivos.len();
+                let n_proyectos: usize = res.archivos.iter().map(|(_, ids)| ids.len()).sum();
+                if let Some(w) = &mut self.work {
+                    for (ruta, indices) in &res.archivos {
+                        for &idx in indices {
+                            if let Some(pr) = self.proyectos.get(idx) {
+                                let ids = crate::preparados::ids_registros(w, &pr.registros);
+                                w.preparados.anotar("word", "creado", ids, &pr.dependencia, &ruta.display().to_string());
+                            }
+                        }
+                    }
+                }
+                self.aviso(format!("Proyectos generados: {n_archivos} archivo(s), {n_proyectos} proyecto(s) en {}", res.carpeta.display()), false);
+                self.marcar_sucio();
+                self.registrar(res.carpeta, "Proyectos de resolución (Word)");
+            }
+            Err(e) => self.aviso(e, true),
+        }
+    }
+}
+
 pub struct App {
     cfg: Config,
     vista: Vista,
     work: Option<Trabajo>,
     corte_txt: String,
+    corte_valido: NaiveDate,
+    inspector_tab: usize,
+    ajustes_tab: usize,
+    desplazar_sel: bool,
+    favoritos_cache: Option<std::collections::BTreeMap<String, String>>,
+    matriz_cache: Option<(String, Vec<String>)>,
+    huellas_cache: Vec<Option<String>>,
+    producto_job: Option<(BackgroundJob<()>, std::sync::Arc<std::sync::Mutex<OperacionProductos>>)>,
     pedida: Option<Mode>,
     sel: Option<usize>,
     filtro: String,
@@ -110,6 +329,8 @@ pub struct App {
     favorito_elegido: String,
     valores_favorito: std::collections::BTreeMap<String, String>,
     /// Lo que se está editando en cada fila de contactos (correos y alias) antes de guardarlo.
+    contactos_pendientes: BTreeSet<String>,
+    cfg_sucia: bool,
     contacto_buf: std::collections::BTreeMap<String, (String, String)>,
     /// Anulaciones de columnas de origen en edición para la fila seleccionada: (fila, revisión, mapa clave → texto).
     origen_buf: Option<(usize, u64, std::collections::BTreeMap<String, String>)>,
@@ -131,7 +352,8 @@ pub struct App {
     actualizacion: Option<crate::actualizacion::Pendiente>,
     actualizacion_error: Option<String>,
     actualizacion_oculta: bool,
-    actualizacion_rx: Option<std::sync::mpsc::Receiver<Result<Option<crate::actualizacion::Pendiente>, String>>>,
+    actualizacion_rx: Option<BackgroundJob<Result<Option<crate::actualizacion::Pendiente>, String>>>,
+    actualizacion_inicial: bool,
     estado_borrador_prueba: Option<Result<crate::outlook::ReciboOutlook, crate::outlook::ErrorOutlook>>,
     /// Huella del programa en uso, calculada una sola vez (leer el ejecutable en cada cuadro congelaría la ventana).
     huella_programa: Option<String>,
@@ -159,6 +381,14 @@ impl App {
             vista: Vista::Trabajo,
             work: None,
             corte_txt: hoy.format("%d/%m/%Y").to_string(),
+            corte_valido: hoy,
+            inspector_tab: 0,
+            ajustes_tab: 0,
+            desplazar_sel: false,
+            favoritos_cache: None,
+            matriz_cache: None,
+            huellas_cache: Vec::new(),
+            producto_job: None,
             pedida: None,
             sel: None,
             filtro: String::new(),
@@ -190,6 +420,8 @@ impl App {
             favorito_elegido: String::new(),
             valores_favorito: std::collections::BTreeMap::new(),
             contacto_buf: std::collections::BTreeMap::new(),
+            contactos_pendientes: BTreeSet::new(),
+            cfg_sucia: false,
             origen_buf: None,
             plantilla_sel: "espera".into(),
             plantilla_edicion: None,
@@ -206,6 +438,7 @@ impl App {
             actualizacion_error: None,
             actualizacion_oculta: false,
             actualizacion_rx: None,
+            actualizacion_inicial: screenshot.is_none(),
             estado_borrador_prueba: None,
             huella_programa: None,
             anon_inf: None,
@@ -230,19 +463,6 @@ impl App {
             app.cargar_ejemplo(Mode::Espera);
             app.avisos.clear();
             app.sel = Some(1);
-        } else {
-            let (tx, rx) = std::sync::mpsc::channel();
-            app.actualizacion_rx = Some(rx);
-            let dir_act = crate::actualizacion::carpeta();
-            let adic = (!app.cfg.carpeta_actualizaciones_adicional.trim().is_empty())
-                .then(|| PathBuf::from(app.cfg.carpeta_actualizaciones_adicional.trim()));
-            let actual = std::env::current_exe().ok();
-            std::thread::spawn(move || {
-                if let Some(act) = actual {
-                    let res = crate::actualizacion::buscar_con_adicional(&dir_act, adic.as_deref(), &act);
-                    let _ = tx.send(res);
-                }
-            });
         }
         app
     }
@@ -252,25 +472,79 @@ impl App {
     }
 
     /// Busca una versión nueva en la carpeta de actualizaciones; solo avisa, no cambia nada.
-    fn revisar_actualizacion(&mut self) {
+    fn revisar_actualizacion(&mut self, ctx: &egui::Context) {
         self.actualizacion_error = None;
         self.actualizacion = None;
-        let Ok(actual) = std::env::current_exe() else { return };
-        let adicional = if !self.cfg.carpeta_actualizaciones_adicional.trim().is_empty() {
-            Some(std::path::Path::new(self.cfg.carpeta_actualizaciones_adicional.trim()))
-        } else {
-            None
-        };
-        match crate::actualizacion::buscar_con_adicional(&crate::actualizacion::carpeta(), adicional, &actual) {
-            Ok(p) => {
-                self.actualizacion_oculta = false;
-                self.actualizacion = p;
-            }
-            Err(e) => self.actualizacion_error = Some(e),
+        self.actualizacion_oculta = false;
+        let dir = crate::actualizacion::carpeta();
+        let adicional = (!self.cfg.carpeta_actualizaciones_adicional.trim().is_empty())
+            .then(|| PathBuf::from(self.cfg.carpeta_actualizaciones_adicional.trim()));
+        ctx.request_repaint();
+        self.actualizacion_rx = Some(BackgroundJob::iniciar(ctx, "Buscando actualizaciones…", move |_| {
+            let actual = std::env::current_exe().map_err(|e| e.to_string())?;
+            crate::actualizacion::buscar_con_adicional(&dir, adicional.as_deref(), &actual)
+        }));
+    }
+
+    fn tomar_operacion(&mut self) -> OperacionProductos {
+        OperacionProductos {
+            work: self.work.take(), cfg: self.cfg.clone(),
+            borradores: std::mem::take(&mut self.borradores), proyectos: std::mem::take(&mut self.proyectos),
+            productos: Vec::new(), avisos: Vec::new(), sucio: false,
+            anon_inf: None, estado_prueba: None, manual_estado: None,
         }
     }
 
-    /// Guarda la sesión, reemplaza el programa por la versión nueva y lo reinicia.
+    fn recuperar_operacion(&mut self, op: OperacionProductos) {
+        self.work = op.work; self.borradores = op.borradores; self.proyectos = op.proyectos;
+        for (ruta, tipo) in op.productos { self.registrar(ruta, &tipo); }
+        for (aviso, error) in op.avisos { self.aviso(aviso, error); }
+        if let Some(inf) = op.anon_inf { self.anon_inf = Some(inf); }
+        if let Some(estado) = op.estado_prueba { self.estado_borrador_prueba = Some(estado); }
+        if let Some(estado) = op.manual_estado { self.manual_estado = Some(estado); }
+        if op.sucio { self.marcar_sucio(); }
+        self.huellas_cache.clear();
+    }
+
+    fn iniciar_producto(&mut self, ctx: &egui::Context, nombre: &str, f: impl FnOnce(&mut OperacionProductos, &Progreso) + Send + 'static) {
+        if self.producto_job.is_some() || !self.guardar_pendiente() { return; }
+        let estado = std::sync::Arc::new(std::sync::Mutex::new(self.tomar_operacion()));
+        let trabajador = estado.clone();
+        let job = BackgroundJob::iniciar(ctx, nombre, move |progreso| {
+            let mut op = trabajador.lock().unwrap_or_else(|e| e.into_inner());
+            f(&mut op, &progreso);
+        });
+        self.producto_job = Some((job, estado));
+        ctx.request_repaint();
+    }
+
+    fn sondear_producto(&mut self) {
+        let resultado = self.producto_job.as_mut().and_then(|(job, _)| job.sondear());
+        if let Some(resultado) = resultado {
+            let (_, estado) = self.producto_job.take().expect("job activo");
+            // El trabajador liberó el guard antes de publicar el resultado.
+            let mut op = estado.lock().unwrap_or_else(|e| e.into_inner());
+            let recuperada = OperacionProductos {
+                work: op.work.take(), cfg: op.cfg.clone(), borradores: std::mem::take(&mut op.borradores),
+                proyectos: std::mem::take(&mut op.proyectos), productos: std::mem::take(&mut op.productos),
+                avisos: std::mem::take(&mut op.avisos), sucio: op.sucio,
+                anon_inf: op.anon_inf.take(), estado_prueba: op.estado_prueba.take(), manual_estado: op.manual_estado.take(),
+            };
+            drop(op);
+            self.recuperar_operacion(recuperada);
+            if let Err(e) = resultado { self.aviso(e, true); }
+            self.guardar_pendiente();
+        }
+    }
+
+    #[cfg(test)]
+    fn ejecutar_producto_en_linea(&mut self, f: impl FnOnce(&mut OperacionProductos, &Progreso)) {
+        let mut op = self.tomar_operacion();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        f(&mut op, &Progreso { tx, ctx: egui::Context::default() });
+        self.recuperar_operacion(op);
+    }
+
     fn aplicar_actualizacion(&mut self, ctx: &egui::Context) {
         let Some(p) = self.actualizacion.clone() else { return };
         if let Err(e) = self.guardar_sesion_actual() {
@@ -288,14 +562,17 @@ impl App {
     }
 
     fn corte(&self) -> NaiveDate {
-        parse_date_text(&self.corte_txt).unwrap_or_else(|| chrono::Local::now().date_naive())
+        parse_date_text(&self.corte_txt).unwrap_or(self.corte_valido)
     }
 
     fn guardar_cfg(&mut self) {
+        self.revision += 1;
         if self.screenshot.is_some() {
             return;
         }
+        self.cfg_sucia = false;
         if let Err(e) = config::save(&self.cfg) {
+            self.cfg_sucia = true;
             self.aviso(format!("No se pudo guardar la configuración: {e}"), true);
         }
     }
@@ -303,6 +580,7 @@ impl App {
     fn marcar_sucio(&mut self) {
         self.revision += 1;
         self.sucio = Some(Instant::now());
+        self.huellas_cache.clear();
     }
 
     fn carpeta_productos(&mut self) -> Option<PathBuf> {
@@ -439,6 +717,7 @@ impl App {
 
     fn activar_trabajo(&mut self) {
         let w = self.work.as_ref().unwrap();
+        if let Some(corte) = w.corte { self.corte_valido = corte; self.corte_txt = corte.format("%d/%m/%Y").to_string(); }
         let n = w.registros.len();
         let ms = w.analisis_ms;
         let modo = w.mode().label();
@@ -451,6 +730,7 @@ impl App {
         self.sel = (n > 0).then_some(0);
         let (preparados_b, preparados_p) = self.work.as_ref().map(|w| (w.preparados.borradores.clone(), w.preparados.proyectos.clone())).unwrap_or_default();
         self.borradores = preparados_b;
+        self.huellas_cache.clear();
         self.bsel = (!self.borradores.is_empty()).then_some(0);
         self.proyectos = preparados_p;
         self.psel = (!self.proyectos.is_empty()).then_some(0);
@@ -503,7 +783,21 @@ impl App {
         );
     }
 
-    fn guardar_pendiente(&mut self) -> bool {
+    pub fn guardar_pendiente(&mut self) -> bool {
+        if self.screenshot.is_some() { return true; }
+        if self.work.is_some() && parse_date_text(&self.corte_txt).is_some_and(|c| c != self.corte_valido) { self.reanalizar(); }
+        let mut cfg = self.cfg.clone();
+        for nombre in &self.contactos_pendientes {
+            if let Some((correo, alias)) = self.contacto_buf.get(nombre) {
+                let alias: Vec<String> = alias.split(',').map(str::to_string).collect();
+                match crate::personalizar::guardar_contacto(&cfg, nombre, correo, &alias, Some(nombre)) {
+                    Ok(c) => cfg = c,
+                    Err(e) => { let msg = format!("Contacto pendiente: {e}"); self.aviso(msg, true); return false; }
+                }
+            }
+        }
+        if !self.contactos_pendientes.is_empty() { self.cfg = cfg; self.contactos_pendientes.clear(); self.cfg_sucia = true; }
+        if self.cfg_sucia { self.guardar_cfg(); if self.cfg_sucia { return false; } }
         if self.sucio.is_some() && self.screenshot.is_none() {
             if let Err(e) = self.guardar_sesion_actual() {
                 self.aviso(format!("No se pudo guardar la sesión: {e}"), true);
@@ -551,6 +845,7 @@ impl App {
             "cumplimiento" => self.cargar_ejemplo(Mode::Cumplimiento),
             "informes" => self.cargar_ejemplo(Mode::Informes),
             "trabajo-contexto" if self.screenshot.is_some() => {
+                self.inspector_tab = 1;
                 let ruta = std::env::var_os("FLOW_E3_PAQUETE").expect("paquete ficticio de contexto");
                 self.corte_txt = "19/10/2026".into();
                 self.abrir(PathBuf::from(ruta));
@@ -590,7 +885,8 @@ impl App {
     }
 
     fn reanalizar(&mut self) {
-        let corte = self.corte();
+        let Some(corte) = parse_date_text(&self.corte_txt) else { return };
+        self.corte_valido = corte;
         self.revision_bitacoras = None;
         if let Some(w) = &mut self.work {
             w.corte = Some(corte);
@@ -601,6 +897,7 @@ impl App {
             }
             w.analizar(&self.cfg);
             self.revision += 1;
+            self.sucio = Some(Instant::now());
             let ms = w.analisis_ms;
             let n = w.registros.len();
             self.aviso(format!("Reglas aplicadas de nuevo a {n} registros ({ms} ms). Tus ediciones se conservan."), false);
@@ -608,33 +905,16 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     fn guardar_excel(&mut self) {
-        if self.work.is_none() {
-            self.aviso("Primero abre un Excel de RUS o un paquete CSMP.", true);
-            return;
-        }
         let Some(dir) = self.carpeta_productos() else { return };
-        let w = self.work.as_ref().unwrap();
-        // Como Flow Python: copia del Excel original (o del consolidado del paquete) con las columnas de revisión.
-        // Sin libro que preservar, una tabla nueva de fidelidad reducida, con el aviso visible.
-        let hoja = crate::copia_excel::base(w).map(|b| b.hoja).unwrap_or_else(|_| w.mode().label().to_uppercase());
-        let r = match crate::copia_excel::base(w) {
-            Ok(_) => crate::copia_excel::exportar(w, &dir).map(|p| (p, None)),
-            Err(aviso) => crate::producto_excel::exportar(w, &dir, Some(&aviso)).map(|p| (p, Some(aviso))),
-        };
-        match r {
-            Ok((p, aviso)) => {
-                let texto = format!("Excel revisable guardado: {}", p.display());
-                self.aviso(aviso.map_or(texto.clone(), |a| format!("{texto} · {a}")), false);
-                if let Some(w) = self.work.as_mut() {
-                    crate::sincronizar::recordar_exportacion(w, &hoja);
-                    w.copia = Some(p.clone());
-                }
-                crate::estadisticas::registrar_exportacion(&crate::estadisticas::directorio_metricas(), self.cfg.metricas_locales);
-                self.registrar(p, "Excel de observaciones");
-            }
-            Err(e) => self.aviso(e, true),
-        }
+        self.ejecutar_producto_en_linea(|op, progreso| op.guardar_excel(dir, progreso));
+    }
+
+    fn iniciar_excel(&mut self, ctx: &egui::Context) {
+        if self.work.is_none() { self.aviso("Primero abre un Excel de RUS o un paquete CSMP.", true); return; }
+        let Some(dir) = self.carpeta_productos() else { return };
+        self.iniciar_producto(ctx, "Guardando observaciones…", move |op, progreso| op.guardar_excel(dir, progreso));
     }
 
     /// «Actualizar desde Excel»: trae a Trabajo la revisión hecha en la última copia guardada.
@@ -730,6 +1010,33 @@ impl App {
             theme::aplicar(ctx, self.cfg.tema_oscuro);
             self.ultimo_tema = Some(self.cfg.tema_oscuro);
         }
+        if self.actualizacion_inicial {
+            self.actualizacion_inicial = false;
+            self.revisar_actualizacion(ctx);
+        }
+        if let Some(res) = self.actualizacion_rx.as_mut().and_then(BackgroundJob::sondear) {
+            self.actualizacion_rx = None;
+            match res.and_then(|r| r) {
+                Ok(act) => { self.actualizacion = act; self.actualizacion_error = None; }
+                Err(e) => { self.actualizacion = None; self.actualizacion_error = Some(e); }
+            }
+        }
+        self.sondear_producto();
+        if let Some((job, _)) = &self.producto_job {
+            if ctx.input(|i| i.viewport().close_requested()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.heading("Operación en curso");
+                ui.horizontal(|ui| { ui.spinner(); ui.label(&job.estado); });
+                ui.label("La ventana sigue respondiendo. La edición y el cierre se habilitan al confirmar el resultado, para proteger las decisiones y recibos.");
+            });
+            return;
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && !self.guardar_pendiente() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        let vista_anterior = self.vista;
         // Atajos
         if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::O))) {
             if self.vista == Vista::Descargador {
@@ -739,23 +1046,9 @@ impl App {
             }
         }
         if !matches!(self.vista, Vista::Descargador | Vista::Meta4) && ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::S))) {
-            self.guardar_excel();
+            self.iniciar_excel(ctx);
         }
-        if let Some(rx) = &self.actualizacion_rx {
-            if let Ok(res) = rx.try_recv() {
-                match res {
-                    Ok(act) => {
-                        self.actualizacion = act;
-                        self.actualizacion_error = None;
-                    }
-                    Err(e) => {
-                        self.actualizacion = None;
-                        self.actualizacion_error = Some(e);
-                    }
-                }
-                self.actualizacion_rx = None;
-            }
-        }
+        if self.producto_job.is_some() { return; }
         // Archivos arrastrados a la ventana
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
         if !dropped.is_empty() {
@@ -772,8 +1065,8 @@ impl App {
             if t.elapsed().as_millis() > 800 && self.screenshot.is_none() {
                 if let Err(e) = self.guardar_sesion_actual() {
                     self.aviso(format!("No se pudo guardar la sesión: {e}"), true);
-                }
-                self.sucio = None;
+                    self.sucio = Some(Instant::now());
+                } else { self.sucio = None; }
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(300));
             }
@@ -784,6 +1077,7 @@ impl App {
         if !matches!(self.vista, Vista::Descargador | Vista::Meta4) {
             self.barra(ctx, &p);
         }
+        if self.producto_job.is_some() { return; }
         self.avisos_panel(ctx, &p);
         self.dialogo_sincronia(ctx, &p);
         self.dialogo_conciliacion(ctx, &p);
@@ -793,7 +1087,7 @@ impl App {
                 Vista::Trabajo => self.v_trabajo(ui, &p),
                 Vista::Correos => self.v_correos(ui, &p),
                 Vista::Resoluciones => self.v_resoluciones(ui, &p),
-                Vista::Resultados => self.v_resultados(ui, &p),
+                Vista::Resultados => { egui::ScrollArea::vertical().id_salt("resultados_asistente").show(ui, |ui| self.v_resultados(ui, &p)); }
                 Vista::Contactos => self.v_contactos(ui, &p),
                 Vista::Anonimizador => self.v_anon(ui, &p),
                 // Estas dos vistas son largas y no traen su propio desplazamiento: sin él, lo que queda bajo el borde de la
@@ -806,6 +1100,8 @@ impl App {
                 }
                 Vista::Ajustes => self.v_ajustes(ui, &p),
             });
+        if self.producto_job.is_some() { return; }
+        if self.vista != vista_anterior && !self.guardar_pendiente() { self.vista = vista_anterior; ctx.request_repaint(); }
         if let Some(paquete) = self.descargador.paquete_para_trabajo() {
             self.abrir(paquete);
         }
@@ -858,12 +1154,12 @@ impl App {
                 });
                 ui.add_space(18.0);
                 for (v, icon, label) in VISTAS {
-                    if v == Vista::Anonimizador {
-                        ui.add_space(10.0);
-                        ui.label(RichText::new("HERRAMIENTAS").size(10.5).color(p.nav_text.gamma_multiply(0.5)));
+                    if let Some(etapa) = match v { Vista::Descargador => Some("1. Captura"), Vista::Trabajo => Some("2. Gestión CSMP"), Vista::Anonimizador => Some("3. Herramientas"), _ => None } {
+                        ui.add_space(7.0);
+                        ui.label(RichText::new(etapa).size(12.0).color(p.nav_text).strong());
                     }
                     let activo = self.vista == v;
-                    let fill = if activo { p.accent } else { Color32::TRANSPARENT };
+                    let fill = if activo { p.primary_bg } else { Color32::TRANSPARENT };
                     let txt_color = if activo { Color32::WHITE } else { p.nav_text };
                     let badge = match v {
                         Vista::Correos if !self.borradores.is_empty() => format!("{}", self.borradores.len()),
@@ -887,9 +1183,7 @@ impl App {
                     if resp.hovered() && !activo {
                         ui.painter().rect_stroke(r.response.rect, 8.0, egui::Stroke::new(1.0_f32, p.nav_text.gamma_multiply(0.25)), egui::StrokeKind::Inside);
                     }
-                    if resp.clicked() {
-                        self.vista = v;
-                    }
+                    if resp.clicked() && self.guardar_pendiente() { self.vista = v; }
                     ui.add_space(2.0);
                 }
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
@@ -913,12 +1207,14 @@ impl App {
                         self.abrir_dialogo();
                     }
                     if ui.button("💾  Guardar observaciones").on_hover_text("Ctrl+S · copia del Excel original con la observación de cada fila (requiere Excel)").clicked() {
-                        self.guardar_excel();
+                        self.iniciar_excel(ctx);
                     }
                     ui.separator();
                     ui.label(RichText::new("Corte").color(p.muted));
                     let r = ui.add(egui::TextEdit::singleline(&mut self.corte_txt).desired_width(88.0).hint_text("dd/mm/aaaa"));
-                    if r.lost_focus() && parse_date_text(&self.corte_txt).is_some() {
+                    if parse_date_text(&self.corte_txt).is_none() {
+                        ui.label(RichText::new("Fecha inválida").color(p.red)).on_hover_text("Usa dd/mm/aaaa. Se conserva el corte y análisis anteriores.");
+                    } else if r.lost_focus() || (r.has_focus() && ui.input(|i| i.key_pressed(Key::Enter))) {
                         self.reanalizar();
                     }
                     ui.label(RichText::new("Etapa").color(p.muted));
@@ -1122,6 +1418,7 @@ impl App {
             self.sucio = None;
         }
         self.sel = Some(primera);
+        self.desplazar_sel = true;
         self.filtro.clear();
         self.filtro_estado = None;
         self.filtro_trib.clear();
@@ -1205,6 +1502,7 @@ impl App {
             let accion_aplicada = match accion {
                 Some(crate::revision_ui::Accion::AbrirFila(i)) => {
                     self.sel = Some(i);
+                    self.desplazar_sel = true;
                     true
                 }
                 Some(crate::revision_ui::Accion::SeleccionarEnTrabajo(filas)) => {
@@ -1222,7 +1520,7 @@ impl App {
         }
         ui.add_space(4.0);
         let mut nuevo_filtro: Option<Option<Estado>> = None;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let filtro_actual = self.filtro_estado;
             let mut tarjeta = |ui: &mut egui::Ui, label: &str, n: usize, color: Color32, estado: Option<Estado>| {
                 let activo = filtro_actual == estado;
@@ -1246,6 +1544,11 @@ impl App {
             tarjeta(ui, "Excluidos", *conteos.get("Excluido").unwrap_or(&0), p.gray, Some(Estado::Excluido));
             tarjeta(ui, "Sin observación", *conteos.get("Sin observación").unwrap_or(&0), p.muted, Some(Estado::SinObservacion));
         });
+        let revisadas = *conteos.get("Revisada").unwrap_or(&0);
+        let excluidas = *conteos.get("Excluido").unwrap_or(&0);
+        let revisables = total.saturating_sub(excluidas);
+        let fraccion = if revisables == 0 { 0.0 } else { revisadas as f32 / revisables as f32 };
+        ui.add(egui::ProgressBar::new(fraccion).text(format!("Revisión: {revisadas}/{revisables} (sin excluidas)")));
         if let Some(f) = nuevo_filtro {
             self.filtro_estado = f;
         }
@@ -1261,7 +1564,9 @@ impl App {
         let mut marcar_visibles = false;
         let mut marcar_seleccion: Option<bool> = None;
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.filtro).hint_text("🔍  Buscar RIT, nombre, RUT, programa u observación").desired_width(380.0));
+            let foco = ui.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::F)));
+            let r = ui.add(egui::TextEdit::singleline(&mut self.filtro).id_source("filtro_trabajo").hint_text("Buscar RIT, nombre, RUT, programa u observación").desired_width((ui.available_width() * 0.45).clamp(150.0, 380.0)));
+            if foco { r.request_focus(); }
             egui::ComboBox::from_id_salt("ftrib")
                 .selected_text(if self.filtro_trib.is_empty() { "Todos los tribunales".to_string() } else { self.filtro_trib.clone() })
                 .show_ui(ui, |ui| {
@@ -1271,13 +1576,15 @@ impl App {
                     }
                 });
             ui.checkbox(&mut self.solo_marcadas, "Solo filas marcadas");
+        });
+        ui.horizontal_wrapped(|ui| {
             if ui.button("☑ Marcar visibles").on_hover_text("Marca todas las filas que muestra el filtro actual").clicked() {
                 marcar_seleccion = Some(true);
             }
             if ui.button("☐ Desmarcar todas").clicked() {
                 marcar_seleccion = Some(false);
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("↻  Volver a analizar…").on_hover_text("Descarta ediciones y marcas y aplica las reglas desde cero").clicked() {
                     self.confirmar_reinicio = true;
                 }
@@ -1320,9 +1627,11 @@ impl App {
             let pos = self.sel.and_then(|s| ids.iter().position(|i| *i == s));
             if ui.input(|i| i.key_pressed(Key::ArrowDown)) {
                 self.sel = Some(ids[pos.map_or(0, |p| (p + 1).min(ids.len() - 1))]);
+                self.desplazar_sel = true;
             }
             if ui.input(|i| i.key_pressed(Key::ArrowUp)) {
                 self.sel = Some(ids[pos.map_or(0, |p| p.saturating_sub(1))]);
+                self.desplazar_sel = true;
             }
             if ui.input(|i| i.key_pressed(Key::Space)) {
                 if let (Some(s), Some(w)) = (self.sel, &mut self.work) {
@@ -1367,8 +1676,11 @@ impl App {
         let w = self.work.as_mut().unwrap();
         // Anchos proporcionales al espacio: la tabla nunca se sale de su tarjeta.
         let libre = (ui.available_width() - 26.0 - 104.0 - 74.0 - 80.0 - 70.0).max(300.0);
-        TableBuilder::new(ui)
-            .striped(true)
+        let mut tabla = TableBuilder::new(ui);
+        if std::mem::take(&mut self.desplazar_sel) {
+            if let Some(pos) = sel.and_then(|s| ids.iter().position(|&i| i == s)) { tabla = tabla.scroll_to_row(pos, Some(egui::Align::Center)); }
+        }
+        tabla.striped(true)
             .resizable(true)
             .auto_shrink(false)
             .sense(egui::Sense::click())
@@ -1466,6 +1778,12 @@ impl App {
             return;
         };
         let mostrar_cronologia = self.screenshot.is_some();
+        ui.horizontal_wrapped(|ui| {
+            for (j, titulo) in ["Observación", "Contexto SITFA", "Datos RUS", "Bitácora"].into_iter().enumerate() {
+                ui.selectable_value(&mut self.inspector_tab, j, titulo);
+            }
+        });
+        let tab = self.inspector_tab;
         let mut cambio = false;
         let mut consignacion: Option<(String, bool)> = None;
         let mut aplicar_origen: Option<std::collections::BTreeMap<String, String>> = None;
@@ -1483,7 +1801,7 @@ impl App {
             let rut = w.value(&w.registros[i], "rut");
             let headers = w.headers.clone();
             let consignados = w.consignados(&w.registros[i]);
-            theme::card(p).show(ui, |ui| {
+            if tab == 0 { theme::card(p).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     let e = w.registros[i].estado();
@@ -1503,7 +1821,7 @@ impl App {
                 theme::seccion(ui, p, "Observación");
                 let r = &mut w.registros[i];
                 let mut texto = r.observacion().to_string();
-                let resp = ui.add(egui::TextEdit::multiline(&mut texto).desired_rows(7).desired_width(f32::INFINITY).font(egui::TextStyle::Body));
+                let resp = ui.add(egui::TextEdit::multiline(&mut texto).id_source(("obs", &w.hash, i)).desired_rows(7).desired_width(f32::INFINITY).font(egui::TextStyle::Body));
                 if resp.changed() {
                     r.editada = if texto == r.propuesta { None } else { Some(texto) };
                     cambio = true;
@@ -1512,7 +1830,7 @@ impl App {
                 ui.horizontal(|ui| {
                     let label = if r.revisada { "✔ Revisada" } else { "Marcar revisada" };
                     let b = if r.revisada {
-                        ui.add(egui::Button::new(RichText::new(label).color(Color32::WHITE).strong()).fill(p.green))
+                        ui.add(egui::Button::new(RichText::new(label).color(Color32::WHITE).strong()).fill(p.reviewed_bg))
                     } else {
                         theme::primary(ui, p, label)
                     };
@@ -1633,16 +1951,17 @@ impl App {
                     theme::seccion(ui, p, "Reglas aplicadas");
                     ui.label(RichText::new(r.eventos.join(" · ")).size(11.5).color(p.muted).monospace());
                 }
-            });
+            }); }
             let contexto = w.paquete.as_ref().and_then(|pq| {
                 let id = headers.iter().position(|h| h == "ID_REGISTRO_CAPTURA").and_then(|c| w.registros[i].values.get(c))?.display();
                 pq.contextos.get(&id).map(|contexto| (id, contexto.clone()))
             });
-            if let Some((id, ctx)) = contexto {
+            if let Some((id, ctx)) = contexto.filter(|_| tab == 1 || tab == 3) {
                 ui.add_space(8.0);
                 theme::card(p).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     theme::seccion(ui, p, "Fuentes del paquete");
+                    if tab == 1 {
                     if let Some(e) = &ctx.escritos {
                         let estado = match e.cobertura.as_str() {
                             _ if e.discordante => "lecturas simultáneas discordantes".to_string(),
@@ -1691,6 +2010,8 @@ impl App {
                     if let Some(primera) = ctx.calendario.as_ref().and_then(|c| c.pendientes.first()) {
                         ui.label(RichText::new(format!("Primera proyección pendiente · {}", primera.format("%d/%m/%Y"))).size(12.0));
                     }
+                    }
+                    if tab == 3 {
                     if let Some(cronologia) = &ctx.cronologia {
                         egui::CollapsingHeader::new("Cronología de bitácora")
                             .id_salt(&id)
@@ -1727,9 +2048,11 @@ impl App {
                                     )).color(p.amber));
                                 }
                             });
+                    } else { ui.label("No hay cronología de bitácora disponible."); }
                     }
                 });
-            }
+            } else if tab == 1 || tab == 3 { ui.label("Sin contexto de paquete disponible para esta fila."); }
+            if tab == 2 {
             ui.add_space(8.0);
             theme::card(p).show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -1761,7 +2084,7 @@ impl App {
                             for (k, idx, titulo) in &campos_origen {
                                 ui.label(RichText::new(titulo).size(12.0).color(p.muted));
                                 let entrada = buf.entry((*k).to_string()).or_default();
-                                ui.add(egui::TextEdit::singleline(entrada).desired_width(180.0));
+                                ui.add(egui::TextEdit::singleline(entrada).id_source(("origen", &w.hash, i, k)).desired_width(180.0));
                                 let orig = w.registros[i].values.get(*idx).map(|c| c.display()).unwrap_or_default();
                                 ui.label(RichText::new(if orig.trim().is_empty() { "vacío".into() } else { format!("Orig: {orig}") }).size(11.5).color(p.muted));
                                 ui.end_row();
@@ -1798,6 +2121,7 @@ impl App {
                     }
                 });
             });
+            }
         });
         self.origen_buf = origen_buf;
         if let Some(anulaciones) = aplicar_origen {
@@ -1868,6 +2192,7 @@ impl App {
         self.actualizar_obsoletos();
         let obsoletos_b = self.obsoletos.1.clone();
         theme::titulo(ui, p, "Correos", "Borradores listos para revisar: en Borradores de Outlook o como .eml sin enviar. Nunca se envían. Todos llevan CC a ucc_concepcion@pjud.cl.");
+        ui.label(RichText::new("Solo borradores · CC fijo ucc_concepcion@pjud.cl").strong().color(p.green));
         self.correo_manual(ui, p);
         let mut accion: Option<&'static str> = None;
         let mut guardar_destino = false;
@@ -1909,7 +2234,7 @@ impl App {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let hay = self.work.is_some();
-                if ui.add_enabled(hay, egui::Button::new(RichText::new("✉  Preparar borradores").color(Color32::WHITE).strong()).fill(p.accent)).clicked() {
+                if ui.add_enabled(hay, egui::Button::new(RichText::new("✉  Preparar borradores").color(Color32::WHITE).strong()).fill(p.primary_bg)).clicked() {
                     accion = Some("preparar");
                 }
                 let particulares: Vec<(String, String)> = self
@@ -1954,7 +2279,7 @@ impl App {
         }
         match accion {
             Some("preparar") => self.preparar_correos(),
-            Some("guardar") => self.guardar_borradores(None),
+            Some("guardar") => { self.iniciar_borradores(ui.ctx(), None); return; }
             Some(k) => self.preparar_tipo(k),
             None => {}
         }
@@ -1978,6 +2303,7 @@ impl App {
         let mut guardar_uno = None;
         let mut guardar_nomina = None;
         let mut conciliar_incierto: Option<String> = None;
+        let mut correo_editado = false;
         ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(egui::vec2(330.0, alto), egui::Layout::top_down(egui::Align::Min), |ui| {
                 egui::ScrollArea::vertical().id_salt("blist").show(ui, |ui| {
@@ -1992,7 +2318,7 @@ impl App {
                             ui.set_width(300.0);
                             ui.set_max_width(300.0);
                             ui.horizontal(|ui| {
-                                ui.checkbox(&mut b.incluir, "");
+                                correo_editado |= ui.checkbox(&mut b.incluir, "").changed();
                                 ui.add(egui::Label::new(RichText::new(&b.titulo).strong().size(13.0)).truncate()).on_hover_text(&b.titulo);
                             });
                             let falta = b.para.trim().is_empty();
@@ -2021,25 +2347,30 @@ impl App {
             let Some(j) = self.bsel.filter(|j| *j < self.borradores.len()) else { return };
             ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), alto), egui::Layout::top_down(egui::Align::Min), |ui| {
                 egui::ScrollArea::vertical().id_salt("bedit").show(ui, |ui| {
-                    let incierto = self.work.as_ref().is_some_and(|w| w.preparados.incierto(&crate::preparados::huella_borrador(&self.borradores[j])));
+                    self.huellas_cache.resize(self.borradores.len(), None);
+                    if self.huellas_cache[j].is_none() { self.huellas_cache[j] = Some(crate::preparados::huella_borrador(&self.borradores[j])); }
+                    let huella = self.huellas_cache[j].clone().unwrap_or_default();
+                    let incierto = self.work.as_ref().is_some_and(|w| w.preparados.incierto(&huella));
                     let b = &mut self.borradores[j];
                     theme::card(p).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         egui::Grid::new("cab").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                             ui.label(RichText::new("Para").color(p.muted));
-                            if ui.add(egui::TextEdit::singleline(&mut b.para).desired_width(f32::INFINITY).hint_text("correo@example.invalid; otro@example.invalid")).changed() { b.para_automatico = None; }
+                            if ui.add(egui::TextEdit::singleline(&mut b.para).id_source(("para", j)).desired_width(f32::INFINITY).hint_text("correo@example.invalid; otro@example.invalid")).changed() { b.para_automatico = None; correo_editado = true; }
                             ui.end_row();
                             ui.label(RichText::new("CC").color(p.muted));
-                            ui.add(egui::TextEdit::singleline(&mut b.cc).desired_width(f32::INFINITY));
+                            correo_editado |= ui.add(egui::TextEdit::singleline(&mut b.cc).id_source(("cc", j)).desired_width(f32::INFINITY)).changed();
                             ui.end_row();
                             ui.label(RichText::new("Asunto").color(p.muted));
-                            ui.add(egui::TextEdit::singleline(&mut b.asunto).desired_width(f32::INFINITY));
+                            correo_editado |= ui.add(egui::TextEdit::singleline(&mut b.asunto).id_source(("asunto", j)).desired_width(f32::INFINITY)).changed();
                             ui.end_row();
                         });
-                        if !b.cc.to_lowercase().contains(CC_OBLIGATORIO) {
+                        let procedencia = if b.para.trim().is_empty() { "Falta destinatario" } else if b.para_automatico.as_deref() == Some(b.para.as_str()) { "Desde Contactos" } else { "Editado aquí" };
+                        ui.label(RichText::new(procedencia).color(p.muted));
+                        if !b.cc.split([';', ',']).any(|s| s.trim().eq_ignore_ascii_case(CC_OBLIGATORIO)) {
                             ui.label(RichText::new(format!("El CC {CC_OBLIGATORIO} se agrega siempre al guardar.")).color(p.amber).size(12.0));
                         }
-                        ui.add(egui::TextEdit::multiline(&mut b.cuerpo).desired_rows(9).desired_width(f32::INFINITY));
+                        correo_editado |= ui.add(egui::TextEdit::multiline(&mut b.cuerpo).id_source(("cuerpo", j)).desired_rows(9).desired_width(f32::INFINITY)).changed();
                         ui.horizontal(|ui| {
                             if theme::primary(ui, p, "💾  Guardar este borrador").clicked() {
                                 guardar_uno = Some(j);
@@ -2067,10 +2398,10 @@ impl App {
                                     ui.label("");
                                     ui.end_row();
                                     for (k, row) in n.rows.iter_mut().enumerate() {
-                                        ui.checkbox(&mut n.incluir[k], "");
-                                        for v in row.iter_mut() {
+                                        correo_editado |= ui.checkbox(&mut n.incluir[k], "").changed();
+                                        for (c, v) in row.iter_mut().enumerate() {
                                             let ancho = (v.chars().count().clamp(6, 40) as f32) * 7.5;
-                                            ui.add(egui::TextEdit::singleline(v).desired_width(ancho).font(egui::TextStyle::Small));
+                                            correo_editado |= ui.add(egui::TextEdit::singleline(v).id_source(("nomina", j, k, c)).desired_width(ancho).font(egui::TextStyle::Small)).changed();
                                         }
                                         if ui.small_button("✕").on_hover_text("Quitar fila de la nómina").clicked() {
                                             quitar = Some(k);
@@ -2080,10 +2411,12 @@ impl App {
                                 });
                             });
                             if let Some(k) = quitar {
+                                correo_editado = true;
                                 n.rows.remove(k);
                                 n.incluir.remove(k);
                             }
                             if ui.small_button("＋ Agregar fila").clicked() {
+                                correo_editado = true;
                                 n.rows.push(vec![String::new(); n.headers.len()]);
                                 n.incluir.push(true);
                             }
@@ -2092,6 +2425,7 @@ impl App {
                 });
             });
         });
+        if correo_editado { self.marcar_sucio(); }
         if let Some(huella) = conciliar_incierto {
             if let Some(w) = self.work.as_mut() {
                 let n = w.preparados.conciliar_incierto(&huella);
@@ -2100,7 +2434,8 @@ impl App {
             self.marcar_sucio();
         }
         if let Some(j) = guardar_uno {
-            self.guardar_borradores(Some(j));
+            self.iniciar_borradores(ui.ctx(), Some(j));
+            return;
         }
         if let Some(j) = guardar_nomina {
             if let Some(dir) = self.carpeta_productos() {
@@ -2147,6 +2482,7 @@ impl App {
         let n = out.len();
         let sin = out.iter().filter(|b| b.para.trim().is_empty()).count();
         self.borradores = out;
+        self.marcar_sucio();
         self.sellar_preparados();
         self.bsel = if n > 0 { Some(0) } else { None };
         if n == 0 {
@@ -2178,6 +2514,7 @@ impl App {
                         let n = rows.len();
                         b.nomina = Some(productos::Nomina { headers, rows, incluir: vec![true; n] });
                         self.borradores.push(b);
+                        self.marcar_sucio();
                         self.bsel = Some(self.borradores.len() - 1);
                     }
                     self.registrar(pth, "Reporte de proyectos");
@@ -2192,103 +2529,21 @@ impl App {
         }
         if let Some(b) = productos::borrador_plantilla(self.work.as_ref(), &self.cfg, kind, &filas) {
             self.borradores.push(b);
+                        self.marcar_sucio();
             self.bsel = Some(self.borradores.len() - 1);
             self.sellar_preparados();
         }
     }
 
+    #[cfg(test)]
     fn guardar_borradores(&mut self, solo: Option<usize>) {
         let Some(dir) = self.carpeta_productos() else { return };
-        let dir = dir.join(format!("Borradores_{}", chrono::Local::now().format("%Y-%m-%d")));
-        let mut ok = 0;
-        let mut duplicados = 0;
-        let mut errores = Vec::new();
-        let idx: Vec<usize> = match solo {
-            Some(j) => vec![j],
-            None => (0..self.borradores.len()).filter(|j| self.borradores[*j].incluir && self.borradores[*j].guardado.is_none()).collect(),
-        };
-        let outlook = self.cfg.destino_outlook;
-        for j in idx {
-            let huella = crate::preparados::huella_borrador(&self.borradores[j]);
-            if let Some(w) = self.work.as_ref() {
-                if crate::preparados::borrador_obsoleto(w, &self.cfg, &self.borradores[j]) {
-                    errores.push(format!("«{}»: {}", self.borradores[j].titulo, crate::preparados::OBSOLETO));
-                    continue;
-                }
-                // Un borrador con el mismo contenido que otro ya guardado no se crea dos veces.
-                if w.preparados.incierto(&huella) {
-                    errores.push(format!("«{}»: Outlook pudo haber guardado este borrador sin confirmarlo. Revisa Borradores de Outlook y marca «Ya lo revisé en Outlook» antes de repetir.", self.borradores[j].titulo));
-                    continue;
-                }
-                if let Some(r) = w.preparados.guardado(&huella) {
-                    self.borradores[j].guardado = Some(PathBuf::from(&r.ruta));
-                    duplicados += 1;
-                    continue;
-                }
-            }
-            let mut guardado: Option<(String, bool)> = None;
-            if outlook {
-                match crate::outlook::guardar_outlook(&self.borradores[j], &self.cfg.cuenta_outlook) {
-                    Ok(_) => {
-                        self.borradores[j].guardado = Some(PathBuf::from("Outlook: Borradores"));
-                        guardado = Some(("Outlook: Borradores".into(), true));
-                        ok += 1;
-                    }
-                    // Falló antes de guardar: queda una copia .eml de respaldo y se sigue con los demás.
-                    Err(crate::outlook::ErrorOutlook::NoGuardado(e)) => errores.push(e),
-                    // Pudo haberse guardado: no hay respaldo ni reintento hasta que la persona lo revise.
-                    Err(crate::outlook::ErrorOutlook::Incierto(e)) => {
-                        errores.push(e);
-                        if let Some(w) = self.work.as_mut() {
-                            let ids = crate::preparados::ids_registros(w, &self.borradores[j].registros);
-                            w.preparados.anotar("borrador", "incierto", ids, &huella, "Outlook: Borradores");
-                        }
-                        self.marcar_sucio();
-                        continue;
-                    }
-                }
-            }
-            match productos::guardar_eml(&self.borradores[j], &dir) {
-                Ok(pth) => {
-                    if !outlook {
-                        self.borradores[j].guardado = Some(pth.clone());
-                        guardado = Some((pth.display().to_string(), true));
-                        ok += 1;
-                    }
-                    self.registrar(pth, if outlook { "Copia .eml de respaldo" } else { "Borrador de correo" });
-                }
-                Err(e) => errores.push(e),
-            }
-            if let Some((ruta, _)) = guardado {
-                if let Some(w) = self.work.as_mut() {
-                    let ids = crate::preparados::ids_registros(w, &self.borradores[j].registros);
-                    w.preparados.anotar("borrador", "creado", ids, &huella, &ruta);
-                }
-                self.marcar_sucio();
-            }
-        }
-        let sin_destinatario = (0..self.borradores.len())
-            .filter(|j| self.borradores[*j].guardado.is_some() && self.borradores[*j].para.trim().is_empty())
-            .count();
-        if sin_destinatario > 0 {
-            self.aviso(format!("{sin_destinatario} borrador(es) quedaron sin destinatario: complétalo en Outlook antes de enviar."), false);
-        }
-        if ok > 0 {
-            crate::estadisticas::registrar_borrador(&crate::estadisticas::directorio_metricas(), self.cfg.metricas_locales);
-        }
-        if duplicados > 0 {
-            self.aviso(format!("{duplicados} borrador(es) ya estaban guardados con el mismo contenido y no se crearon de nuevo."), false);
-        }
-        if ok > 0 && outlook {
-            self.aviso(format!("{ok} borradores guardados en Borradores de Outlook. Revísalos y envíalos tú."), false);
-        } else if ok > 0 {
-            self.aviso(format!("{ok} borradores guardados en {}. Ábrelos con Outlook, revísalos y envíalos tú.", dir.display()), false);
-        } else if errores.is_empty() && duplicados == 0 {
-            self.aviso("No hay borradores pendientes marcados (los ya guardados se omiten).", false);
-        }
-        for e in errores {
-            self.aviso(e, true);
-        }
+        self.ejecutar_producto_en_linea(|op, progreso| op.guardar_borradores(solo, dir, progreso));
+    }
+
+    fn iniciar_borradores(&mut self, ctx: &egui::Context, solo: Option<usize>) {
+        let Some(dir) = self.carpeta_productos() else { return };
+        self.iniciar_producto(ctx, "Guardando borradores…", move |op, progreso| op.guardar_borradores(solo, dir, progreso));
     }
 
     // ── Resoluciones ─────────────────────────────────────────────────────────
@@ -2298,13 +2553,14 @@ impl App {
         let obsoletos_p = self.obsoletos.2.clone();
         theme::titulo(ui, p, "Resoluciones", "Un proyecto por tribunal, RIT y tipo con todas las personas de la causa. Lo que falte queda como [COMPLETAR …] en el documento.");
         self.word_manual(ui, p);
+        if self.producto_job.is_some() { return; }
         let mut preparar = false;
         let mut generar = false;
         theme::card(p).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 let hay = self.work.is_some();
-                if ui.add_enabled(hay, egui::Button::new(RichText::new("⚖  Preparar proyectos").color(Color32::WHITE).strong()).fill(p.accent)).clicked() {
+                if ui.add_enabled(hay, egui::Button::new(RichText::new("⚖  Preparar proyectos").color(Color32::WHITE).strong()).fill(p.primary_bg)).clicked() {
                     preparar = true;
                 }
                 ui.checkbox(&mut self.solo_sel_res, "Solo filas marcadas");
@@ -2333,6 +2589,7 @@ impl App {
                 self.proyectos = productos::preparar_proyectos(w, &self.cfg, self.solo_sel_res);
                 self.psel = if self.proyectos.is_empty() { None } else { Some(0) };
                 self.sellar_preparados();
+                self.marcar_sucio();
                 let n = self.proyectos.len();
                 self.aviso(if n == 0 { "No hay registros que pidan proyecto (PC_IE, PC_INFO o NOMENCL).".to_string() } else { format!("{n} proyectos preparados.") }, false);
             }
@@ -2345,39 +2602,16 @@ impl App {
             if !desactualizados.is_empty() {
                 self.aviso(format!("{} Proyectos: {}.", crate::preparados::OBSOLETO, desactualizados.join(", ")), true);
             } else if let Some(dir) = self.carpeta_productos() {
-                match productos::generar_word_formato(&self.proyectos, &dir, self.corte(), self.formato_word) {
-                    Ok(res) => {
-                        let n_archivos = res.archivos.len();
-                        let n_proyectos: usize = res.archivos.iter().map(|(_, idxs)| idxs.len()).sum();
-                        let desc = match self.formato_word {
-                            FormatoWord::PorProyecto => "un .docx por proyecto",
-                            FormatoWord::PorTribunal => "un .docx por tribunal",
-                        };
-                        self.aviso(
-                            format!("Proyectos generados ({desc}): {n_archivos} archivo(s) y {n_proyectos} proyecto(s) en {}", res.carpeta.display()),
-                            false,
-                        );
-                        if let Some(w) = self.work.as_mut() {
-                            for (ruta_archivo, indices) in &res.archivos {
-                                for &idx in indices {
-                                    if let Some(pr) = self.proyectos.get(idx) {
-                                        let ids = crate::preparados::ids_registros(w, &pr.registros);
-                                        w.preparados.anotar("word", "creado", ids, &pr.dependencia, &ruta_archivo.display().to_string());
-                                    }
-                                }
-                            }
-                        }
-                        self.marcar_sucio();
-                        self.registrar(res.carpeta, "Proyectos de resolución (Word)");
-                    }
-                    Err(e) => self.aviso(e, true),
-                }
+                let corte = self.corte(); let formato = self.formato_word;
+                self.iniciar_producto(ui.ctx(), "Generando proyectos Word…", move |op, _| op.generar_word(dir, corte, formato));
+                return;
             }
         }
         ui.add_space(8.0);
         if self.proyectos.is_empty() {
             return;
         }
+        let mut proyecto_editado = false;
         let alto = ui.available_height();
         ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(egui::vec2(330.0, alto), egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -2393,7 +2627,7 @@ impl App {
                             ui.set_width(300.0);
                             ui.set_max_width(300.0);
                             ui.horizontal(|ui| {
-                                ui.checkbox(&mut pr.incluir, "");
+                                proyecto_editado |= ui.checkbox(&mut pr.incluir, "").changed();
                                 ui.label(RichText::new(format!("{} · {}", pr.tipo, pr.rit)).strong().monospace());
                             });
                             ui.add(egui::Label::new(RichText::new(&pr.vars["NOMBRE"]).size(12.5)).truncate());
@@ -2428,7 +2662,7 @@ impl App {
                         ui.label(RichText::new("Tipo").color(p.muted));
                         egui::ComboBox::from_id_salt("ptipo").selected_text(pr.tipo.clone()).show_ui(ui, |ui| {
                             for (k, l) in TIPOS {
-                                ui.selectable_value(&mut pr.tipo, k.to_string(), l);
+                                proyecto_editado |= ui.selectable_value(&mut pr.tipo, k.to_string(), l).changed();
                             }
                         });
                         ui.label(RichText::new(&pr.tribunal).color(p.muted));
@@ -2440,7 +2674,7 @@ impl App {
                                 continue;
                             }
                             ui.label(RichText::new(k).color(p.muted).size(12.5));
-                            ui.add(egui::TextEdit::singleline(v).desired_width(f32::INFINITY).hint_text(format!("[COMPLETAR {k}]")));
+                            proyecto_editado |= ui.add(egui::TextEdit::singleline(v).id_source(("pvar", j, k)).desired_width(f32::INFINITY).hint_text(format!("[COMPLETAR {k}]"))).changed();
                             ui.end_row();
                         }
                     });
@@ -2459,6 +2693,7 @@ impl App {
                 });
             });
         });
+        if proyecto_editado { self.marcar_sucio(); }
     }
 
     // ── Resultados ───────────────────────────────────────────────────────────
@@ -2587,8 +2822,8 @@ impl App {
                 egui::Grid::new("tribs").num_columns(3).spacing([10.0, 6.0]).show(ui, |ui| {
                     for (k, t) in self.cfg.tribunales.iter_mut() {
                         ui.label(RichText::new(k).strong());
-                        guardar |= ui.add(egui::TextEdit::singleline(&mut t.nombre).desired_width(240.0)).lost_focus();
-                        guardar |= ui.add(egui::TextEdit::singleline(&mut t.para).desired_width(360.0).hint_text("correo@example.invalid; otro@example.invalid")).lost_focus();
+                        guardar |= ui.add(egui::TextEdit::singleline(&mut t.nombre).desired_width(240.0)).changed();
+                        guardar |= ui.add(egui::TextEdit::singleline(&mut t.para).desired_width(360.0).hint_text("correo@example.invalid; otro@example.invalid")).changed();
                         ui.end_row();
                     }
                 });
@@ -2597,10 +2832,10 @@ impl App {
                     ui.label(RichText::new("CC fijo").color(p.muted));
                     ui.label(RichText::new(CC_OBLIGATORIO).strong());
                     ui.label(RichText::new("CC adicional").color(p.muted));
-                    guardar |= ui.add(egui::TextEdit::singleline(&mut self.cfg.cc_adicional).desired_width(300.0)).lost_focus();
+                    guardar |= ui.add(egui::TextEdit::singleline(&mut self.cfg.cc_adicional).desired_width(300.0)).changed();
                 });
                 ui.label(RichText::new("Firma (se agrega al final de cada borrador)").color(p.muted));
-                guardar |= ui.add(egui::TextEdit::multiline(&mut self.cfg.firma).desired_rows(3).desired_width(f32::INFINITY)).lost_focus();
+                guardar |= ui.add(egui::TextEdit::multiline(&mut self.cfg.firma).desired_rows(3).desired_width(f32::INFINITY)).changed();
             });
             ui.add_space(8.0);
             theme::card(p).show(ui, |ui| {
@@ -2630,6 +2865,7 @@ impl App {
                                 self.nuevo_mail.clear();
                                 self.nuevo_alias.clear();
                                 self.contacto_buf.clear();
+                                self.contactos_pendientes.clear();
                                 guardar = true;
                             }
                             Err(e) => self.aviso(e, true),
@@ -2660,9 +2896,10 @@ impl App {
                         let alias_actuales = crate::personalizar::alias_de(&self.cfg, &k).join(", ");
                         let buf = self.contacto_buf.entry(k.clone()).or_insert_with(|| (v.clone(), alias_actuales));
                         ui.label(k.as_str());
-                        let a = ui.add(egui::TextEdit::singleline(&mut buf.0).desired_width(300.0)).lost_focus();
-                        let b = ui.add(egui::TextEdit::singleline(&mut buf.1).hint_text("alias, separados por coma").desired_width(200.0)).lost_focus();
-                        if a || b {
+                        let a = ui.add(egui::TextEdit::singleline(&mut buf.0).id_source(("contacto", &k)).desired_width(300.0));
+                        let b = ui.add(egui::TextEdit::singleline(&mut buf.1).id_source(("alias", &k)).hint_text("alias, separados por coma").desired_width(200.0));
+                        if a.changed() || b.changed() { self.contactos_pendientes.insert(k.clone()); }
+                        if (a.lost_focus() || b.lost_focus()) && self.contactos_pendientes.contains(&k) {
                             cambio = Some((k.clone(), buf.0.clone(), buf.1.clone()));
                         }
                         if ui.small_button("🗑").clicked() {
@@ -2675,13 +2912,13 @@ impl App {
                     let alias: Vec<String> = alias.split(',').map(str::to_string).collect();
                     match crate::personalizar::guardar_contacto(&self.cfg, &nombre, &correo, &alias, Some(&nombre)) {
                         Ok(c) => {
+                            self.contactos_pendientes.remove(&nombre);
                             if c.contactos != self.cfg.contactos || c.aliases != self.cfg.aliases {
                                 self.cfg = c;
                                 guardar = true;
                             }
                         }
                         Err(e) => {
-                            self.contacto_buf.remove(&nombre);
                             self.aviso(e, true);
                         }
                     }
@@ -2690,6 +2927,7 @@ impl App {
                     self.cfg.contactos.remove(&k);
                     self.cfg.aliases.retain(|_, d| *d != k);
                     self.contacto_buf.remove(&k);
+                    self.contactos_pendientes.remove(&k);
                     guardar = true;
                 }
             });
@@ -2713,12 +2951,14 @@ impl App {
 
     /// Bloques favoritos: guardar el texto actual o insertar uno completando sus variables.
     fn favoritos_manual(&mut self, ui: &mut egui::Ui, p: &Pal, cuerpo_word: bool) {
-        let favoritos = crate::manual::favoritos();
+        if ui.small_button("Recargar favoritos").clicked() { self.favoritos_cache = None; }
+        let favoritos = self.favoritos_cache.get_or_insert_with(crate::manual::favoritos).clone();
         ui.horizontal_wrapped(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.nombre_favorito).hint_text("Nombre del bloque").desired_width(160.0));
             if ui.button("Guardar texto como favorito").clicked() {
                 let texto = if cuerpo_word { self.manual.cuerpo_word.clone() } else { self.manual.cuerpo.clone() };
                 self.manual_estado = Some(crate::manual::guardar_favorito(&self.nombre_favorito, &texto).map(|()| "Bloque favorito guardado.".to_string()));
+                self.favoritos_cache = None;
             }
             if !favoritos.is_empty() {
                 egui::ComboBox::from_id_salt(("favorito", cuerpo_word)).selected_text(if self.favorito_elegido.is_empty() { "Insertar favorito…" } else { self.favorito_elegido.as_str() }).show_ui(ui, |ui| {
@@ -2798,6 +3038,7 @@ impl App {
                 match crate::manual::borrador_manual(&self.manual) {
                     Ok(b) => {
                         self.borradores.push(b);
+                        self.marcar_sucio();
                         self.bsel = Some(self.borradores.len() - 1);
                         self.manual_estado = Some(Ok("Borrador preparado: revísalo abajo y guárdalo.".into()));
                     }
@@ -2816,11 +3057,14 @@ impl App {
         egui::CollapsingHeader::new("Word manual · libre o con matriz").id_salt("word manual").show(ui, |ui| {
             let mut cambio = false;
             let matriz = self.manual.matriz.clone();
-            let campos: Vec<String> = if matriz.is_empty() {
-                Vec::new()
-            } else {
-                std::fs::read(&matriz).map_err(|e| e.to_string()).and_then(|b| crate::manual::variables_matriz(&b)).map(|v| v.into_iter().collect()).unwrap_or_default()
-            };
+            if !matriz.is_empty() && ui.small_button("Recargar campos de la matriz").clicked() { self.matriz_cache = None; }
+            if self.matriz_cache.as_ref().is_none_or(|(ruta, _)| ruta != &matriz) {
+                let campos = if matriz.is_empty() { Vec::new() } else {
+                    std::fs::read(&matriz).map_err(|e| e.to_string()).and_then(|b| crate::manual::variables_matriz(&b)).map(|v| v.into_iter().collect()).unwrap_or_default()
+                };
+                self.matriz_cache = Some((matriz.clone(), campos));
+            }
+            let campos = self.matriz_cache.as_ref().map(|(_, campos)| campos.clone()).unwrap_or_default();
             ui.horizontal(|ui| {
                 ui.label("Título");
                 cambio |= ui.add(egui::TextEdit::singleline(&mut self.manual.titulo_word).desired_width(f32::INFINITY)).changed();
@@ -2832,11 +3076,13 @@ impl App {
                 if ui.button("Elegir matriz…").clicked() {
                     if let Some(m) = rfd::FileDialog::new().add_filter("Matriz Word", &["docx"]).pick_file() {
                         self.manual.matriz = m.display().to_string();
+                        self.matriz_cache = None;
                         cambio = true;
                     }
                 }
                 if !matriz.is_empty() && ui.button("Usar texto libre").clicked() {
                     self.manual.matriz.clear();
+                    self.matriz_cache = None;
                     self.manual.valores.clear();
                     cambio = true;
                 }
@@ -2857,13 +3103,13 @@ impl App {
                 if let Some(dir) = self.carpeta_productos() {
                     let destino = crate::manual::ruta_word(&dir);
                     let m = (!matriz.is_empty()).then(|| std::path::PathBuf::from(&matriz));
-                    match crate::manual::generar_word(&destino, &self.manual.titulo_word, &self.manual.cuerpo_word, m.as_deref(), &self.manual.valores) {
-                        Ok(r) => {
-                            self.manual_estado = Some(Ok(format!("Word generado: {}", r.display())));
-                            self.registrar(r, "Word manual");
+                    let titulo = self.manual.titulo_word.clone(); let cuerpo = self.manual.cuerpo_word.clone(); let valores = self.manual.valores.clone();
+                    self.iniciar_producto(ui.ctx(), "Generando Word manual…", move |op, _| {
+                        match crate::manual::generar_word(&destino, &titulo, &cuerpo, m.as_deref(), &valores) {
+                            Ok(r) => { op.manual_estado = Some(Ok(format!("Word generado: {}", r.display()))); op.registrar(r, "Word manual"); }
+                            Err(e) => op.manual_estado = Some(Err(e)),
                         }
-                        Err(e) => self.manual_estado = Some(Err(e)),
-                    }
+                    });
                 }
             }
             self.estado_manual(ui, p);
@@ -3051,7 +3297,7 @@ impl App {
                 });
                 ui.add_space(6.0);
                 if ui
-                    .add_enabled(!self.anon_files.is_empty(), egui::Button::new(RichText::new("🛡  Crear copias anonimizadas").color(Color32::WHITE).strong()).fill(p.accent))
+                    .add_enabled(!self.anon_files.is_empty(), egui::Button::new(RichText::new("🛡  Crear copias anonimizadas").color(Color32::WHITE).strong()).fill(p.primary_bg))
                     .clicked()
                 {
                     ejecutar = true;
@@ -3102,15 +3348,14 @@ impl App {
             } else {
                 PathBuf::from(self.anon_out.trim())
             };
-            let t0 = Instant::now();
-            let inf = anon::ejecutar(&self.anon_files, &out, &self.anon_opts);
-            let n = inf.creados.len();
-            for c in inf.creados.clone() {
-                self.registrar(c, "Copia anonimizada");
-            }
-            let err = !inf.errores.is_empty();
-            self.aviso(format!("{n} copias creadas en {} ms.", t0.elapsed().as_millis()), err);
-            self.anon_inf = Some(inf);
+            let archivos = self.anon_files.clone(); let opciones = self.anon_opts.clone();
+            self.iniciar_producto(ui.ctx(), "Creando copias anonimizadas…", move |op, _| {
+                let t0 = Instant::now();
+                let inf = anon::ejecutar(&archivos, &out, &opciones);
+                for c in inf.creados.clone() { op.registrar(c, "Copia anonimizada"); }
+                op.aviso(format!("{} copias creadas en {} ms.", inf.creados.len(), t0.elapsed().as_millis()), !inf.errores.is_empty());
+                op.anon_inf = Some(inf);
+            });
         }
     }
 
@@ -3120,10 +3365,13 @@ impl App {
         theme::titulo(ui, p, "Ajustes", "Umbrales y textos de las reglas. Los cambios se aplican al volver a analizar; los valores base son los del original.");
         let mut guardar = false;
         let mut reanalizar = false;
-        egui::ScrollArea::vertical().id_salt("aj").show(ui, |ui| {
-            ui.columns(2, |cols| {
-                let (izq, der) = cols.split_at_mut(1);
-                let ui = &mut izq[0];
+        ui.horizontal_wrapped(|ui| {
+            for (i, titulo) in ["Reglas y Umbrales", "Textos y Plantillas", "Outlook y Carpetas", "Actualizaciones y Diagnóstico"].iter().enumerate() {
+                ui.selectable_value(&mut self.ajustes_tab, i, *titulo);
+            }
+        });
+        egui::ScrollArea::vertical().id_salt(("aj", self.ajustes_tab)).show(ui, |ui| {
+            if self.ajustes_tab == 0 {
                 theme::card(p).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     theme::seccion(ui, p, "Redacción");
@@ -3172,7 +3420,8 @@ impl App {
                         reanalizar = true;
                     }
                 });
-                let ui = &mut der[0];
+            }
+            if self.ajustes_tab == 1 {
                 theme::card(p).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     theme::seccion(ui, p, "Textos de las observaciones");
@@ -3208,23 +3457,29 @@ impl App {
                         }
                     });
                     ui.label(RichText::new("Las variables entre llaves ({PROGRAMA}, {FECHA_VENCIMIENTO}…) se completan solas.").size(12.0).color(p.muted));
-                    ui.add_space(10.0);
+                    self.editor_plantillas(ui, p);
+                });
+            }
+            if self.ajustes_tab == 2 {
+                theme::card(p).show(ui, |ui| {
                     theme::seccion(ui, p, "Correos");
                     ui.horizontal(|ui| {
                         ui.label("Período (reporte de proyectos)");
-                        guardar |= ui.add(egui::TextEdit::singleline(&mut self.cfg.periodo).desired_width(220.0)).lost_focus();
+                        guardar |= ui.add(egui::TextEdit::singleline(&mut self.cfg.periodo).desired_width(220.0)).changed();
                     });
                     guardar |= ui.checkbox(&mut self.cfg.metricas_locales, "Guardar métricas locales (solo conteos y fechas de cada ciclo, nunca datos de casos)").changed();
                     ui.horizontal(|ui| {
                         ui.label("Cuenta de Outlook");
                         guardar |= ui
                             .add(egui::TextEdit::singleline(&mut self.cfg.cuenta_outlook).hint_text("dirección o nombre exactos; vacío: la predeterminada").desired_width(340.0))
-                            .lost_focus();
+                            .changed();
                     });
                     ui.horizontal(|ui| {
                         if ui.button("Guardar un borrador de prueba en Outlook").on_hover_text("Crea un borrador sintético sin datos de causas con CC fijo en la carpeta Borradores de Outlook (usa Save(), nunca se envía).").clicked() {
-                            let cuenta = (!self.cfg.cuenta_outlook.trim().is_empty()).then(|| self.cfg.cuenta_outlook.trim());
-                            self.estado_borrador_prueba = Some(crate::outlook::borrador_prueba(cuenta));
+                            let cuenta = self.cfg.cuenta_outlook.trim().to_string();
+                            self.iniciar_producto(ui.ctx(), "Guardando borrador de prueba…", move |op, _| {
+                                op.estado_prueba = Some(crate::outlook::borrador_prueba((!cuenta.is_empty()).then_some(cuenta.as_str())));
+                            });
                         }
                     });
                     if let Some(resultado) = &self.estado_borrador_prueba {
@@ -3245,9 +3500,10 @@ impl App {
                             }
                         }
                     }
-                    ui.add_space(6.0);
-                    self.editor_plantillas(ui, p);
-                    ui.add_space(10.0);
+                });
+            }
+            if self.ajustes_tab == 3 {
+                theme::card(p).show(ui, |ui| {
                     theme::seccion(ui, p, "Actualizaciones");
                     let carpeta_act = crate::actualizacion::carpeta();
                     let actual_exe = std::env::current_exe().ok();
@@ -3268,7 +3524,7 @@ impl App {
                             if let Some(d) = rfd::FileDialog::new().set_title("Carpeta adicional de actualizaciones (por ejemplo, OneDrive)").pick_folder() {
                                 self.cfg.carpeta_actualizaciones_adicional = d.display().to_string();
                                 self.guardar_cfg();
-                                self.revisar_actualizacion();
+                                self.revisar_actualizacion(ui.ctx());
                             }
                         }
                         if !self.cfg.carpeta_actualizaciones_adicional.trim().is_empty()
@@ -3276,7 +3532,7 @@ impl App {
                         {
                             self.cfg.carpeta_actualizaciones_adicional.clear();
                             self.guardar_cfg();
-                            self.revisar_actualizacion();
+                            self.revisar_actualizacion(ui.ctx());
                         }
                     });
                     ui.add_space(4.0);
@@ -3293,12 +3549,8 @@ impl App {
                     )).color(p.muted).size(12.5));
                     ui.horizontal(|ui| {
                         if ui.button("Buscar actualización").clicked() {
-                            self.revisar_actualizacion();
-                            match (&self.actualizacion, &self.actualizacion_error) {
-                                (Some(_), _) => self.aviso("Hay una versión nueva lista para aplicar.", false),
-                                (None, Some(e)) => self.aviso(e.clone(), true),
-                                (None, None) => self.aviso("No hay una versión nueva en la carpeta de actualizaciones.", false),
-                            }
+                            self.revisar_actualizacion(ui.ctx());
+
                         }
                         if ui.button("Abrir la carpeta de actualizaciones").clicked() {
                             let _ = std::fs::create_dir_all(&carpeta_act);
@@ -3316,7 +3568,8 @@ impl App {
                             }
                         }
                     });
-                    if let Some(err) = &self.actualizacion_error {
+                    if self.actualizacion_rx.is_some() { ui.horizontal(|ui| { ui.spinner(); ui.label("Buscando actualizaciones…"); }); }
+                    else if let Some(err) = &self.actualizacion_error {
                         ui.label(RichText::new(format!("Estado de la última búsqueda: {err}")).color(p.red).size(12.5));
                     } else if let Some(p_act) = &self.actualizacion {
                         let commit_txt = if p_act.commit.is_empty() { String::new() } else { format!(" (commit {})", &p_act.commit[..p_act.commit.len().min(7)]) };
@@ -3337,11 +3590,14 @@ impl App {
                     }
                     if let Some(inf) = &self.autodiagnostico {
                         for c in &inf.comprobaciones {
-                            let (marca, color) = if c.ok { ("✓", p.green) } else { ("✕", p.red) };
-                            ui.label(RichText::new(format!("{marca} {} — {}", c.nombre, c.detalle)).color(color));
+                            let color = if c.ok { p.green } else if c.requerida { p.red } else { p.muted };
+                            ui.label(RichText::new(format!("{} · {} — {}", c.estado, c.nombre, c.detalle)).color(color));
                         }
                     }
-                    ui.add_space(10.0);
+                });
+            }
+            if self.ajustes_tab == 2 || self.ajustes_tab == 1 {
+                theme::card(p).show(ui, |ui| {
                     theme::seccion(ui, p, "Carpetas");
                     ui.horizontal(|ui| {
                         if ui.button("Importar matrices Word (ZIP)…").on_hover_text("Un ZIP con una matriz por tribunal y tipo (por ejemplo LAJA_PC_IE.docx). Las que ya existían se respaldan.").clicked() {
@@ -3367,7 +3623,7 @@ impl App {
                         }
                     });
                 });
-            });
+            }
         });
         if guardar {
             self.guardar_cfg();
@@ -4003,5 +4259,41 @@ mod pruebas_interfaz {
         assert!(!harness.state().work.as_ref().unwrap().registros[fila].propuesta.contains(&programa), "la consignación no se conservó");
         assert!(harness.query_by_label(&format!("Deshacer consignación de «{programa}»")).is_some(), "tras reabrir falta «Deshacer»");
         println!("D2_TRABAJO: fila {fila}, programa «{programa}», consignada, deshacer visible, conservada al reabrir");
+    }
+}
+
+#[cfg(test)]
+mod pruebas_worker_a2 {
+    use super::*;
+    #[test]
+    fn progreso_y_resultado_sin_esperar_al_trabajador() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (inicio, iniciado) = mpsc::channel();
+        let (liberar, espera) = mpsc::channel();
+        let mut job = BackgroundJob::iniciar(&egui::Context::default(), "inicio", move |p| {
+            p.emitir("procesando"); inicio.send(()).unwrap();
+            espera.recv_timeout(Duration::from_secs(5)).unwrap(); 42
+        });
+        iniciado.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(job.sondear().is_none());
+        assert_eq!(job.estado, "procesando");
+        liberar.send(()).unwrap();
+        assert_eq!(job.resultado.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(), 42);
+    }
+    #[test]
+    fn corte_invalido_conserva_corte_previo() {
+        let mut app = App::new(None);
+        let previo = NaiveDate::from_ymd_opt(2026, 11, 20).unwrap();
+        app.corte_valido = previo;
+        app.work = Some(Trabajo { corte: Some(previo), analisis_ms: 123, registros: vec![crate::trabajo::Registro { propuesta: "propuesta sintética".into(), ..Default::default() }], ..Default::default() });
+        app.corte_txt = "fecha no válida".into();
+        app.reanalizar();
+        assert_eq!(app.corte(), previo);
+        assert_eq!(app.corte_txt, "fecha no válida");
+        let w = app.work.as_ref().unwrap();
+        assert_eq!(w.corte, Some(previo));
+        assert_eq!(w.analisis_ms, 123);
+        assert_eq!(w.registros[0].propuesta, "propuesta sintética");
     }
 }

@@ -12,6 +12,8 @@ pub struct Pal {
     pub muted: Color32,
     pub accent: Color32,
     pub accent_soft: Color32,
+    pub primary_bg: Color32,
+    pub reviewed_bg: Color32,
     pub green: Color32,
     pub amber: Color32,
     pub red: Color32,
@@ -31,6 +33,8 @@ pub fn pal(dark: bool) -> Pal {
             muted: Color32::from_rgb(150, 160, 178),
             accent: Color32::from_rgb(96, 145, 255),
             accent_soft: Color32::from_rgb(36, 50, 84),
+            primary_bg: Color32::from_rgb(37, 99, 235),
+            reviewed_bg: Color32::from_rgb(16, 122, 74),
             green: Color32::from_rgb(70, 190, 130),
             amber: Color32::from_rgb(235, 170, 60),
             red: Color32::from_rgb(240, 100, 100),
@@ -45,11 +49,13 @@ pub fn pal(dark: bool) -> Pal {
             card: Color32::from_rgb(255, 255, 255),
             border: Color32::from_rgb(225, 229, 238),
             text: Color32::from_rgb(28, 33, 45),
-            muted: Color32::from_rgb(105, 114, 132),
+            muted: Color32::from_rgb(92, 101, 117),
             accent: Color32::from_rgb(37, 99, 235),
             accent_soft: Color32::from_rgb(226, 236, 254),
-            green: Color32::from_rgb(22, 150, 90),
-            amber: Color32::from_rgb(205, 130, 10),
+            primary_bg: Color32::from_rgb(37, 99, 235),
+            reviewed_bg: Color32::from_rgb(15, 118, 70),
+            green: Color32::from_rgb(15, 118, 70),
+            amber: Color32::from_rgb(161, 98, 7),
             red: Color32::from_rgb(210, 55, 55),
             gray: Color32::from_rgb(130, 138, 152),
             nav: Color32::from_rgb(22, 30, 48),
@@ -116,7 +122,7 @@ pub fn chip(ui: &mut Ui, text: &str, color: Color32, dark: bool) {
 }
 
 pub fn primary(ui: &mut Ui, p: &Pal, text: &str) -> egui::Response {
-    ui.add(egui::Button::new(RichText::new(text).color(Color32::WHITE).strong()).fill(p.accent).corner_radius(CornerRadius::same(7)))
+    ui.add(egui::Button::new(RichText::new(text).color(Color32::WHITE).strong()).fill(p.primary_bg).corner_radius(CornerRadius::same(7)))
 }
 
 pub fn titulo(ui: &mut Ui, p: &Pal, t: &str, sub: &str) {
@@ -129,4 +135,27 @@ pub fn titulo(ui: &mut Ui, p: &Pal, t: &str, sub: &str) {
 
 pub fn seccion(ui: &mut Ui, p: &Pal, t: &str) {
     ui.label(RichText::new(t.to_uppercase()).size(11.5).strong().color(p.muted));
+}
+
+#[cfg(test)]
+mod pruebas_contraste {
+    use super::*;
+
+    fn luminancia(c: Color32) -> f64 {
+        let lineal = |v: u8| {
+            let v = f64::from(v) / 255.0;
+            if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * lineal(c.r()) + 0.7152 * lineal(c.g()) + 0.0722 * lineal(c.b())
+    }
+
+    #[test]
+    fn cinco_pares_aa_sin_redondear() {
+        let claro = pal(false);
+        let oscuro = pal(true);
+        for color in [claro.amber, claro.green, claro.muted, oscuro.primary_bg, oscuro.reviewed_bg] {
+            let ratio = (luminancia(Color32::WHITE) + 0.05) / (luminancia(color) + 0.05);
+            assert!(ratio >= 4.5, "{color:?}: {ratio}");
+        }
+    }
 }
