@@ -7,12 +7,14 @@
 //! Excel consolidado.
 
 use super::lote::{self, Conexion};
+use super::preferencias::{self, PausaAdaptativa, Rapido};
+use std::cell::Cell;
 use super::sitfa::{self, Consulta, Pares, Respuesta};
 use super::{lecturas, vinculos, Alcance, Catalogo, Edicion, Pantalla, Perfil};
 use chrono::NaiveDate;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -30,9 +32,10 @@ const MODALIDADES: [(&str, &str); 4] = [("1", "Residencia"), ("2", "Ambulatorio"
 #[derive(Clone, Debug, Default)]
 pub struct Opciones {
     pub pausa: Duration,
+    pub rapido: Rapido,
     /// `resume`: carpeta de un lote anterior; lo ya leído con su huella intacta no se vuelve a pedir.
     pub retomar: Option<PathBuf>,
-    /// `reuse_base`: destino del usuario donde buscar lecturas de otros lotes del mismo día (EF-04).
+    /// Compatibilidad con llamadores anteriores; no se usa para reutilizar lecturas de otros lotes.
     pub reutilizar_base: Option<PathBuf>,
     /// Reloj fijo para las pruebas; `None` usa la hora local.
     pub ahora: Option<chrono::DateTime<chrono::FixedOffset>>,
@@ -171,12 +174,12 @@ struct Sesion<'a> {
     aperturas: usize,
     fallas_seguidas: usize,
     cancelar: &'a AtomicBool,
-    pausa: Duration,
+    control_pausa: Cell<PausaAdaptativa>,
+    rapido: bool,
+    prefetched: VecDeque<(Value, Result<Value, String>)>,
     /// Registros del lote retomado (`registros` + `anteriores_no_reenumeradas`) y sus LEIDA por clave.
     previos: Vec<Value>,
     antiguos: BTreeMap<String, Value>,
-    /// Lecturas reutilizables de otros lotes: clave → (carpeta, registro).
-    cruzadas: BTreeMap<String, (PathBuf, Value)>,
     calendarios: bool,
     historico: bool,
     /// Históricos ya resueltos en este lote por huella de persona (`_historicos`), fallas seguidas y suspensión.
@@ -236,7 +239,28 @@ impl Sesion<'_> {
     }
 
     fn pedir(&self, comando: &str, payload: Value) -> Result<Value, String> {
-        self.conexion.llamar(comando, payload, lote::PLAZO)
+        let inicio = std::time::Instant::now();
+        let respuesta = self.conexion.llamar(comando, payload, lote::PLAZO);
+        if matches!(comando, "search" | "diary_open" | "calendar_open" | "historico_open") {
+            let mut p = self.control_pausa.get(); p.observar(inicio.elapsed(), respuesta.is_ok()); self.control_pausa.set(p);
+        }
+        respuesta
+    }
+
+    fn pausa(&self) -> Duration { self.control_pausa.get().pausa() }
+
+    fn preparar_siguientes(&mut self, siguientes: &[Value]) {
+        if !self.rapido || !self.prefetched.is_empty() || siguientes.is_empty() || self.fallas_seguidas + 1 >= MAX_FALLAS_SEGUIDAS { return; }
+        let n = siguientes.len().min(self.control_pausa.get().tope()).min(MAX_LECTURAS_POR_LOTE.saturating_sub(self.aperturas));
+        if n == 0 || !preferencias::esperar(self.pausa(), self.cancelar) { return; }
+        let cargas: Vec<_> = siguientes[..n].iter().map(|p| json!({"params": p, "timeout": ESPERA_MS})).collect();
+        self.aperturas += n;
+        let inicio = std::time::Instant::now();
+        let respuestas = preferencias::pedir_grupo(self.conexion, "diary_open", &cargas, lote::PLAZO);
+        let mut p = self.control_pausa.get();
+        p.observar(inicio.elapsed(), respuestas.iter().all(Result::is_ok));
+        self.control_pausa.set(p);
+        self.prefetched.extend(siguientes[..n].iter().cloned().zip(respuestas));
     }
 }
 
@@ -330,27 +354,25 @@ pub fn ejecutar_con_avance(
         std::fs::create_dir(&carpeta).map_err(|e| format!("No se pudo crear la carpeta del lote de bitácoras: {e}"))?;
         carpeta
     };
-    let cruzadas = match &opciones.reutilizar_base {
-        Some(base) => lecturas_reutilizables(&carpetas_previas(base, Some(&carpeta)), inicio),
-        None => BTreeMap::new(),
-    };
-    let pausa = opciones.pausa;
+    // Solo el propio lote retomado puede aportar ventanas ya verificadas.
+    let historia_anterior = opciones.retomar.as_ref().map(|r| r.join("historia").join("historias.json")).filter(|r| r.is_file());
     let mut s = Sesion {
         conexion,
         carpeta: carpeta.clone(),
         estado: json!({
             "version": 1, "tipo": "BITACORAS_LECTURA", "estado": "EN_CURSO", "seleccion": lote_bitacoras.seleccion(),
             "fecha": inicio.format("%Y-%m-%dT%H:%M:%S%.6f%:z").to_string(), "consultas": [], "registros": [],
-            "origen": {"version": super::extension::version(Edicion::Integral), "commit": "desarrollo"},
+            "origen": {"version": "2.9.0", "commit": "desarrollo"},
         }),
         pendiente: 0,
         aperturas: 0,
         fallas_seguidas: 0,
         cancelar,
-        pausa,
+        control_pausa: Cell::new(PausaAdaptativa::nueva(opciones.pausa, Rapido::default())),
+        rapido: false,
+        prefetched: VecDeque::new(),
         previos,
         antiguos,
-        cruzadas,
         calendarios: opciones.calendarios,
         historico: opciones.historico,
         historicos: None,
@@ -361,7 +383,7 @@ pub fn ejecutar_con_avance(
             Some(meses) => Some(super::historia::LectorHistoria::nuevo(
                 meses,
                 opciones.pausa,
-                opciones.historia_anterior.clone(),
+                historia_anterior,
                 *inicio.offset(),
             )?),
             None => None,
@@ -373,8 +395,16 @@ pub fn ejecutar_con_avance(
     let corrida = (|| -> Result<(), Detencion> {
         let version = s.pedir("capabilities", json!({}))?;
         super::comprobar_extension(Edicion::Integral, &version)?;
+        // Una extensión antigua usa el contrato conservador, incluso si quedó marcada la preferencia rápida.
+        let config = if version["flow_rust_rapido"] == 1 && version["flow_rust_version"] == "2.10.0" { opciones.rapido.limitado() } else { Rapido::default() };
+        s.control_pausa.set(PausaAdaptativa::nueva(opciones.pausa, config));
+        s.rapido = config.activado && opciones.retomar.is_none() && !opciones.calendarios && !opciones.historico;
+        let propia = version["flow_rust_version"] == "2.10.0" && version["flow_rust_rapido"] == 1;
+        if propia { s.estado["origen"]["version"] = json!("2.10.0"); }
+        if let Some(h) = s.historia.as_mut() { h.configurar_rapido(config, propia); }
         conexion.habilitar_lecturas(true);
         s.estado["extension"] = json!({"version": version["version"], "protocolos": version["protocolos"]});
+        if propia { s.estado["extension"]["distribucion"] = json!("2.10.0"); }
         s.persistir(false)?;
         s.pedir("lock", json!({}))?;
         bloqueado = true;
@@ -567,9 +597,23 @@ fn enumerar(s: &mut Sesion<'_>, catalogo: &Catalogo, perfil: &Perfil, fechas: Op
             if control != pagina.registros {
                 return Err(Detencion::Consulta("El control de filas no coincide con el listado validado.".into()));
             }
-            for v in &filas {
-                leer_fila(s, perfil, pestana, modalidad, q, numero, v, &mut vistos)?;
+            for (pos, v) in filas.iter().enumerate() {
+                let mut siguientes = Vec::new();
+                if s.rapido {
+                    let mut comprobadas = BTreeSet::new();
+                    comprobadas.insert((perfil.tribunal.clone(), v.causa.clone(), v.ingreso.clone()));
+                    // No cruzar páginas, vínculos dudosos ni duplicados; el contexto DOM sigue siendo el mismo.
+                    for proxima in filas[pos + 1..].iter().take(3) {
+                        if proxima.tribunal != perfil.tribunal || !proxima.bitacora_verificada || proxima.causa.is_empty() || proxima.ingreso.is_empty()
+                            || vistos.contains(&(perfil.tribunal.clone(), proxima.causa.clone(), proxima.ingreso.clone()))
+                            || !comprobadas.insert((perfil.tribunal.clone(), proxima.causa.clone(), proxima.ingreso.clone())) { break; }
+                        let Ok(p) = proxima.params_bitacora(modalidad) else { break; };
+                        siguientes.push(json!(p));
+                    }
+                }
+                leer_fila(s, perfil, pestana, modalidad, q, numero, v, &mut vistos, &siguientes)?;
             }
+            s.prefetched.clear();
             let (conexion, cancelar) = (s.conexion, s.cancelar);
             let tribunal_nombre = s.estado["consultas"][q]["tribunal_nombre"].as_str().unwrap_or("").to_string();
             if let Some(h) = s.historia.as_mut() {
@@ -582,6 +626,7 @@ fn enumerar(s: &mut Sesion<'_>, catalogo: &Catalogo, perfil: &Perfil, fechas: Op
         s.persistir(false)?;
         Ok(())
     })();
+    s.prefetched.clear();
     match resultado {
         Ok(()) => Ok(true),
         Err(Detencion::Lote(e)) => {
@@ -608,6 +653,7 @@ fn leer_fila(
     numero: usize,
     v: &vinculos::Vinculo,
     vistos: &mut BTreeSet<(String, String, String)>,
+    siguientes: &[Value],
 ) -> Result<(), Detencion> {
     s.detener_si_cancelada()?;
     let consulta = &s.estado["consultas"][q];
@@ -652,14 +698,10 @@ fn leer_fila(
             "COD_Tribunal": perfil.tribunal, "TIP_Consulta": modalidad, "ID_Ingreso": identidad.2,
             "COD_Etapa": campo(&s.estado["registros"][i], "etapa"), "FLG_MejorNinez": campo(&s.estado["registros"][i], "antiguo")});
         s.estado["registros"][i]["params"] = params.clone();
-        let reutilizada = match reutilizar_retomada(s, i, &params) {
-            Ok(true) => Ok(true),
-            Ok(false) => Ok(reutilizar_de_otro_lote(s, i, &params)?),
-            Err(e) => Err(e),
-        };
+        let reutilizada = reutilizar_retomada(s, i, &params);
         let apertura = match reutilizada {
             Ok(true) => Ok(false),
-            Ok(false) => abrir(s, i, &params).map(|()| true),
+            Ok(false) => abrir(s, i, &params, siguientes).map(|()| true),
             Err(e) => Err(e),
         }
         .and_then(|abierta| {
@@ -713,8 +755,8 @@ fn leer_fila(
         )));
     }
     let reutilizada = s.estado["registros"][i]["reutilizada"] == true;
-    let espera =
-        if estado != "SIN_VINCULO" && (!reutilizada || calendario_abierto) { s.pausa } else { Duration::from_millis(50) };
+    let espera = if !s.prefetched.is_empty() { Duration::ZERO }
+        else if estado != "SIN_VINCULO" && (!reutilizada || calendario_abierto) { s.pausa() } else { Duration::from_millis(50) };
     let fin = std::time::Instant::now() + espera;
     while std::time::Instant::now() < fin {
         if s.cancelar.load(Ordering::SeqCst) {
@@ -861,36 +903,6 @@ fn reutilizar_retomada(s: &mut Sesion<'_>, i: usize, params: &Value) -> Result<b
     let parametros: BTreeMap<String, String> = serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
     let leida = lecturas::leer_bitacora(&datos, &parametros, "", "")?;
     copiar_lectura(s, i, &anterior, &leida);
-    Ok(true)
-}
-
-/// `_reutilizar_de_otro_lote`: copia al lote actual una lectura reciente de otro lote (identidad, parámetros y huella).
-fn reutilizar_de_otro_lote(s: &mut Sesion<'_>, i: usize, params: &Value) -> Result<bool, Detencion> {
-    let clave = s.estado["registros"][i]["clave"].as_str().unwrap_or("").to_string();
-    let Some((carpeta, anterior)) = s.cruzadas.get(&clave).cloned() else { return Ok(false) };
-    if &anterior["params"] != params || !estructura_reutilizable(&anterior) {
-        return Ok(false);
-    }
-    let nombre = anterior["archivo"].as_str().unwrap_or("").to_string();
-    let Some(datos) = instantanea(&carpeta.join(&nombre), anterior["sha256"].as_str().unwrap_or("")) else {
-        return Ok(false);
-    };
-    let Ok(parametros) = serde_json::from_value::<BTreeMap<String, String>>(params.clone()) else { return Ok(false) };
-    // Una copia ajena ilegible se resuelve leyendo en SITFA, no como FALLIDA (E3 #4).
-    let Ok(leida) = lecturas::leer_bitacora(&datos, &parametros, "", "") else { return Ok(false) };
-    let destino = s.carpeta.join(&nombre);
-    if destino.exists() {
-        if std::fs::read(&destino).map_err(|e| e.to_string())? != datos {
-            return Err(Detencion::Consulta("El archivo local de bitácora cambió.".into()));
-        }
-    } else {
-        lote::guardar_exclusivo(&destino, &datos)?;
-    }
-    copiar_lectura(s, i, &anterior, &leida);
-    s.estado["registros"][i]["reutilizada_de"] = json!({
-        "carpeta": carpeta.file_name().and_then(|n| n.to_str()).unwrap_or(""),
-        "capturada": anterior["capturada"],
-    });
     Ok(true)
 }
 
@@ -1082,8 +1094,8 @@ fn leer_historico(s: &mut Sesion<'_>, i: usize) -> Result<bool, Detencion> {
                 s.estado["registros"][i]["historico_lectura"] = json!({"estado": "PENDIENTE", "error": "HISTORICO_TOPE"});
                 return Err(Detencion::Lote(format!("Se alcanzó el máximo de {MAX_LECTURAS_POR_LOTE} lecturas por lote.")));
             }
-            if !s.pausa.is_zero() {
-                let fin = std::time::Instant::now() + s.pausa;
+            if !s.pausa().is_zero() {
+                let fin = std::time::Instant::now() + s.pausa();
                 while std::time::Instant::now() < fin && !s.cancelar.load(Ordering::SeqCst) {
                     std::thread::sleep((fin - std::time::Instant::now()).min(Duration::from_millis(20)));
                 }
@@ -1189,8 +1201,8 @@ fn leer_calendario(s: &mut Sesion<'_>, i: usize, pausar: bool) -> Result<bool, D
              «Reintentar lecturas fallidas…») para continuar."
         )));
     }
-    if pausar && !s.pausa.is_zero() {
-        let fin = std::time::Instant::now() + s.pausa;
+    if pausar && !s.pausa().is_zero() {
+        let fin = std::time::Instant::now() + s.pausa();
         while std::time::Instant::now() < fin && !s.cancelar.load(Ordering::SeqCst) {
             std::thread::sleep((fin - std::time::Instant::now()).min(Duration::from_millis(20)));
         }
@@ -1238,16 +1250,37 @@ fn leer_calendario(s: &mut Sesion<'_>, i: usize, pausar: bool) -> Result<bool, D
 }
 
 /// `_abrir_bitacora`: `diary_open`, cotejo de huella, parámetros y fecha, lectura e instantánea local exclusiva.
-fn abrir(s: &mut Sesion<'_>, i: usize, params: &Value) -> Result<(), Detencion> {
-    if s.aperturas >= MAX_LECTURAS_POR_LOTE {
-        return Err(Detencion::Lote(format!(
-            "Se alcanzó el máximo de {MAX_LECTURAS_POR_LOTE} lecturas por lote. Usa «Más › Retomar paquete…» (o \
-             «Reintentar lecturas fallidas…») para continuar."
-        )));
-    }
-    s.aperturas += 1;
-    let respuesta = s.pedir("diary_open", json!({"params": params, "timeout": ESPERA_MS}))?;
-    let datos = lote::cuerpo(&respuesta, false)?;
+fn abrir(s: &mut Sesion<'_>, i: usize, params: &Value, siguientes: &[Value]) -> Result<(), Detencion> {
+    let respuesta = if s.prefetched.front().is_some_and(|(p, _)| p == params) {
+        s.prefetched.pop_front().ok_or_else(|| "No se identificó la lectura pendiente.".to_string())?.1?
+    } else {
+        s.prefetched.clear();
+        if s.aperturas >= MAX_LECTURAS_POR_LOTE {
+            return Err(Detencion::Lote(format!("Se alcanzó el máximo de {MAX_LECTURAS_POR_LOTE} lecturas por lote. Usa «Más › Retomar paquete…» (o «Reintentar lecturas fallidas…») para continuar.")));
+        }
+        s.aperturas += 1;
+        s.pedir("diary_open", json!({"params": params, "timeout": ESPERA_MS}))?
+    };
+    let carpeta = s.carpeta.clone();
+    let r = s.estado["registros"][i].clone();
+    let params = params.clone();
+    let procesar = move || procesar_bitacora(&respuesta, &params, &r, &carpeta);
+    let resultado = if s.rapido && s.prefetched.is_empty() && !siguientes.is_empty() {
+        // Solo un trabajador CPU a la vez. El manifiesto se modifica en el hilo dueño, en orden de fila.
+        std::thread::scope(|scope| {
+            let trabajo = scope.spawn(procesar);
+            s.preparar_siguientes(siguientes);
+            trabajo.join().map_err(|_| Detencion::Consulta("Falló el procesamiento local de la bitácora.".into()))?
+        })
+    } else { procesar() };
+    if resultado.is_err() { let mut p = s.control_pausa.get(); p.observar(Duration::ZERO, false); s.control_pausa.set(p); }
+    let campos = resultado?;
+    if let Some(destino) = s.estado["registros"][i].as_object_mut() { destino.extend(campos); }
+    Ok(())
+}
+
+fn procesar_bitacora(respuesta: &Value, params: &Value, r: &Value, carpeta: &Path) -> Result<Map<String, Value>, Detencion> {
+    let datos = lote::cuerpo(respuesta, false)?;
     let huella = sha256(&datos);
     if datos.len() > 8 * 1024 * 1024 || respuesta["digest"].as_str() != Some(huella.as_str()) || &respuesta["params"] != params {
         return Err(Detencion::Consulta("La respuesta de bitácora no coincide con la solicitud.".into()));
@@ -1257,11 +1290,10 @@ fn abrir(s: &mut Sesion<'_>, i: usize, params: &Value) -> Result<(), Detencion> 
         .map_err(|_| Detencion::Consulta("La fecha de la lectura de bitácora no es válida.".into()))?;
     let parametros: BTreeMap<String, String> = serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
     let leida = lecturas::leer_bitacora(&datos, &parametros, "", &capturada)?;
-    let r = &s.estado["registros"][i];
     let avisos = advertencias(&leida, r["rit"].as_str().unwrap_or(""), r["nombre"].as_str().unwrap_or(""));
-    let clave = r["clave"].as_str().unwrap_or("").to_string();
+    let clave = r["clave"].as_str().filter(|c| c.len() == 64 && c.bytes().all(|b| b.is_ascii_hexdigit())).ok_or_else(|| "Huella de registro inválida.".to_string())?;
     let nombre = format!("bitacora-{}-{}.html", &clave[..24], &huella[..16]);
-    let ruta = s.carpeta.join(&nombre);
+    let ruta = carpeta.join(&nombre);
     if ruta.exists() {
         if std::fs::read(&ruta).map_err(|e| e.to_string())? != datos {
             return Err(Detencion::Consulta("El archivo local de bitácora cambió.".into()));
@@ -1269,15 +1301,15 @@ fn abrir(s: &mut Sesion<'_>, i: usize, params: &Value) -> Result<(), Detencion> 
     } else {
         lote::guardar_exclusivo(&ruta, &datos)?;
     }
-    let r = &mut s.estado["registros"][i];
-    r["error"] = json!(avisos.join(" "));
-    r["advertencias"] = json!(avisos);
-    r["estado"] = json!("LEIDA");
-    r["archivo"] = json!(nombre);
-    r["sha256"] = json!(huella);
-    r["capturada"] = json!(capturada);
-    r["entradas"] = json!(leida["entries"].as_array().map_or(0, Vec::len));
-    Ok(())
+    Ok(Map::from_iter([
+        ("error".into(), json!(avisos.join(" "))),
+        ("advertencias".into(), json!(avisos)),
+        ("estado".into(), json!("LEIDA")),
+        ("archivo".into(), json!(nombre)),
+        ("sha256".into(), json!(huella)),
+        ("capturada".into(), json!(capturada)),
+        ("entradas".into(), json!(leida["entries"].as_array().map_or(0, Vec::len))),
+    ]))
 }
 
 #[cfg(test)]
@@ -1471,6 +1503,68 @@ mod tests {
     /// E-Q4a: mismas órdenes al puente, mismo `bitacoras.json`, mismas instantáneas y mismo resultado que
     /// `DiaryRunner` de Flow Python en los escenarios de `app/qa/generar_bitacoras.py` (`fecha` declarada).
     #[test]
+    fn pipeline_bitacoras_conserva_manifiesto_y_huellas() {
+        let datos: Value = serde_json::from_str(include_str!("../../tests/datos/bitacoras.json")).unwrap();
+        let caso = datos["escenarios"].as_array().unwrap().iter().find(|e| e["escenario"] == "basico").unwrap();
+        let pasos: Vec<Value> = caso["guion"].as_array().unwrap().iter().filter(|v| v["comando"] == "diary_open").cloned().collect();
+        assert_eq!(pasos.len(), 2);
+        let params: Vec<Value> = pasos.iter().map(|p| p["payload"]["params"].clone()).collect();
+        let mut sal = [0u8; 8]; getrandom::fill(&mut sal).unwrap();
+        let raiz = std::env::temp_dir().join(format!("flow-pipeline-{}", sal.iter().map(|b| format!("{b:02x}")).collect::<String>()));
+        std::fs::create_dir(&raiz).unwrap();
+        let mut salidas = Vec::new();
+        for rapido in [false, true] {
+            let carpeta = raiz.join(rapido.to_string()); std::fs::create_dir(&carpeta).unwrap();
+            let guion = Guion { pasos: pasos.clone(), pedidos: RefCell::default() };
+            let cancelar = AtomicBool::new(false);
+            let mut s = Sesion { conexion: &guion, carpeta: carpeta.clone(), estado: json!({"registros":caso["manifiesto"]["registros"]}), pendiente: 0,
+                aperturas: 0, fallas_seguidas: 0, cancelar: &cancelar, control_pausa: Cell::new(PausaAdaptativa::nueva(Duration::ZERO, Rapido::default())), rapido,
+                prefetched: VecDeque::new(), previos: Vec::new(), antiguos: BTreeMap::new(), calendarios: false, historico: false,
+                historicos: None, historicos_fallidos: 0, historico_suspendido: false, ahora: chrono::DateTime::parse_from_rfc3339(caso["ahora"].as_str().unwrap()).unwrap(), historia: None,
+                avance: &|_, _| {} };
+            assert!(abrir(&mut s, 0, &params[0], &params[1..]).is_ok());
+            if rapido { assert_eq!(s.prefetched.len(), 1); assert_eq!(guion.pedidos.borrow().len(), 2); }
+            assert!(abrir(&mut s, 1, &params[1], &[]).is_ok());
+            assert_eq!(s.aperturas, 2);
+            assert_eq!(guion.pedidos.borrow().len(), 2);
+            let huellas = instantaneas(&carpeta);
+            let esperado: BTreeMap<String, String> = serde_json::from_value(caso["instantaneas"].clone()).unwrap();
+            assert_eq!(huellas, esperado);
+            salidas.push((s.estado.clone(), huellas));
+        }
+        assert_eq!(salidas[0], salidas[1]);
+        std::fs::remove_dir_all(raiz).unwrap();
+    }
+
+    #[test]
+    fn un_lote_nuevo_no_usa_bitacoras_de_otro_lote() {
+        let datos: Value = serde_json::from_str(include_str!("../../tests/datos/bitacoras.json")).unwrap();
+        let es = datos["escenarios"].as_array().unwrap();
+        let viejo = es.iter().find(|e| e["escenario"] == "reutilizar_de_otro_lote").unwrap();
+        let fresco = es.iter().find(|e| e["escenario"] == "basico").unwrap();
+        let catalogo: Catalogo = serde_json::from_value(datos["catalogo"].clone()).unwrap();
+        let lista = |k: &str| -> Vec<String> { serde_json::from_value(fresco["lote"][k].clone()).unwrap() };
+        let lote = LoteBitacoras { tribunales: lista("tribunales"), modalidades: lista("modalidades"), pestanas: lista("pestanas"), fechas: None };
+        let destino = std::env::temp_dir().join(format!("flow-fresco-{}", std::process::id()));
+        std::fs::create_dir(&destino).unwrap();
+        let inicial = &viejo["inicial"];
+        let carpeta = destino.join(inicial["carpeta"].as_str().unwrap());
+        std::fs::create_dir(&carpeta).unwrap();
+        use base64::Engine;
+        for (archivo, b64) in inicial["archivos"].as_object().unwrap() {
+            std::fs::write(carpeta.join(archivo), base64::engine::general_purpose::STANDARD.decode(b64.as_str().unwrap()).unwrap()).unwrap();
+        }
+        let guion = Guion { pasos: fresco["guion"].as_array().unwrap().clone(), pedidos: RefCell::default() };
+        let opciones = Opciones { reutilizar_base: Some(destino.clone()), ahora: Some(chrono::DateTime::parse_from_rfc3339(viejo["ahora"].as_str().unwrap()).unwrap()), ..Default::default() };
+        let r = ejecutar_con_avance(&guion, &catalogo, &lote, &destino, &opciones, &AtomicBool::new(false), &|_, _| {}).unwrap();
+        assert_eq!(r["leidas"], 2);
+        assert_eq!(guion.pedidos.borrow().iter().filter(|v| v["comando"] == "diary_open").count(), 2);
+        let m: Value = serde_json::from_slice(&std::fs::read(r["manifest"].as_str().unwrap()).unwrap()).unwrap();
+        assert!(m["registros"].as_array().unwrap().iter().all(|r| r.get("reutilizada_de").is_none()));
+        std::fs::remove_dir_all(destino).unwrap();
+    }
+
+    #[test]
     fn lote_de_bitacoras_igual_a_python() {
         let datos: Value = serde_json::from_str(include_str!("../../tests/datos/bitacoras.json")).unwrap();
         let catalogo: Catalogo = serde_json::from_value(datos["catalogo"].clone()).unwrap();
@@ -1479,6 +1573,7 @@ mod tests {
         let escenarios = datos["escenarios"].as_array().unwrap();
         for e in escenarios {
             let nombre = e["escenario"].as_str().unwrap();
+            if nombre == "reutilizar_de_otro_lote" { continue; } // decisión explícita: ahora exige lecturas frescas (prueba separada).
             let lista = |k: &str| -> Vec<String> { serde_json::from_value(e["lote"][k].clone()).unwrap() };
             let lote = LoteBitacoras { tribunales: lista("tribunales"), modalidades: lista("modalidades"), pestanas: lista("pestanas"), fechas: None };
             let guion = Guion { pasos: e["guion"].as_array().unwrap().clone(), pedidos: RefCell::default() };

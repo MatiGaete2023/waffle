@@ -60,7 +60,8 @@ pub struct Opciones {
     pub fecha_informes: NaiveDate,
     pub pdf_vacias: bool,
     pub pausa: Duration,
-    /// `reuse`: reutiliza bitácoras de otros lotes del mismo día (solo en un paquete nuevo).
+    pub rapido: super::preferencias::Rapido,
+    /// Compatibilidad con controles anteriores; no se reutilizan lecturas de otros lotes.
     pub reutilizar: bool,
 }
 
@@ -77,7 +78,8 @@ impl Default for Opciones {
             fecha_informes: chrono::Local::now().date_naive(),
             pdf_vacias: true,
             pausa: Duration::from_secs(1),
-            reutilizar: true,
+            rapido: super::preferencias::Rapido::default(),
+            reutilizar: false,
         }
     }
 }
@@ -106,17 +108,23 @@ impl Opciones {
                 Some(ms) => Duration::from_millis(ms.as_u64().filter(|n| *n > 0).ok_or(OPCIONES_INVALIDAS)?),
                 None => Self::default().pausa,
             },
-            reutilizar: Default::default(),
+            rapido: match v.get("rapido") {
+                Some(r) => serde_json::from_value::<super::preferencias::Rapido>(r.clone()).map_err(|_| OPCIONES_INVALIDAS)?.limitado(),
+                None => super::preferencias::Rapido::default(),
+            },
+            reutilizar: false,
         })
     }
 
     pub fn a_json(&self) -> Value {
-        json!({
+        let mut valor = json!({
             "consolidado": self.consolidado, "calendarios": self.calendarios, "historia": self.historia,
             "historico": self.historico, "historia_en_paquete": self.historia_en_paquete, "meses": self.meses,
             "informes": self.informes, "fecha_informes": self.fecha_informes.to_string(),
             "pdf_vacias": self.pdf_vacias, "pausa_ms": self.pausa.as_millis().min(u128::from(u64::MAX)) as u64,
-        })
+        });
+        if self.rapido.activado { valor["rapido"] = json!(self.rapido.limitado()); }
+        valor
     }
 }
 
@@ -498,6 +506,42 @@ fn publicar_captura(nuevo: &Path, objetivo: &Path, respaldo: &Path) -> Result<()
     Ok(())
 }
 
+/// Etiqueta efímera de UNA ejecución del paquete. Chrome conserva solo páginas de búsqueda de
+/// la primera fase y únicamente las puede restituir durante la segunda, por igualdad exacta de pares.
+/// Nunca persiste el HTML ni la clave del ámbito ni los incluye en manifiestos.
+struct ReusoConsultas<'a> {
+    real: &'a dyn Conexion,
+    ambito: String,
+    fase: std::cell::Cell<u8>,
+    limpiar: std::cell::Cell<bool>,
+}
+impl<'a> ReusoConsultas<'a> {
+    fn nuevo(real: &'a dyn Conexion) -> Result<Self, String> {
+        let mut azar = [0u8; 16];
+        getrandom::fill(&mut azar).map_err(|_| "No se pudo crear el ámbito de la consulta local.")?;
+        Ok(ReusoConsultas { real, ambito: azar.iter().map(|b| format!("{b:02x}")).collect(), fase: std::cell::Cell::new(0), limpiar: std::cell::Cell::new(false) })
+    }
+}
+impl Conexion for ReusoConsultas<'_> {
+    fn llamar(&self, comando: &str, mut payload: Value, plazo: Duration) -> Result<Value, String> {
+        let fase = self.fase.get();
+        if fase < 2 && matches!(comando, "lock" | "search" | "unlock") {
+            payload["flow_scope"] = json!(self.ambito);
+            payload["flow_cache"] = json!(if fase == 0 { "record" } else { "replay" });
+            if comando == "lock" { self.limpiar.set(true); }
+        }
+        let r = self.real.llamar(comando, payload, plazo);
+        if comando == "unlock" && fase == 1 && r.is_ok() { self.limpiar.set(false); }
+        r
+    }
+    fn habilitar_lecturas(&self, integral: bool) { self.real.habilitar_lecturas(integral); }
+}
+impl Drop for ReusoConsultas<'_> {
+    fn drop(&mut self) {
+        if self.limpiar.get() { let _ = self.real.llamar("unlock", json!({}), Duration::from_secs(8)); }
+    }
+}
+
 /// Fases del flujo y estado a partir del cual se puede retomar. `ejecutar` crea y ejecuta la carpeta; `retomar`
 /// continúa una cortada.
 #[allow(clippy::too_many_arguments)]
@@ -507,7 +551,7 @@ fn correr(
     edicion: Edicion,
     plan: &PlanLote,
     alcance: &LoteBitacoras,
-    destino_usuario: Option<&Path>,
+    _destino_usuario: Option<&Path>,
     raiz: &Path,
     previo: Option<Control>,
     opciones: &Opciones,
@@ -565,6 +609,8 @@ fn correr(
         BTreeMap::new()
     };
 
+    let reuso = if op.rapido.activado && !retomando { Some(ReusoConsultas::nuevo(conexion)?) } else { None };
+    let conexion: &dyn Conexion = reuso.as_ref().map_or(conexion, |r| r as &dyn Conexion);
     let corrida = (|| -> Result<(Resultado, Value), String> {
         // -- consultas (`BatchRunner.run`)
         fase(&mut estado, &control, "consultas", cancelar, emitir)?;
@@ -603,6 +649,7 @@ fn correr(
         }
         checkpoint(cancelar)?;
 
+        if let Some(r) = &reuso { r.fase.set(1); }
         // -- bitácoras, calendarios, historia e histórico (`DiaryRunner.run`)
         fase(&mut estado, &control, "bitacoras", cancelar, emitir)?;
         estado["alcance_ingresos"]["bitacoras_aplicado"] = Value::Null;
@@ -612,7 +659,8 @@ fn correr(
         let opciones_bit = bitacoras::Opciones {
             pausa: op.pausa,
             retomar: previas.clone(),
-            reutilizar_base: (op.reutilizar && !retomando).then(|| destino_usuario.map(Path::to_path_buf)).flatten(),
+            reutilizar_base: None,
+            rapido: op.rapido,
             calendarios: op.calendarios,
             historico: op.historico,
             historia: op.historia.then_some(op.meses),
@@ -671,6 +719,7 @@ fn correr(
         }
         escribir_control(&control, &estado)?;
 
+        if let Some(r) = &reuso { r.fase.set(2); }
         // -- informes por vencer (`_informes`): solo con la hoja de Cumplimiento
         let (carpetas_informes, informes_completos) =
             informes(conexion, edicion, alcance, &respaldo, raiz, &mut estado, &control, &op, cancelar, emitir)?;

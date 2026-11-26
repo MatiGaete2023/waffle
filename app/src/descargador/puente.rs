@@ -3,12 +3,13 @@
 
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
-use std::io::Read;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-use tiny_http::{Header, Method, Request, Response, Server};
+
 
 /// Órdenes de lectura que admite la extensión Lite (`puente.Bridge.call` de Flow Python). Ninguna escribe en SITFA.
 const COMANDOS: [&str; 10] = [
@@ -28,7 +29,190 @@ const LECTURAS_INTEGRAL: [&str; 4] = ["diary_open", "history_open", "calendar_op
 const MOTIVOS_EVIDENCIA: [&str; 9] = [
     "estructura", "sesion", "cambio", "pantalla", "tiempo", "pagina", "acceso", "permiso", "pestaña",
 ];
-const CUERPO_MAXIMO: usize = 4 * 1024 * 1024;
+// El lector de la extensión admite 80 MiB binarios; base64 ocupa hasta 107 MiB.
+const CONTROL_MAXIMO: usize = 256 * 1024;
+const DATOS_MAXIMO: usize = 112 * 1024 * 1024;
+const CABECERAS_MAXIMO: usize = 16 * 1024;
+const PLAZO_CABECERAS: Duration = Duration::from_secs(5);
+const PLAZO_CUERPO: Duration = Duration::from_secs(30);
+const PLAZO_ESCRITURA: Duration = Duration::from_secs(10);
+const MAX_EN_VUELO: usize = 3;
+
+fn tomar<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    // No se ejecuta código de usuario bajo estos locks; cada mutación es una operación de colección.
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lectura_paralela(comando: &str) -> bool {
+    LECTURAS_INTEGRAL.contains(&comando)
+}
+
+fn presupuesto(comando: &str) -> usize {
+    if matches!(comando, "search" | "download" | "evidence_capture" | "evidence_open") || lectura_paralela(comando) {
+        DATOS_MAXIMO
+    } else {
+        CONTROL_MAXIMO
+    }
+}
+
+struct Pendiente {
+    envio: Sender<Value>,
+    comando: String,
+}
+
+#[derive(Default)]
+struct Despacho {
+    configurado: usize,
+    fallas: usize,
+    degradado: bool,
+    en_vuelo: HashMap<String, bool>,
+}
+
+impl Despacho {
+    fn limite(&self) -> usize {
+        if self.degradado { 1 } else { self.configurado.clamp(1, MAX_EN_VUELO) }
+    }
+    fn admite(&self, comando: &str) -> bool {
+        self.en_vuelo.is_empty() || (lectura_paralela(comando) && self.en_vuelo.values().all(|v| *v) && self.en_vuelo.len() < self.limite())
+    }
+    fn resultado(&mut self, sano: bool) {
+        if sano { self.fallas = 0; } else {
+            self.fallas = self.fallas.saturating_add(1);
+            if self.fallas >= 2 { self.degradado = true; }
+        }
+    }
+}
+
+// Una conexión HTTP por socket. Plazo absoluto, no solo inactividad entre bytes.
+struct LecturaHttp {
+    socket: TcpStream,
+    limite: Instant,
+}
+impl Read for LecturaHttp {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let resta = self.limite.saturating_duration_since(Instant::now());
+        if resta.is_zero() { return Err(io::Error::new(io::ErrorKind::TimedOut, "plazo HTTP")); }
+        self.socket.set_read_timeout(Some(resta))?;
+        self.socket.read(buf)
+    }
+}
+
+struct Peticion {
+    entrada: BufReader<LecturaHttp>,
+    metodo: String,
+    ruta: String,
+    cabeceras: HashMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ErrorHttp { Invalido, Grande, Tiempo }
+impl From<io::Error> for ErrorHttp {
+    fn from(e: io::Error) -> Self {
+        if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) { Self::Tiempo } else { Self::Invalido }
+    }
+}
+impl ErrorHttp {
+    fn respuesta(self) -> (u16, Value) {
+        match self {
+            Self::Invalido => (400, json!({"error":"INVALID_MESSAGE", "message":"Mensaje HTTP inválido."})),
+            Self::Grande => (413, json!({"error":"PAYLOAD_TOO_LARGE", "message":"La respuesta excede el presupuesto de lectura del puente local."})),
+            Self::Tiempo => (408, json!({"error":"LOCAL_TIMEOUT", "message":"Se agotó el plazo de lectura del puente local."})),
+        }
+    }
+}
+
+fn linea<R: BufRead>(r: &mut R, restante: &mut usize) -> Result<String, ErrorHttp> {
+    // read_until por sí solo no acota una línea sin salto; Take impone el máximo real.
+    let mut b = Vec::new();
+    let n = (&mut *r).take((*restante as u64).saturating_add(1)).read_until(b'\n', &mut b)?;
+    if n > *restante { return Err(ErrorHttp::Grande); }
+    *restante -= n;
+    if !b.ends_with(b"\r\n") { return Err(ErrorHttp::Invalido); }
+    b.truncate(b.len() - 2);
+    String::from_utf8(b).map_err(|_| ErrorHttp::Invalido)
+}
+
+fn cabeceras_http<R: BufRead>(r: &mut R) -> Result<(String, String, HashMap<String, String>), ErrorHttp> {
+    let mut resto = CABECERAS_MAXIMO;
+    let primera = linea(r, &mut resto)?;
+    let partes: Vec<_> = primera.split_whitespace().collect();
+    if partes.len() != 3 || !matches!(partes[2], "HTTP/1.1" | "HTTP/1.0") || !partes[1].starts_with('/') { return Err(ErrorHttp::Invalido); }
+    let mut headers = HashMap::new();
+    loop {
+        let l = linea(r, &mut resto)?;
+        if l.is_empty() { break; }
+        let (k, v) = l.split_once(':').ok_or(ErrorHttp::Invalido)?;
+        if k.is_empty() || !k.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)) || v.bytes().any(|b| b < 32 && b != b'\t' || b == 127) { return Err(ErrorHttp::Invalido); }
+        let k = k.to_ascii_lowercase();
+        if headers.insert(k.clone(), v.trim().to_string()).is_some() && matches!(k.as_str(), "content-length" | "transfer-encoding" | "origin" | "x-sitfa-code" | "x-sitfa-extension" | "x-sitfa-task") { return Err(ErrorHttp::Invalido); }
+    }
+    Ok((partes[0].into(), partes[1].into(), headers))
+}
+
+fn leer_cuerpo<R: BufRead>(r: &mut R, h: &HashMap<String, String>, max: usize) -> Result<Vec<u8>, ErrorHttp> {
+    let largo = h.get("content-length");
+    if let Some(te) = h.get("transfer-encoding") {
+        if largo.is_some() || !te.eq_ignore_ascii_case("chunked") { return Err(ErrorHttp::Invalido); }
+        let mut cuerpo = Vec::new();
+        // También se limita el framing; permite muchos chunks pequeños sin crecimiento ilimitado.
+        let mut framing = 8 * 1024 * 1024;
+        loop {
+            let l = linea(r, &mut framing)?;
+            let n = l.split(';').next().ok_or(ErrorHttp::Invalido)?.trim();
+            if n.is_empty() || !n.bytes().all(|b| b.is_ascii_hexdigit()) { return Err(ErrorHttp::Invalido); }
+            let n = usize::from_str_radix(n, 16).map_err(|_| ErrorHttp::Grande)?;
+            if n == 0 {
+                let mut trailers = CABECERAS_MAXIMO;
+                loop {
+                    let l = linea(r, &mut trailers)?;
+                    if l.is_empty() { return Ok(cuerpo); }
+                    if !l.contains(':') { return Err(ErrorHttp::Invalido); }
+                }
+            }
+            if n > max.saturating_sub(cuerpo.len()) { return Err(ErrorHttp::Grande); }
+            let inicio = cuerpo.len();
+            // No reservar el tamaño declarado antes de recibir bytes.
+            let recibidos = (&mut *r).take(n as u64).read_to_end(&mut cuerpo)?;
+            if recibidos != n || cuerpo.len() != inicio + n { return Err(ErrorHttp::Invalido); }
+            let mut fin = [0; 2];
+            r.read_exact(&mut fin)?;
+            if fin != *b"\r\n" { return Err(ErrorHttp::Invalido); }
+        }
+    }
+    let n = largo.ok_or(ErrorHttp::Invalido)?;
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) { return Err(ErrorHttp::Invalido); }
+    let n = n.parse::<usize>().map_err(|_| ErrorHttp::Grande)?;
+    if n == 0 { return Err(ErrorHttp::Invalido); }
+    if n > max { return Err(ErrorHttp::Grande); }
+    let mut cuerpo = Vec::new();
+    if (&mut *r).take(n as u64).read_to_end(&mut cuerpo)? != n { return Err(ErrorHttp::Invalido); }
+    Ok(cuerpo)
+}
+
+fn respuesta_http(socket: &mut TcpStream, estado: u16, datos: Option<Value>, origen: Option<&str>, preflight: bool) {
+    let cuerpo = datos.map(|v| v.to_string()).unwrap_or_default();
+    let razon = match estado { 200 => "OK", 204 => "No Content", 400 => "Bad Request", 403 => "Forbidden", 404 => "Not Found", 408 => "Request Timeout", 409 => "Conflict", 413 => "Payload Too Large", _ => "Error" };
+    let _ = socket.set_write_timeout(Some(PLAZO_ESCRITURA));
+    let _ = (|| -> io::Result<()> {
+        write!(socket, "HTTP/1.1 {estado} {razon}\r\nConnection: close\r\nCache-Control: no-store\r\nVary: Origin\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n", cuerpo.len())?;
+        if let Some(o) = origen { write!(socket, "Access-Control-Allow-Origin: {o}\r\n")?; }
+        if preflight {
+            socket.write_all(b"Access-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, X-Sitfa-Code, X-Sitfa-Extension, X-Sitfa-Task\r\nAccess-Control-Allow-Private-Network: true\r\n")?;
+        }
+        socket.write_all(b"\r\n")?;
+        socket.write_all(cuerpo.as_bytes())
+    })();
+}
+
+fn aceptar(estado: &Estado, mut socket: TcpStream) {
+    if socket.set_nonblocking(false).is_err() { return; }
+    let Ok(lector) = socket.try_clone() else { return; };
+    let mut entrada = BufReader::new(LecturaHttp { socket: lector, limite: Instant::now() + PLAZO_CABECERAS });
+    match cabeceras_http(&mut entrada) {
+        Ok((metodo, ruta, cabeceras)) => atender(estado, Peticion { entrada, metodo, ruta, cabeceras }),
+        Err(e) => { let (status, datos) = e.respuesta(); respuesta_http(&mut socket, status, Some(datos), None, false); }
+    }
+}
 const ESPERA_TAREA: Duration = Duration::from_secs(4);
 const VIGENCIA_CONEXION: Duration = Duration::from_secs(20);
 
@@ -43,7 +227,8 @@ struct Estado {
     origen: Mutex<Option<String>>,
     tareas: Mutex<VecDeque<Tarea>>,
     hay_tarea: Condvar,
-    pendientes: Mutex<HashMap<String, Sender<Value>>>,
+    pendientes: Mutex<HashMap<String, Pendiente>>,
+    despacho: Mutex<Despacho>,
     visto: Mutex<Option<Instant>>,
     cerrado: AtomicBool,
     /// La última verificación de la extensión fue Integral: habilita `LECTURAS_INTEGRAL`.
@@ -53,7 +238,6 @@ struct Estado {
 pub struct Puente {
     puerto: u16,
     estado: Arc<Estado>,
-    servidor: Arc<Server>,
 }
 
 fn aleatorio<const N: usize>() -> Result<String, String> {
@@ -70,16 +254,12 @@ fn iguales_en_tiempo_constante(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }
 
-fn cabecera(peticion: &Request, nombre: &str) -> Option<String> {
-    peticion
-        .headers()
-        .iter()
-        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(nombre))
-        .map(|h| h.value.as_str().to_string())
+fn cabecera(peticion: &Peticion, nombre: &str) -> Option<String> {
+    peticion.cabeceras.get(&nombre.to_ascii_lowercase()).cloned()
 }
 
 /// Origen CORS válido: `chrome-extension://<id>`.
-fn origen_cors(peticion: &Request) -> Option<String> {
+fn origen_cors(peticion: &Peticion) -> Option<String> {
     cabecera(peticion, "Origin").filter(|o| {
         o.strip_prefix("chrome-extension://")
             .is_some_and(es_id_extension)
@@ -87,7 +267,7 @@ fn origen_cors(peticion: &Request) -> Option<String> {
 }
 
 /// Identidad de la extensión. Chrome puede omitir `Origin`; la identidad declarada nunca reemplaza al código secreto.
-fn origen_extension(peticion: &Request) -> Option<String> {
+fn origen_extension(peticion: &Peticion) -> Option<String> {
     let declarada = cabecera(peticion, "X-Sitfa-Extension").unwrap_or_default();
     if !declarada.is_empty() && !es_id_extension(&declarada) {
         return None;
@@ -104,24 +284,12 @@ fn origen_extension(peticion: &Request) -> Option<String> {
     }
 }
 
-fn responder(peticion: Request, estado_http: u16, datos: Value) {
+fn responder(mut peticion: Peticion, estado_http: u16, datos: Value) {
     let origen = origen_cors(&peticion);
-    let mut respuesta = Response::from_string(datos.to_string()).with_status_code(estado_http);
-    let mut poner = |nombre: &str, valor: &str| {
-        if let Ok(h) = Header::from_bytes(nombre.as_bytes(), valor.as_bytes()) {
-            respuesta.add_header(h);
-        }
-    };
-    if let Some(o) = &origen {
-        poner("Access-Control-Allow-Origin", o);
-    }
-    poner("Vary", "Origin");
-    poner("Cache-Control", "no-store");
-    poner("Content-Type", "application/json; charset=utf-8");
-    let _ = peticion.respond(respuesta);
+    respuesta_http(&mut peticion.entrada.get_mut().socket, estado_http, Some(datos), origen.as_deref(), false);
 }
 
-fn autorizada(estado: &Estado, peticion: &Request) -> Result<String, &'static str> {
+fn autorizada(estado: &Estado, peticion: &Peticion) -> Result<String, &'static str> {
     let origen = origen_extension(peticion).ok_or("EXTENSION_ORIGIN")?;
     let codigo = cabecera(peticion, "X-Sitfa-Code").unwrap_or_default();
     let formato = codigo.len() == 32
@@ -131,128 +299,117 @@ fn autorizada(estado: &Estado, peticion: &Request) -> Result<String, &'static st
     if !formato || !iguales_en_tiempo_constante(&codigo, &estado.codigo) {
         return Err("CONNECTION_CODE");
     }
-    if estado
-        .origen
-        .lock()
-        .unwrap()
+    if tomar(&estado.origen)
         .as_ref()
         .is_some_and(|fijado| *fijado != origen)
     {
         return Err("EXTENSION_CHANGED");
     }
-    *estado.visto.lock().unwrap() = Some(Instant::now());
+    *tomar(&estado.visto) = Some(Instant::now());
     Ok(origen)
 }
 
-fn atender(estado: &Estado, mut peticion: Request) {
-    if *peticion.method() == Method::Options {
-        let Some(origen) = origen_cors(&peticion) else {
-            return responder(peticion, 403, json!({}));
-        };
-        let mut respuesta = Response::empty(204);
-        for (nombre, valor) in [
-            ("Access-Control-Allow-Origin", origen.as_str()),
-            ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
-            (
-                "Access-Control-Allow-Headers",
-                "Content-Type, X-Sitfa-Code, X-Sitfa-Extension",
-            ),
-            ("Access-Control-Allow-Private-Network", "true"),
-            ("Cache-Control", "no-store"),
-        ] {
-            if let Ok(h) = Header::from_bytes(nombre.as_bytes(), valor.as_bytes()) {
-                respuesta.add_header(h);
-            }
-        }
-        let _ = peticion.respond(respuesta);
+fn atender(estado: &Estado, mut peticion: Peticion) {
+    if peticion.metodo == "OPTIONS" {
+        let Some(origen) = origen_cors(&peticion) else { return responder(peticion, 403, json!({})); };
+        respuesta_http(&mut peticion.entrada.get_mut().socket, 204, None, Some(&origen), true);
         return;
     }
     let origen = match autorizada(estado, &peticion) {
         Ok(o) => o,
         Err(motivo) => return responder(peticion, 403, json!({"error": motivo})),
     };
-    let ruta = peticion.url().to_string();
-    if *peticion.method() == Method::Get {
-        if ruta != "/next" || estado.origen.lock().unwrap().is_none() {
-            return responder(peticion, 404, json!({}));
-        }
+    let ruta = peticion.ruta.clone();
+    if peticion.metodo == "GET" {
+        if ruta != "/next" || tomar(&estado.origen).is_none() { return responder(peticion, 404, json!({})); }
         let limite = Instant::now() + ESPERA_TAREA;
-        let mut cola = estado.tareas.lock().unwrap();
+        let mut cola = tomar(&estado.tareas);
         loop {
-            while let Some(tarea) = cola.pop_front() {
-                // Una tarea cuyo plazo ya venció no se entrega.
-                if estado.pendientes.lock().unwrap().contains_key(&tarea.id) {
-                    drop(cola);
-                    return responder(
-                        peticion,
-                        200,
-                        json!({"id": tarea.id, "command": tarea.comando, "payload": tarea.payload}),
-                    );
-                }
+            while let Some(tarea) = cola.front() {
+                let pendientes = tomar(&estado.pendientes);
+                if !pendientes.contains_key(&tarea.id) { cola.pop_front(); continue; }
+                let mut d = tomar(&estado.despacho);
+                if !d.admite(&tarea.comando) || (!estado.integral.load(Ordering::SeqCst) && !d.en_vuelo.is_empty()) { break; }
+                let Some(tarea) = cola.pop_front() else { break; };
+                d.en_vuelo.insert(tarea.id.clone(), lectura_paralela(&tarea.comando));
+                let paralelo = if estado.integral.load(Ordering::SeqCst) { d.limite() } else { 1 };
+                drop(d); drop(pendientes); drop(cola);
+                return responder(peticion, 200, json!({"id":tarea.id,"command":tarea.comando,"payload":tarea.payload,"parallel":paralelo}));
             }
             let resta = limite.saturating_duration_since(Instant::now());
             if resta.is_zero() || estado.cerrado.load(Ordering::SeqCst) {
                 drop(cola);
-                return responder(peticion, 200, json!({"idle": true}));
+                let paralelo = if estado.integral.load(Ordering::SeqCst) { tomar(&estado.despacho).limite() } else { 1 };
+                return responder(peticion, 200, json!({"idle":true,"parallel":paralelo}));
             }
-            cola = estado.hay_tarea.wait_timeout(cola, resta).unwrap().0;
+            cola = estado.hay_tarea.wait_timeout(cola, resta).unwrap_or_else(|e| e.into_inner()).0;
         }
     }
-    if *peticion.method() != Method::Post {
-        return responder(peticion, 404, json!({}));
-    }
-    let largo = peticion.body_length().unwrap_or(0);
-    if largo == 0 || largo > CUERPO_MAXIMO {
-        return responder(peticion, 400, json!({"error": "Mensaje invalido."}));
-    }
-    let mut cuerpo = Vec::with_capacity(largo.min(1 << 20));
-    if peticion
-        .as_reader()
-        .take(CUERPO_MAXIMO as u64 + 1)
-        .read_to_end(&mut cuerpo)
-        .is_err()
-    {
-        return responder(peticion, 400, json!({"error": "Mensaje invalido."}));
-    }
-    let Ok(Value::Object(datos)) = serde_json::from_slice::<Value>(&cuerpo) else {
-        return responder(peticion, 400, json!({"error": "Mensaje invalido."}));
+    if peticion.metodo != "POST" || !matches!(ruta.as_str(), "/connect" | "/complete") { return responder(peticion, 404, json!({})); }
+    let tarea_declarada = cabecera(&peticion, "X-Sitfa-Task");
+    let maximo = if ruta == "/connect" { CONTROL_MAXIMO } else if let Some(id) = &tarea_declarada {
+        let pendientes = tomar(&estado.pendientes);
+        // Una respuesta tardía también libera el cupo sin interpretar un cuerpo arbitrario.
+        match pendientes.get(id) {
+            Some(p) => presupuesto(&p.comando),
+            None => {
+                drop(pendientes);
+                tomar(&estado.despacho).en_vuelo.remove(id);
+                estado.hay_tarea.notify_all();
+                return responder(peticion, 409, json!({"error":"TASK_EXPIRED"}));
+            }
+        }
+    } else {
+        // Extensión anterior: si hay tareas activas identificadas, también se aplica su presupuesto
+        // antes de leer. Una respuesta tardía sin cabecera necesita el límite general para liberar el cupo.
+        let pendientes = tomar(&estado.pendientes);
+        let d = tomar(&estado.despacho);
+        d.en_vuelo.keys().map(|id| pendientes.get(id).map_or(DATOS_MAXIMO, |p| presupuesto(&p.comando))).max().unwrap_or(CONTROL_MAXIMO)
     };
-    match ruta.as_str() {
-        "/connect" => {
-            let mut fijado = estado.origen.lock().unwrap();
-            if fijado.as_ref().is_some_and(|fijado| *fijado != origen) {
-                return responder(peticion, 403, json!({"error": "EXTENSION_CHANGED"}));
-            }
-            *fijado = Some(origen);
-            *estado.visto.lock().unwrap() = Some(Instant::now());
-            drop(fijado);
-            responder(peticion, 200, json!({"ok": true}))
-        }
-        "/complete" => {
-            if estado.origen.lock().unwrap().is_none() {
-                return responder(peticion, 409, json!({"error": "NOT_CONNECTED"}));
-            }
-            let (Some(id), Some(_)) = (
-                datos.get("id").and_then(Value::as_str),
-                datos.get("ok").and_then(Value::as_bool),
-            ) else {
-                return responder(peticion, 400, json!({"error": "Mensaje invalido."}));
-            };
-            let canal = estado.pendientes.lock().unwrap().remove(id);
-            if canal.is_some_and(|canal| canal.send(Value::Object(datos)).is_ok()) {
-                responder(peticion, 200, json!({"ok": true}));
-            } else {
-                responder(peticion, 409, json!({"error": "TASK_EXPIRED"}));
-            }
-        }
-        _ => responder(peticion, 404, json!({})),
+    peticion.entrada.get_mut().limite = Instant::now() + PLAZO_CUERPO;
+    if cabecera(&peticion, "Expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue")) {
+        let _ = peticion.entrada.get_mut().socket.set_write_timeout(Some(PLAZO_ESCRITURA));
+        let _ = peticion.entrada.get_mut().socket.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
     }
+    let cuerpo = match leer_cuerpo(&mut peticion.entrada, &peticion.cabeceras, maximo) {
+        Ok(c) => c,
+        Err(e) => { let (status, datos) = e.respuesta(); return responder(peticion, status, datos); }
+    };
+    let Ok(Value::Object(datos)) = serde_json::from_slice::<Value>(&cuerpo) else { return responder(peticion, 400, json!({"error":"INVALID_MESSAGE"})); };
+    if ruta == "/connect" {
+        let mut fijado = tomar(&estado.origen);
+        if fijado.as_ref().is_some_and(|fijado| *fijado != origen) { return responder(peticion, 403, json!({"error":"EXTENSION_CHANGED"})); }
+        *fijado = Some(origen);
+        *tomar(&estado.visto) = Some(Instant::now());
+        drop(fijado);
+        return responder(peticion, 200, json!({"ok":true,"parallel":1}));
+    }
+    if tomar(&estado.origen).is_none() { return responder(peticion, 409, json!({"error":"NOT_CONNECTED"})); }
+    let (Some(id), Some(sano)) = (datos.get("id").and_then(Value::as_str), datos.get("ok").and_then(Value::as_bool)) else { return responder(peticion, 400, json!({"error":"INVALID_MESSAGE"})); };
+    if tarea_declarada.as_deref().is_some_and(|t| t != id) { return responder(peticion, 400, json!({"error":"INVALID_MESSAGE"})); }
+    let mut pendientes = tomar(&estado.pendientes);
+    if pendientes.get(id).is_some_and(|p| cuerpo.len() > presupuesto(&p.comando)) {
+        let (status, datos) = ErrorHttp::Grande.respuesta();
+        drop(pendientes);
+        return responder(peticion, status, datos);
+    }
+    let mut d = tomar(&estado.despacho);
+    let activa = d.en_vuelo.remove(id).is_some();
+    if activa { d.resultado(sano); }
+    drop(d);
+    let canal = if activa { pendientes.remove(id) } else { None };
+    drop(pendientes);
+    estado.hay_tarea.notify_all();
+    if canal.is_some_and(|p| p.envio.send(Value::Object(datos)).is_ok()) { responder(peticion, 200, json!({"ok":true})); }
+    else { responder(peticion, 409, json!({"error":"TASK_EXPIRED"})); }
 }
 
 /// Texto fijo por código de la extensión; el motivo técnico de la evidencia solo se acepta de una lista cerrada.
 fn mensaje_error(comando: &str, datos: &Value) -> String {
     let codigo = datos["error"].as_str().unwrap_or("");
     let mut texto = match codigo {
+        "PAYLOAD_TOO_LARGE" => "La respuesta excede el presupuesto de lectura del puente local; acota la consulta.",
+        "LOCAL_TIMEOUT" => "Se agotó el plazo de lectura del puente local.",
         "FOLLOWUP_REQUIRED" => "Entra a Seguimiento en la pestaña SITFA y vuelve a cargar las opciones.",
         "SITE_ACCESS" => "Comprueba que Chrome siga abierto en SITFA y que la extensión pueda acceder a esa pestaña.",
         "MULTIPLE_FORMS" => "Se encontró más de un formulario de Seguimiento. Abre la conexión desde una pestaña con un solo formulario.",
@@ -275,42 +432,42 @@ fn mensaje_error(comando: &str, datos: &Value) -> String {
 impl Puente {
     /// Abre el puente en un puerto libre de 127.0.0.1.
     pub fn abrir() -> Result<Puente, String> {
-        let servidor = Arc::new(
-            Server::http("127.0.0.1:0")
-                .map_err(|e| format!("No se pudo abrir el puente local: {e}"))?,
-        );
-        let puerto = servidor
-            .server_addr()
-            .to_ip()
-            .map(|a| a.port())
-            .ok_or("Puente sin puerto.")?;
+        let servidor = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("No se pudo abrir el puente local: {e}"))?;
+        servidor.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let puerto = servidor.local_addr().map_err(|e| e.to_string())?.port();
         let estado = Arc::new(Estado {
             codigo: aleatorio::<16>()?,
             origen: Mutex::new(None),
             tareas: Mutex::new(VecDeque::new()),
             hay_tarea: Condvar::new(),
             pendientes: Mutex::new(HashMap::new()),
+            despacho: Mutex::new(Despacho::default()),
             visto: Mutex::new(None),
             cerrado: AtomicBool::new(false),
             integral: AtomicBool::new(false),
         });
-        for _ in 0..4 {
+        // Tres peticiones de trabajo como máximo, más polls y control; número fijo de hilos.
+        let servidor = Arc::new(servidor);
+        for _ in 0..8 {
             let (servidor, estado) = (servidor.clone(), estado.clone());
             std::thread::spawn(move || {
                 while !estado.cerrado.load(Ordering::SeqCst) {
-                    match servidor.recv_timeout(Duration::from_millis(300)) {
-                        Ok(Some(peticion)) => atender(&estado, peticion),
-                        Ok(None) => {}
+                    match servidor.accept() {
+                        Ok((socket, _)) => aceptar(&estado, socket),
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(20)),
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
                     }
                 }
             });
         }
-        Ok(Puente {
-            puerto,
-            estado,
-            servidor,
-        })
+        Ok(Puente { puerto, estado })
+    }
+
+    /// Configura el tope para la próxima operación. Una degradación por fallas dura hasta reconectar.
+    pub fn configurar_concurrencia(&self, maximo: usize) {
+        tomar(&self.estado.despacho).configurado = maximo.clamp(1, MAX_EN_VUELO);
+        self.estado.hay_tarea.notify_all();
     }
 
     /// La extensión verificada es Integral (habilita las lecturas de contexto) o no (Lite, o verificación fallida).
@@ -331,12 +488,8 @@ impl Puente {
     /// La extensión se conectó y sigue consultando.
     pub fn conectado(&self) -> bool {
         !self.estado.cerrado.load(Ordering::SeqCst)
-            && self.estado.origen.lock().unwrap().is_some()
-            && self
-                .estado
-                .visto
-                .lock()
-                .unwrap()
+            && tomar(&self.estado.origen).is_some()
+            && tomar(&self.estado.visto)
                 .is_some_and(|t| t.elapsed() < VIGENCIA_CONEXION)
     }
 
@@ -346,6 +499,30 @@ impl Puente {
         payload: Value,
         plazo: Duration,
     ) -> Result<Value, String> {
+        if comando == "context_batch" {
+            // Orden interna del adaptador, no una acción del navegador. Solo ventanas de lectura verificadas.
+            let comando = payload["command"].as_str().filter(|c| lectura_paralela(c)).ok_or("Acción no permitida.")?;
+            let cargas = payload["payloads"].as_array().filter(|a| !a.is_empty() && a.len() <= MAX_EN_VUELO).ok_or("Grupo de lectura inválido.")?;
+            if !self.estado.integral.load(Ordering::SeqCst) { return Err("Acción no permitida.".into()); }
+            let mut resultados = Vec::with_capacity(cargas.len());
+            let mut restantes = cargas.as_slice();
+            while !restantes.is_empty() {
+                let n = restantes.len().min(tomar(&self.estado.despacho).limite());
+                let grupo = &restantes[..n];
+                // Se conservan las posiciones aunque Chrome responda fuera de orden.
+                let r = std::thread::scope(|scope| {
+                    let h: Vec<_> = grupo.iter().map(|p| scope.spawn(move || self.llamar(comando, p.clone(), plazo))).collect();
+                    h.into_iter().map(|t| match t.join() {
+                        Ok(Ok(v)) => json!({"ok":true,"result":v}),
+                        Ok(Err(e)) => json!({"ok":false,"error":e}),
+                        Err(_) => json!({"ok":false,"error":"Falló el trabajador de lectura local."}),
+                    }).collect::<Vec<_>>()
+                });
+                resultados.extend(r);
+                restantes = &restantes[n..];
+            }
+            return Ok(Value::Array(resultados));
+        }
         let lectura = LECTURAS_INTEGRAL.contains(&comando);
         if !COMANDOS.contains(&comando) && !(lectura && self.estado.integral.load(Ordering::SeqCst)) {
             return Err("Acción no permitida.".into());
@@ -356,20 +533,25 @@ impl Puente {
         let id = aleatorio::<12>()?;
         let (envio, recepcion) = channel();
         {
-            let mut pendientes = self.estado.pendientes.lock().unwrap();
+            let mut pendientes = tomar(&self.estado.pendientes);
             if self.estado.cerrado.load(Ordering::SeqCst) {
                 return Err("Se cerró la conexión local.".into());
             }
-            pendientes.insert(id.clone(), envio);
+            pendientes.insert(id.clone(), Pendiente { envio, comando: comando.into() });
         }
-        self.estado.tareas.lock().unwrap().push_back(Tarea {
+        tomar(&self.estado.tareas).push_back(Tarea {
             id: id.clone(),
             comando: comando.into(),
             payload,
         });
         self.estado.hay_tarea.notify_all();
         let respuesta = recepcion.recv_timeout(plazo);
-        self.estado.pendientes.lock().unwrap().remove(&id);
+        tomar(&self.estado.pendientes).remove(&id);
+        if respuesta.is_err() {
+            // No liberar un fetch en vuelo hasta que Chrome lo confirme, para no exceder el tope real.
+            tomar(&self.estado.despacho).resultado(false);
+        }
+        self.estado.hay_tarea.notify_all();
         let datos = respuesta.map_err(|_| {
             "Chrome no respondió a tiempo o se cerró la conexión local. Los archivos ya verificados se conservan."
         })?;
@@ -381,10 +563,11 @@ impl Puente {
 
     pub fn cerrar(&self) {
         self.estado.cerrado.store(true, Ordering::SeqCst);
-        self.estado.pendientes.lock().unwrap().clear();
-        *self.estado.origen.lock().unwrap() = None;
+        tomar(&self.estado.pendientes).clear();
+        *tomar(&self.estado.origen) = None;
         self.estado.hay_tarea.notify_all();
-        self.servidor.unblock();
+        tomar(&self.estado.tareas).clear();
+        tomar(&self.estado.despacho).en_vuelo.clear();
     }
 }
 
@@ -424,6 +607,83 @@ mod tests {
         let (cabecera, cuerpo) = respuesta.split_once("\r\n\r\n").unwrap();
         let status = cabecera.split_whitespace().nth(1).unwrap().parse().unwrap();
         (status, serde_json::from_str(cuerpo).unwrap())
+    }
+
+    #[test]
+    fn chunked_valido_y_presupuesto_real() {
+        let puente = Puente::abrir().unwrap();
+        let mut socket = TcpStream::connect((Ipv4Addr::LOCALHOST, puente.puerto())).unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+        write!(socket, "POST /connect HTTP/1.1\r\nHost: localhost\r\nOrigin: chrome-extension://{}\r\nX-Sitfa-Code: {}\r\nTransfer-Encoding: chunked\r\n\r\n1\r\n{{\r\n1\r\n}}\r\n0\r\n\r\n", "a".repeat(32), puente.estado.codigo).unwrap();
+        let mut salida = String::new(); socket.read_to_string(&mut salida).unwrap();
+        assert!(salida.starts_with("HTTP/1.1 200"));
+        let h = HashMap::from([("transfer-encoding".to_string(), "chunked".to_string())]);
+        let mut b = std::io::Cursor::new(b"2\r\n{}\r\n0\r\nX-Test: valor\r\n\r\n");
+        assert_eq!(leer_cuerpo(&mut b, &h, 2).unwrap(), b"{}");
+        let mut exceso = std::io::Cursor::new(b"2\r\n{}\r\n1\r\nx\r\n0\r\n\r\n");
+        let e = leer_cuerpo(&mut exceso, &h, 2).unwrap_err();
+        assert_eq!(e, ErrorHttp::Grande);
+        assert_eq!(e.respuesta().0, 413);
+        assert_eq!(e.respuesta().1["error"], "PAYLOAD_TOO_LARGE");
+        assert!(e.respuesta().1["message"].as_str().unwrap().contains("presupuesto"));
+        let h = HashMap::from([("content-length".to_string(), (CONTROL_MAXIMO + 1).to_string())]);
+        assert_eq!(leer_cuerpo(&mut std::io::Cursor::new(b""), &h, CONTROL_MAXIMO), Err(ErrorHttp::Grande));
+        assert!(presupuesto("download") > presupuesto("catalog"));
+    }
+
+    #[test]
+    fn plazo_absoluto_y_mutex_envenenado() {
+        let servidor = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _cliente = TcpStream::connect(servidor.local_addr().unwrap()).unwrap();
+        let (socket, _) = servidor.accept().unwrap();
+        let mut r = BufReader::new(LecturaHttp { socket, limite: Instant::now() + Duration::from_millis(50) });
+        assert_eq!(cabeceras_http(&mut r).unwrap_err(), ErrorHttp::Tiempo);
+        let m = Arc::new(Mutex::new(7));
+        let copia = m.clone();
+        assert!(std::thread::spawn(move || { let _g = tomar(&copia); panic!("fallo sintético"); }).join().is_err());
+        assert_eq!(*tomar(&m), 7);
+    }
+
+    #[test]
+    fn despacho_tope_tres_y_degradacion() {
+        let mut d = Despacho { configurado: 99, ..Default::default() };
+        for i in 0..3 {
+            assert!(d.admite("diary_open"));
+            d.en_vuelo.insert(i.to_string(), true);
+        }
+        assert!(!d.admite("diary_open")); assert!(!d.admite("search"));
+        d.en_vuelo.clear(); d.resultado(false); assert_eq!(d.limite(), 3);
+        d.resultado(false); assert_eq!(d.limite(), 1);
+        d.en_vuelo.insert("sintetica".into(), true);
+        assert!(!d.admite("history_open"));
+        d.resultado(true); assert_eq!(d.limite(), 1);
+    }
+
+    #[test]
+    fn grupo_real_entrega_tres_y_reordena_respuestas() {
+        let p = Puente::abrir().unwrap();
+        let origen = format!("chrome-extension://{}", "a".repeat(32));
+        let vacio = json!({});
+        assert_eq!(pedir(&p, "POST", "/connect", &origen, &vacio).0, 200);
+        p.habilitar_lecturas(true);
+        p.configurar_concurrencia(3);
+        std::thread::scope(|scope| {
+            let lectura = scope.spawn(|| p.llamar("context_batch", json!({"command":"diary_open","payloads":[{"i":0},{"i":1},{"i":2}]}), Duration::from_secs(10)));
+            let mut tareas = Vec::new();
+            for _ in 0..3 {
+                let (status, t) = pedir(&p, "GET", "/next", &origen, &vacio);
+                assert_eq!(status, 200); assert_eq!(t["command"], "diary_open");
+                tareas.push(t);
+            }
+            assert_eq!(tomar(&p.estado.despacho).en_vuelo.len(), 3);
+            for t in tareas.into_iter().rev() {
+                let respuesta = json!({"id":t["id"],"ok":true,"result":t["payload"]});
+                assert_eq!(pedir(&p, "POST", "/complete", &origen, &respuesta).0, 200);
+            }
+            let v = lectura.join().unwrap().unwrap();
+            assert_eq!(v, json!([{"ok":true,"result":{"i":0}},{"ok":true,"result":{"i":1}},{"ok":true,"result":{"i":2}}]));
+            assert!(tomar(&p.estado.despacho).en_vuelo.is_empty());
+        });
     }
 
     #[test]

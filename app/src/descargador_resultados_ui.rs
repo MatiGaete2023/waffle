@@ -14,6 +14,7 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
 
 pub const SIN_LOTE: &str = "Selecciona la carpeta de un lote descargado o conjunto.";
 
@@ -66,6 +67,33 @@ pub struct Resultados {
     ofrecida: Option<PathBuf>,
     conjunta: bool,
     historial_cargado: bool,
+    indice: Option<IndiceResultados>,
+}
+
+struct IndiceResultados {
+    carpeta: PathBuf,
+    referencias: Vec<archivo_local::Referencia>,
+    tipo: Option<Tipo>,
+    flujo: Option<Arc<Value>>,
+    bitacoras: Vec<PathBuf>,
+    disponibles: BTreeSet<PathBuf>,
+}
+impl IndiceResultados {
+    fn cargar(carpeta: PathBuf, preferencias: &Preferencias, bitacoras: Vec<PathBuf>) -> Self {
+        let referencias = archivo_local::descubrir(Path::new(&preferencias.destino), preferencias, None);
+        let tipo = if carpeta.as_os_str().is_empty() { None } else { archivo_local::tipo(&carpeta).ok() };
+        let flujo = if tipo == Some(Tipo::Conjunto) {
+            use std::io::Read;
+            std::fs::File::open(carpeta.join("flujo.json")).ok().and_then(|f| {
+                let mut b = Vec::new();
+                f.take(4 * 1024 * 1024 + 1).read_to_end(&mut b).ok()?;
+                if b.len() > 4 * 1024 * 1024 { return None; }
+                serde_json::from_slice::<Value>(&b).ok().map(Arc::new)
+            })
+        } else { None };
+        let disponibles = bitacoras.iter().filter(|p| p.is_file()).cloned().collect();
+        Self { carpeta, referencias, tipo, flujo, bitacoras, disponibles }
+    }
 }
 
 fn ahora() -> chrono::DateTime<chrono::FixedOffset> {
@@ -216,6 +244,7 @@ impl Resultados {
     }
 
     pub fn cargar(&mut self, ctx: &egui::Context) {
+        self.indice = None;
         self.cargado = None;
         self.fase_activa = 0;
         if self.carpeta.trim().is_empty() {
@@ -255,6 +284,7 @@ impl Resultados {
     }
 
     fn anadir_carpeta_paquete(&mut self) {
+        self.indice = None;
         let Some(carpeta) = rfd::FileDialog::new().set_title("Carpeta de una descarga o conjunto").pick_folder() else { return };
         match archivo_local::tipo(&carpeta) {
             Ok(Tipo::Bitacoras) => self.estado = Some(Err("La carpeta es de bitácoras. Elige «Añadir bitácoras…» y selecciona bitacoras.json.".into())),
@@ -274,6 +304,7 @@ impl Resultados {
     }
 
     fn anadir_bitacoras_paquete(&mut self) {
+        self.indice = None;
         let paths = rfd::FileDialog::new().set_title("Selecciona controles bitacoras.json")
             .add_filter("Control bitacoras.json", &["json"]).pick_files();
         if let Some(paths) = paths {
@@ -320,6 +351,7 @@ impl Resultados {
         };
         self.ocupado = false;
         self.recepcion = None;
+        self.indice = None;
         match mensaje {
             Mensaje::Cargado(Ok(c)) => {
                 self.fase_activa = 0;
@@ -336,17 +368,29 @@ impl Resultados {
         }
     }
 
+    pub fn invalidar_indice(&mut self) { self.indice = None; }
+
+    fn actualizar_indice(&mut self, ruta_preferencias: &Path) {
+        let carpeta = self.ruta();
+        if self.indice.as_ref().is_some_and(|i| i.carpeta == carpeta && i.bitacoras == self.bitacoras_paquete) { return; }
+        let preferencias = Preferencias::cargar(ruta_preferencias);
+        if !self.historial_cargado {
+            // El historial permite seleccionar fuentes manualmente, pero nunca las añade a un lote nuevo.
+            self.historial_cargado = true;
+        }
+        self.indice = Some(IndiceResultados::cargar(carpeta, &preferencias, self.bitacoras_paquete.clone()));
+    }
+
     pub fn mostrar(&mut self, ui: &mut Ui, p: &Pal) {
         self.recibir();
         ui.add_space(8.0);
         theme::seccion(ui, p, "Resultados del lote");
         let ruta_preferencias = Preferencias::ruta();
-        let mut preferencias = Preferencias::cargar(&ruta_preferencias);
-        if !self.historial_cargado {
-            self.bitacoras_paquete = archivo_local::referencias_bitacoras(&preferencias, &[]);
-            self.historial_cargado = true;
-        }
-        let referencias = archivo_local::descubrir(Path::new(&preferencias.destino), &preferencias, None);
+        if ui.button("Actualizar").clicked() { self.indice = None; }
+        self.actualizar_indice(&ruta_preferencias);
+        let carpeta_indice = self.ruta();
+        let (referencias, tipo, flujo, disponibles) = self.indice.as_ref().map(|i|
+            (i.referencias.clone(), i.tipo, i.flujo.clone(), i.disponibles.clone())).unwrap_or_default();
         for referencia in referencias {
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!("{} · {} · {} · {}", referencia.tipo, referencia.estado, referencia.conteo, referencia.carpeta.display()));
@@ -361,6 +405,8 @@ impl Resultados {
                     }
                 }
                 if ui.button("Quitar del historial").clicked() {
+                    let mut preferencias = Preferencias::cargar(&ruta_preferencias);
+                    self.indice = None;
                     preferencias.historial_lotes.retain(|p| Path::new(p) != referencia.carpeta);
                     preferencias.historial_bitacoras.retain(|p| Path::new(p).parent() != Some(referencia.carpeta.as_path()));
                     if let Err(error) = preferencias.guardar(&ruta_preferencias) { self.estado = Some(Err(error)); }
@@ -384,7 +430,7 @@ impl Resultados {
             if self.parcial != antes && !self.carpeta.trim().is_empty() {
                 self.cargar(ui.ctx());
             }
-            if ui.add_enabled(!self.ocupado && archivo_local::tipo(&self.ruta()) == Ok(Tipo::Conjunto), egui::Button::new("Ver descarga conjunta")).clicked() {
+            if ui.add_enabled(!self.ocupado && carpeta_indice == self.ruta() && tipo == Some(Tipo::Conjunto), egui::Button::new("Ver descarga conjunta")).clicked() {
                 self.conjunta = true;
             }
         });
@@ -426,11 +472,12 @@ impl Resultados {
             });
             }
         }
+        if carpeta_indice != self.ruta() { self.conjunta = false; self.indice = None; }
         if self.conjunta {
             let carpeta = self.ruta();
             let mut abierta = self.conjunta;
             egui::Window::new("Resultados · descarga conjunta CSMP").open(&mut abierta).show(ui.ctx(), |ui| {
-                let datos = std::fs::read(carpeta.join("flujo.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+                let datos = flujo.clone();
                 if let Some(datos) = datos {
                     ui.label(datos["estado"].as_str().unwrap_or("DESCONOCIDO"));
                     ui.label(format!("{} completo · corte {} · informes del mes actual y siguiente", datos["seleccion"]["modo"].as_str().unwrap_or(""), datos["seleccion"]["corte"].as_str().unwrap_or("")));
@@ -530,13 +577,13 @@ impl Resultados {
         }
         for (i, diario) in self.bitacoras_paquete.clone().iter().enumerate() {
             ui.horizontal(|ui| {
-                ui.label(format!("{} · {}", if diario.is_file() { "Bitácoras" } else { "NO_DISPONIBLE" }, diario.display()));
+                ui.label(format!("{} · {}", if disponibles.contains(diario) { "Bitácoras" } else { "NO_DISPONIBLE" }, diario.display()));
                 if ui.push_id(("quitar_bitacora", diario), |ui| ui.add_enabled(!self.ocupado, egui::Button::new("Quitar"))).inner.clicked() {
                     self.bitacoras_paquete.remove(i);
                 }
             });
         }
-        let faltan = self.bitacoras_paquete.iter().any(|path| !path.is_file());
+        let faltan = self.bitacoras_paquete.iter().any(|path| !disponibles.contains(path));
         if ui.add_enabled(!self.ocupado && !self.carpetas_paquete.is_empty() && !faltan, egui::Button::new("Crear paquete" )).clicked() {
             if let Some(destino) = rfd::FileDialog::new().set_title("Guardar paquete del Asistente").set_file_name("Captura_CSMP.zip").save_file() {
                 self.crear_paquete(&ctx, destino);
@@ -853,4 +900,21 @@ mod pruebas {
         }
         let _ = std::fs::remove_dir_all(&f.base);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn indice_resultados_no_recarga_en_reposo() {
+    let (_candado, tmp) = crate::prueba_entorno::perfil_aislado();
+    let prefs = tmp.join("preferencias.json");
+    let diario = tmp.join("bitacoras.json");
+    let mut r = Resultados { historial_cargado: true, bitacoras_paquete: vec![diario.clone()], ..Default::default() };
+    r.actualizar_indice(&prefs);
+    assert!(!r.indice.as_ref().unwrap().disponibles.contains(&diario));
+    std::fs::write(&diario, b"{}").unwrap();
+    r.actualizar_indice(&prefs);
+    assert!(!r.indice.as_ref().unwrap().disponibles.contains(&diario));
+    r.indice = None;
+    r.actualizar_indice(&prefs);
+    assert!(r.indice.as_ref().unwrap().disponibles.contains(&diario));
 }

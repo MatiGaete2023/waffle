@@ -26,13 +26,18 @@ const LITE: [(&str, &[u8]); 10] = [
     archivo!("descargador_lite", "icons/icono128.png"),
 ];
 
+// La edición Integral propia se actualiza sin alterar la referencia Python congelada.
+macro_rules! integral {
+    ($ruta:literal) => { ($ruta, include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/descargador/extension_integral/", $ruta)).as_slice()) };
+}
+
 const INTEGRAL: [(&str, &[u8]); 6] = [
-    archivo!("descargador", "manifest.json"),
-    archivo!("descargador", "background.js"),
-    archivo!("descargador", "conexion.css"),
-    archivo!("descargador", "conexion.html"),
-    archivo!("descargador", "conexion.js"),
-    archivo!("descargador", "pagina.js"),
+    integral!("manifest.json"),
+    integral!("background.js"),
+    integral!("conexion.css"),
+    integral!("conexion.html"),
+    integral!("conexion.js"),
+    integral!("pagina.js"),
 ];
 
 pub fn archivos(edicion: Edicion) -> &'static [(&'static str, &'static [u8])] {
@@ -176,10 +181,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn integral_incluye_extension_propia_y_manifest_actualizado() {
+        let a = archivos(Edicion::Integral);
+        let m: serde_json::Value = serde_json::from_slice(a.iter().find(|(n, _)| *n == "manifest.json").unwrap().1).unwrap();
+        assert_eq!(m["version"], "2.10.0");
+        let js = std::str::from_utf8(a.iter().find(|(n, _)| *n == "pagina.js").unwrap().1).unwrap();
+        assert!(js.contains("flow_rust_rapido") && js.contains("diaryIndex"));
+        assert!(std::str::from_utf8(a.iter().find(|(n, _)| *n == "conexion.js").unwrap().1).unwrap().contains("Math.min(3"));
+    }
+
+    #[test]
     fn instala_las_dos_ediciones_con_sus_versiones_y_es_idempotente() {
         let base = carpeta_temporal();
         assert_eq!(version(Edicion::Lite), "1.1.0");
-        assert_eq!(version(Edicion::Integral), "2.9.0");
+        assert_eq!(version(Edicion::Integral), "2.10.0");
         let lite = instalar(Edicion::Lite, &base).unwrap();
         assert!(lite.ends_with("extension-lite"), "la carpeta es fija: no lleva la versión");
         assert!(lite.join("icons/icono128.png").is_file());
@@ -214,7 +229,7 @@ mod tests {
         std::fs::write(primera.carpeta.join("manifest.json"), manifest.to_string()).unwrap();
         let segunda = instalar_en_el_lugar(Edicion::Integral, &base).unwrap();
         assert_eq!(segunda.carpeta, primera.carpeta, "la carpeta no cambia");
-        assert_eq!(segunda.cambio, Cambio::Actualizada { de: "2.8.0".into(), a: "2.9.0".into() });
+        assert_eq!(segunda.cambio, Cambio::Actualizada { de: "2.8.0".into(), a: "2.10.0".into() });
         assert!(!segunda.carpeta.join("restos.js").exists());
         assert_eq!(instalar_en_el_lugar(Edicion::Integral, &base).unwrap().cambio, Cambio::SinCambios);
         let _ = std::fs::remove_dir_all(&base);
