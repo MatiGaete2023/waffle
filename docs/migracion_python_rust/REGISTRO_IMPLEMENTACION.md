@@ -16,6 +16,23 @@ Una entrada por encargo, de diez líneas como máximo, la más reciente arriba:
 
 No se copian salidas completas ni listas de mutaciones: la prueba afirma sus conteos y la CI del commit es la evidencia.
 
+## 2026-11-26 · E-P1-C2: puente HTTP chunked/acotado, extensión 2.10.0, Modo Rápido Seguro V-01..V-04 y display (Agente C · ChatGPT)
+- Cambió: `descargador/{puente.rs,extension.rs,preferencias.rs,bitacoras.rs,historia.rs,flujo_paquete.rs}`, nueva extensión propia `descargador/extension_integral/*` (2.10.0), `descargador_ui.rs`, `descargador_resultados_ui.rs`, `meta4_ui.rs` e informe `AGENTE_C_20261126_puente_rapido_display.md`.
+- Acredita: lector HTTP loopback con `chunked`, presupuestos diferenciados (256 KiB control / 112 MiB datos), timeouts y recuperación de `Mutex`; índice DOM por página (`V-01`), pipelining local (`V-02`), pausa adaptativa (`V-03`) y concurrencia acotada 1–3 con degradación (`V-04`), sin reutilización entre lotes del día; Descargador en 3 pasos + Dos Calendarios + índice de Resultados en memoria; suite Linux y 6 verificadores PASA.
+- Diferencias declaradas (orquestador): `downloader.version` emite `"2.10.0"` (extensión propia de Flow Rust; comparadores de `paquete.rs` y `descargador_ui.rs` validan `"2.10.0"` y normalizan contra el oráculo congelado Python 2.9.0); `reutilizar_de_otro_lote` se reemplaza por prueba que exige lecturas frescas.
+- Pendiente: CI Windows y perfilado/validación con Chrome y SITFA reales (no `ACEPTADO`).
+
+## 2026-11-26 · E-P1-B2: cuotas XML/ZIP, rutas canónicas, lectura única de historias y flow-meta4 (Agente B · ChatGPT)
+- Cambió: `descargador/{xls.rs,paquete.rs,resultados.rs,flujo_csmp.rs}`, `descargador.rs`, `lectura.rs`, `rust/crates/flow-meta4/{src,tests}/plantilla.rs`, `tools/inventario_escrituras.py` e informe `AGENTE_B_20261126_cuotas_lectores.md`.
+- Acredita: cuotas XML/ZIP con `Read::take(max+1)` real, `ss:Index <= 16_384`, profundidad XML ≤ 128 y dimensiones OOXML; validación canónica anti-traversal y carga única de historias en `paquete.rs`; consolidado en memoria en `resultados.rs`; presentación en `flujo_csmp.rs`; fix de underflow `count="01"` y cuota ZIP en `flow-meta4` (32/32 pruebas); suite Linux y 6 verificadores PASA.
+- Ajuste del orquestador: comparte los validadores puros XML/ZIP desde `descargador::xls` (`pub mod xls`) para compilar tanto `--lib` como `--bin` sin duplicación y pasar `clippy --lib -D warnings`.
+- Pendiente: CI Windows (no `ACEPTADO`).
+
+## 2026-11-26 · E-P1-A2: estabilidad UI BackgroundJob, on_exit, WCAG AA, rediseños y COM seguro (Agente A · ChatGPT)
+- Cambió: `main.rs`, `ui.rs`, `theme.rs`, `outlook.rs`, `copia_excel.rs`, `preparados.rs`, `productos.rs`, `autodiagnostico.rs`, `util.rs`, `tools/inventario_escrituras.py` e informe `AGENTE_A_20261126_ui_worker_display.md`.
+- Acredita: `BackgroundJob<T>` para COM/Word/Anonimizador/Actualizaciones, `on_exit()` + guardado al cambiar vista, `.id_source` único por registro, error inline en `Corte`, 1× `copia_excel::base`, timeout + limpieza RCW en scripts COM (`Save()` y CC fijo intactos), paleta WCAG AA ≥ 4,5:1 verificada en prueba, Trabajo con 4 pestañas + teclado + `Ctrl+F`, Ajustes en sub-pestañas, `ScrollArea` en Resultados, `preparados.rs` con `gestiones_correo`/`resolucion`, sanitización XML 1.0/Windows y estados por componente en autodiagnóstico; suite Linux y 6 verificadores PASA.
+- Pendiente: CI Windows, pruebas Office COM reales y revisión visual 1100×680 / 1440×900 (no `ACEPTADO`).
+
 ## 2026-11-26 · E-P1-A1: integridad de decisiones, Word por fila, conciliación y correos (Agente A · ChatGPT)
 - Cambió: `sincronizar.rs`, `copia_excel.rs`, `producto_excel.rs`, `productos.rs`, `conciliar.rs`, `estadisticas.rs`, `ordenes.rs`, `config.rs`, `outlook.rs`, `preparados.rs`, `ui.rs` e informe `AGENTE_A_20261126_integridad_decisiones.md`.
 - Acredita: unificación canónica `NURUS_DECISIONES` (límite 32.000 UTF-16, proyección preservada), precedencia Word por fila + protección de ciclos `.rels`, conciliación de `resolucion`/`excluido`, estadísticas con propuestas aprobadas, `null` en OB, procedencia de `Para`, migración Python por fuente, CC exacto y sanitización MIME; `SYNC: 38/38`, suite Linux completa verde y 6 verificadores PASA.

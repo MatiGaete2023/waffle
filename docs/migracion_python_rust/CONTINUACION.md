@@ -4,20 +4,18 @@ Para continuar la coordinación como **Orquestador (Antigravity)** con tres agen
 
 ## Resumen
 
-**Hechos (26-nov, tras integración de Tanda 1 en Linux)**
+**Hechos (26-nov, tras integración de Tandas 1 y 2 en Linux)**
 
-- **Tanda 1 integrada en `estudio/paridad-python-rust-20261119`** (pendiente CI Windows para pasar a `HECHO`; nada marcado `ACEPTADO`):
-  - **E-P0-C1** (Agente C · ChatGPT): rango único de captura en todas las acciones, «Todas las fechas» explícito, pausa/alcance/versión persistidos en `proceso.json` y `bitacoras.rs`, pareja ZIP + diagnóstico hermano, separación período de observaciones vs alcance acreditado en Meta 4, corrección de `Quitar` y `leer()` en Resultados.
-  - **E-P0-B1** (Agente B · ChatGPT): manifiesto `FlowRustOwnership/1` y desinstalación sin borrado recursivo, `Instalar_Flow.cmd` con `"%~dp0."` y `-RequireSha256`, `actualizacion.rs` con SHA-256 obligatorio + publicación atómica y rollback, `flow-anonimo` v1.0/1.1/1.2 + cuota real ZIP (40/40 pruebas; ajuste del orquestador en `texto.rs` para no registrar `STATE_WORDS` como nombres).
-  - **E-P1-A1** (Agente A · ChatGPT): codificador canónico único `NURUS_DECISIONES` (32.000 UTF-16, proyección preservada), selección Word por fila + protección de ciclos `.rels`, conciliación de `resolucion`/`excluido`, estadísticas con propuestas aprobadas, `null` en OB, procedencia `Para`, migración Python por fuente, CC exacto y sanitización MIME (`SYNC: 38/38`; 3 ajustes menores del orquestador al compilar y contrastar oráculos).
-  - **Orquestador (CI):** `.github/workflows/flow-rust-local.yml` ahora incluye `rust/**`, `descargador_lite/**` en `paths:` y copia `installer/LEEME.txt` en `app/target/entrega`.
+- **Tanda 1 integrada en `estudio/paridad-python-rust-20261119`** (`E-P0-C1`, `E-P0-B1`, `E-P1-A1` + workflow CI actualizado con `rust/**`, `descargador_lite/**` e `installer/LEEME.txt`).
+- **Tanda 2 integrada en `estudio/paridad-python-rust-20261119`** (pendiente CI Windows para pasar a `HECHO`; nada marcado `ACEPTADO`):
+  - **E-P1-A2** (Agente A · ChatGPT): `BackgroundJob<T>`, `on_exit()`, `.id_source` único, error inline en `Corte`, 1× `copia_excel::base`, timeout + limpieza RCW en COM, paleta WCAG AA ≥ 4,5:1, rediseño Asistente (navegación 3 etapas, 4 pestañas Trabajo, sub-pestañas Ajustes, `ScrollArea` Resultados, banner seguridad/procedencia `Para`), `preparados.rs`, sanitización XML 1.0/Windows y estados en autodiagnóstico.
+  - **E-P1-B2** (Agente B · ChatGPT): cuotas XML/ZIP reales (`Read::take`, `ss:Index <= 16_384`, profundidad ≤ 128, dimensiones OOXML compartidos desde `descargador::xls`), validación canónica anti-traversal y carga única de historias en `paquete.rs`, consolidado en memoria en `resultados.rs`, presentación en `flujo_csmp.rs` y fix `count="01"` + cuota ZIP en `flow-meta4` (32/32 pruebas).
+  - **E-P1-C2** (Agente C · ChatGPT): puente HTTP `chunked`/acotado (256 KiB control / 112 MiB datos, timeouts, recuperación de `Mutex`), extensión propia `descargador/extension_integral/` (`2.10.0`, sin tocar `descargador/` congelado), «Modo Rápido Seguro» `V-01`..`V-04` (índice DOM, pipelining, pausa adaptativa, concurrencia acotada 1–3 con degradación, **sin caché entre lotes del día**) y display Descargador 3 pasos + Dos Calendarios + índice de Resultados cacheado.
 - **Fuera del proyecto por decisión del usuario:** manuales, registrador de observaciones RUS, extractores de estructura, variables Word por fila, exclusión manual de una fila, paginación del Word manual, M6, M7, formatos antiguos de Meta 4, firma Authenticode del instalador y **caché entre lotes del día** en el Descargador.
 
-**Siguiente tanda planificada (Tanda 2, tras CI Windows verde de Tanda 1)**
+**Siguiente paso (cierre Windows + prueba real)**
 
-- **Agente A:** `P1-09` (`BackgroundJob<T>` para COM/Word/Anonimizador/Actualizaciones, `on_exit()`, `.id_source` único, error inline en `Corte`, 1× `copia_excel::base`) + `P2` Display Asistente (contraste WCAG AA en `theme.rs`, Trabajo con pestañas/teclado/`.scroll_to_row()`, Ajustes con sub-pestañas).
-- **Agente B:** `P1-08` (lectores/cuotas `lectura.rs`, `xls.rs`, `flow-meta4/plantilla.rs`, validación canónica en `cargar_historias`) + endurecimiento de migración de instalaciones legadas sin manifiesto si se solicita.
-- **Agente C:** `P1-08` (`puente.rs` presupuestos coherentes, `chunked`, timeout y recuperación de mutex) + `P2` Descargador/Meta 4 (`Dos Calendarios`, stepper, `ScrollArea` Resultados, caché de índice) + `V-01`..`V-04` («Modo Rápido Seguro» medido, sin caché entre lotes del día).
+- Publicar `estudio/paridad-python-rust-20261119` en GitHub desde el bundle del usuario, verificar CI Linux + Windows verde (y lanzar `workflow_dispatch` con `entrega=true`), cerrar Tandas 1 y 2 como `HECHO` citando el run y ejecutar la prueba real en Windows (Chrome con extensión `2.10.0`, SITFA, Outlook COM, Excel COM, Meta 4 y criterio de salida mensual).
 
 ## Reparto vigente (decisión del usuario del 26-nov; revertible)
 

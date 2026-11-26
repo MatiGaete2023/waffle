@@ -2439,9 +2439,16 @@ mod tests {
                         std::fs::create_dir_all(&salida).unwrap();
                         std::fs::copy(&destino, salida.join(format!("{nombre}.zip"))).unwrap();
                     }
-                    let obtenido = contenido(&destino);
+                    let mut obtenido = contenido(&destino);
                     let esperado: BTreeMap<String, Value> =
                         e["paquete"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    if let (Some(m_obt), Some(m_esp)) = (obtenido.get_mut("manifest.json"), esperado.get("manifest.json")) {
+                        // Diferencia declarada de metadato: la extensión Integral propia de Flow Rust es 2.10.0 frente al oráculo Python 2.9.0.
+                        let esperada_ext = crate::descargador::extension::version(crate::descargador::Edicion::Integral);
+                        if m_obt["downloader"]["version"] == esperada_ext {
+                            m_obt["downloader"]["version"] = m_esp["downloader"]["version"].clone();
+                        }
+                    }
                     for clave in obtenido.keys().chain(esperado.keys()).collect::<BTreeSet<_>>() {
                         if obtenido.get(clave) != esperado.get(clave) {
                             diferencias.push(format!("{clave}:\n    Rust   {:?}\n    Python {:?}", obtenido.get(clave), esperado.get(clave)));

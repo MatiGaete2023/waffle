@@ -1,18 +1,18 @@
 # Estado de Flow Rust
 
-Actualizado: 26 de noviembre de 2026, tras la integración en Linux de la **Tanda 1** del plan consolidado: **E-P0-C1** (Agente C · ChatGPT: rango único de captura, pausa en reanudación, diagnóstico hermano y Meta 4), **E-P0-B1** (Agente B · ChatGPT: entrega Windows con manifiesto, SHA-256 obligatorio y anonimizador v1.2.0) y **E-P1-A1** (Agente A · ChatGPT: integridad de `NURUS_DECISIONES`, Word por fila sin ciclos, conciliación/estadísticas/OB y seguridad de correos), más actualización del workflow CI (`rust/**`, `descargador_lite/**`, `installer/LEEME.txt`). Es la única fuente del estado: se edita en el mismo commit que cierra cada encargo.
+Actualizado: 26 de noviembre de 2026, tras la integración completa en Linux de las **Tandas 1 y 2** del plan definitivo consolidado: **Tanda 1** (`E-P0-C1`, `E-P0-B1`, `E-P1-A1`) y **Tanda 2** (**E-P1-A2** Agente A: `BackgroundJob`, `on_exit`, WCAG AA, rediseños Asistente y timeout/RCW COM; **E-P1-B2** Agente B: cuotas XML/ZIP `Read::take`, rutas canónicas, lectura única de historias y `flow-meta4` sin underflow; **E-P1-C2** Agente C: puente HTTP `chunked`/acotado, extensión propia Integral `2.10.0`, «Modo Rápido Seguro» `V-01`..`V-04` sin caché entre lotes del día y display Descargador/Meta 4). Es la única fuente del estado: se edita en el mismo commit que cierra cada encargo.
 
 - Aplicación: `app/` (`flow_rust.exe`). Referencia funcional: rama `flow-python`.
 - Rama única: `estudio/paridad-python-rust-20261119`.
 - Estados: **Sí** (existe y tiene contraste con Python), **Parcial** (falta lo que se indica), **No** (ausente). Ninguno significa «aceptado»: eso solo lo declara el usuario en un acta.
-- Origen: registro y encargos hasta el 26 de noviembre. Tanda 1 validada en Linux (`tools/probar_app.sh todo`, `flow-anonimo`, `clippy --lib` y los 6 verificadores estáticos); pasa a `HECHO` solo cuando la CI de Windows de la rama principal termine en verde.
+- Origen: registro y encargos hasta el 26 de noviembre. Tandas 1 y 2 validadas en Linux (`tools/probar_app.sh todo`, `flow-anonimo` 40/40, `flow-meta4` 32/32, `clippy --lib -D warnings` y los 6 verificadores estáticos); pasan a `HECHO` solo cuando la CI de Windows de la rama principal termine en verde.
 
 ## Siguiente paso
 
-1. **Coordinación (orquestador Antigravity + 3 agentes ChatGPT en paralelo, modo ZIP + `.patch`):** **Tanda 1 integrada en `estudio/paridad-python-rust-20261119`** (`E-P0-C1`, `E-P0-B1`, `E-P1-A1`, pendientes de CI Windows). Siguiente: **Tanda 2** (`P1-08` puente/lectores/cuotas + `P1-09` `BackgroundJob`/estabilidad UI + `P2` rediseño visual WCAG AA y `V-01`..`V-04` aceleración segura del Descargador **sin caché entre lotes del día**). Cada agente entrega un parche unificado + informe firmado en `informes/AGENTE_<letra>_<fecha>_<tema>.md`; el orquestador aplica, compila, corrige si corresponde, valida e integra.
-2. **Validación Windows y entrega nueva:** al publicar esta rama en GitHub, verificar en verde `linux` y `validar` (incluyendo `verify_flow_rust_installer.ps1`, `flow-anonimo` v1.2.0 y los 23 oráculos) y lanzar `workflow_dispatch` con `entrega=true` para probar el `.exe` actualizado con los 3 bloques de Tanda 1.
-3. **E-U2** (correcciones de la primera prueba con el `.exe`) está `HECHO` con CI verde (run 45648680625); falta que el usuario lo confirme con el `.exe` nuevo.
-4. Decisiones ya tomadas por el usuario (13 respuestas del 25-nov, actualización sin reinstalar y plan consolidado del 26-nov sin caché entre lotes del día): ver «Decisiones del usuario vigentes» de [PLAN.md](PLAN.md). Descartados: M6, M7, formatos antiguos de Meta 4, conteo del Anonimizador, paginación del Word manual y caché entre lotes del día.
+1. **Publicar y validar CI de Windows (`entrega=true`):** subir `estudio/paridad-python-rust-20261119` a GitHub (desde el bundle local del usuario), confirmar `linux` y `validar` en verde (incluyendo `verify_flow_rust_installer.ps1`, `flow-anonimo` 40/40, `flow-meta4` 32/32 y los 23 oráculos) y lanzar `workflow_dispatch` con `entrega=true` para generar el `.exe` + instalador + capturas de Tandas 1 y 2.
+2. **Prueba operativa real del usuario (cierre de brechas Windows/SITFA/Office):** recargar la extensión Integral `2.10.0` en Chrome (carpeta fija `%LOCALAPPDATA%\FlowRust\extension-integral`), repetir el rango `01/11/2026`–`26/11/2026` en modo tradicional y luego medir «Modo Rápido Seguro» (`V-01`..`V-04`), probar Outlook COM (2 cuentas, firma, CC fijo), Excel preservado COM y Meta 4 con alcance acreditado.
+3. **Criterio de salida mensual (Acta):** comparar la extracción `01/11/2026`–`26/11/2026` en Flow Python vs Flow Rust antes de firmar el acta de aceptación.
+4. Decisiones vigentes del usuario: ver «Decisiones del usuario vigentes» de [PLAN.md](PLAN.md). Descartados: M6, M7, formatos antiguos de Meta 4, conteo del Anonimizador, paginación del Word manual y caché entre lotes del día.
 
 ## Pendiente del usuario
 
