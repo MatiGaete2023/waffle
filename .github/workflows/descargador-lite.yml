@@ -1,0 +1,63 @@
+name: Descargador SITFA Lite · Windows
+
+on:
+  push:
+    branches: [descargador-lite]
+    paths: [app/**, descargador_lite/**, tools/**, .github/workflows/descargador-lite.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+      - name: Probar Descargador SITFA Lite
+        run: cargo test --manifest-path app/Cargo.toml --locked --bin descargador_lite
+      - name: Verificadores estáticos
+        run: |
+          python3 tools/check_real_ids.py app/src
+          python3 tools/check_contactos.py app/src
+          python3 tools/inventario_escrituras.py
+          python3 tools/verificar_solo_lectura.py --autoprueba
+          python3 tools/verificar_solo_lectura.py
+          python3 tools/verificar_referencia_python.py
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+      - name: Probar Descargador SITFA Lite
+        run: cargo test --manifest-path app/Cargo.toml --locked --bin descargador_lite
+      - name: Compilar descargador_lite.exe (--release)
+        shell: pwsh
+        run: |
+          cargo build --manifest-path app/Cargo.toml --locked --release --bin descargador_lite
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $salida = New-Item -ItemType Directory -Force -Path app/target/entrega-lite
+          Copy-Item app/target/release/descargador_lite.exe $salida
+          $huella = (Get-FileHash -LiteralPath (Join-Path $salida 'descargador_lite.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$huella  descargador_lite.exe`ncommit $env:GITHUB_SHA" | Set-Content -Encoding utf8 (Join-Path $salida 'SHA256.txt')
+          Get-Content (Join-Path $salida 'SHA256.txt')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Descargador_SITFA_Lite_Windows_exe
+          path: app/target/entrega-lite/
+          if-no-files-found: error
+          retention-days: 14
