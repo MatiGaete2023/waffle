@@ -75,12 +75,104 @@ def test_rt27_regla_valida_con_dato_faltante_de_otra(tmp_path):
     assert any('días de cumplimiento ausentes o inválidos' in aviso for aviso in fila.warnings)
 
 
-def test_rt28_tribunal_no_soportado_sin_textos_inventados(tmp_path):
+def test_rt28_tribunal_externo_usa_perfil_tome_y_ausente_o_ambiguo_revision_manual(tmp_path):
     encabezados = ['RIT', 'TRIBUNAL', 'NOMBRE', 'RUT', 'NOMBRE CENTRO', 'T ESPERA']
-    fila = analizar(tmp_path, 'ESPERA', encabezados, [persona(1, tribunal='TRIBUNAL FICTICIO') + [90]]).rows[0]
-    assert fila.rules == [] and fila.observation == '' and fila.actions == []
-    assert any('Tribunal fuera de Laja, Mulchén y Tomé' in aviso for aviso in fila.warnings)
-    assert fila.values['TRIBUNAL'] == 'TRIBUNAL FICTICIO'
+    cfg = defaults()
+    cfg['umbrales']['espera_tome'] = 50
+    cfg['umbrales']['proyecto_tome'] = 80
+    # Otro tribunal válido en Espera (umbrales 50 y 80): 49 -> E-06, 50 -> E05 solo correo, 80 -> E05 proyecto+correo; DCE solo correo.
+    filas = analizar(
+        tmp_path,
+        'ESPERA',
+        encabezados,
+        [
+            persona(1, tribunal='Juzgado de Familia de Coronel') + [49],
+            persona(2, tribunal='Juzgado de Familia de Coronel') + [50],
+            persona(3, tribunal='Juzgado de Familia de Coronel') + [80],
+            persona(4, tribunal='Juzgado de Familia de Coronel', programa='DCE UNO') + [80],
+        ],
+        configuracion=cfg,
+    ).rows
+    assert filas[0].rules == ['ESPERA.E06_SIN_RESOLUCION'] and filas[0].actions == []
+    assert filas[1].rules == ['ESPERA.E05_SOLO_CORREO'] and filas[1].actions == ['programa_espera']
+    assert filas[2].rules == ['ESPERA.E05_PROYECTO_Y_CORREO'] and filas[2].actions == ['programa_espera', 'PC_IE']
+    assert filas[3].rules == ['ESPERA.E05_SOLO_CORREO'] and filas[3].actions == ['programa_espera']
+    assert all(f.values['TRIBUNAL'] == 'Juzgado de Familia de Coronel' for f in filas)
+
+    # Vacío, marcadores de ausencia y rótulos compuestos/ambiguos quedan en revisión manual sin observación ni acciones.
+    invalidos = ['', '---', 'N/A', 'S/I', 'SIN INFORMACIÓN', 'Ninguno', 'Laja / Mulchén', 'Laja y Tomé', 'Coronel / Talcahuano']
+    filas_inv = analizar(
+        tmp_path,
+        'ESPERA',
+        encabezados,
+        [persona(n, tribunal=t) + [90] for n, t in enumerate(invalidos, 10)],
+        configuracion=cfg,
+    ).rows
+    for fila in filas_inv:
+        assert fila.rules == [] and fila.observation == '' and fila.actions == []
+        assert any('Tribunal sin identificar o ambiguo' in aviso for aviso in fila.warnings), fila.values['TRIBUNAL']
+
+    # Cumplimiento e Informes en otro tribunal válido + contradicción de días negativos con egreso futuro y vencimiento faltante.
+    enc_cump = [
+        'RIT', 'TRIBUNAL', 'NOMBRE', 'RUT', 'NOMBRE CENTRO',
+        'DIAS DE CUMPLIMIENTO', 'DIAS PARA EGRESAR', 'FEC. INGRESO EFECTIVO', 'FEC. EGRESO PROYECTADO',
+    ]
+    cump = analizar(
+        tmp_path,
+        'CUMPLIMIENTO',
+        enc_cump,
+        [
+            persona(20, tribunal='Juzgado de Familia de Coronel') + [100, 10, '2026-01-01', '2026-10-19'],
+            persona(21, tribunal='Juzgado de Familia de Coronel') + [-5, 10, '2026-01-01', '2026-10-19'],
+            persona(22, tribunal='SIN INFORMACIÓN') + [-5, 10, '2026-01-01', '2026-10-19'],
+        ],
+    ).rows
+    assert cump[0].rules == ['CUMPLIMIENTO.C05_POR_VENCER'] and cump[0].actions == ['medidas']
+    assert any('Días negativos y egreso futuro' in a for a in cump[1].warnings)
+    assert 'CUMPLIMIENTO.C04_VENCIDA' not in cump[1].rules
+    assert cump[2].observation == '' and cump[2].actions == []
+    assert any('Días negativos y egreso futuro' in a for a in cump[2].warnings)
+    assert any('Tribunal sin identificar o ambiguo' in a for a in cump[2].warnings)
+
+    inf = analizar(
+        tmp_path,
+        'INFORMES',
+        BASE,
+        [
+            persona(30, tribunal='Juzgado de Familia de Coronel') + ['2026-10-08'],
+            persona(31, tribunal='Juzgado de Familia de Coronel') + [''],
+        ],
+    ).rows
+    assert inf[0].rules == ['INFORMES.I01_VENCIDO_GENERAL'] and inf[0].actions == ['programa_vencido', 'PC_INFO']
+    assert inf[1].rules == [] and inf[1].observation == '' and any('sin fecha de vencimiento' in a for a in inf[1].warnings)
+
+    # Dos tribunales con igual RIT, persona y programa conservan su identidad (no disparan R6 ni cruzan correos).
+    dos_trib = analizar(
+        tmp_path,
+        'ESPERA',
+        encabezados,
+        [
+            ['X-77-2026', 'Juzgado de Familia de Coronel', 'UNO EJEMPLO', '11111111-1', 'PRM UNO', 80],
+            ['X-77-2026', 'Juzgado de Familia de Talcahuano', 'UNO EJEMPLO', '11111111-1', 'PRM UNO', 80],
+        ],
+        configuracion=cfg,
+    )
+    assert all(not any(m[1] == 'DUPLICIDAD' for m in r.avisos) for r in dos_trib.rows)
+    borradores = prepare_drafts(dos_trib, 'programa_espera', directory=tmp_path / 'salida_externos')
+    assert len(borradores) == 2
+    assert {b.court for b in borradores} == {'Juzgado de Familia de Coronel', 'Juzgado de Familia de Talcahuano'}
+
+    # Recálculo desde record_edits.apply(): corregir tribunal ausente activa perfil Tomé sin pisar texto humano.
+    corr = analizar(tmp_path, 'ESPERA', encabezados, [persona(40, tribunal='SIN INFORMACIÓN') + [80]], configuracion=cfg)
+    assert corr.rows[0].observation == '' and corr.rows[0].actions == []
+    apply(corr, [corr.rows[0].id], review={'OBSERVACION': 'Nota humana previa'})
+    apply(corr, [corr.rows[0].id], overrides={'tribunal': 'Juzgado de Familia de Coronel'})
+    assert corr.rows[0].rules == ['ESPERA.E05_PROYECTO_Y_CORREO']
+    assert corr.rows[0].actions == ['programa_espera', 'PC_IE']
+    assert corr.rows[0].review['OBSERVACION'] == 'Nota humana previa'
+    apply(corr, [corr.rows[0].id], overrides={'tribunal': 'Laja / Mulchén'})
+    assert corr.rows[0].observation == '' and corr.rows[0].actions == []
+    assert any('Tribunal sin identificar o ambiguo' in a for a in corr.rows[0].warnings)
 
 
 ESPERA = ['RIT', 'TRIBUNAL', 'NOMBRE', 'RUT', 'NOMBRE CENTRO', 'T ESPERA', 'CURADOR']

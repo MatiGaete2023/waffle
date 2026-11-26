@@ -35,7 +35,8 @@ Todo lo que sigue se leyó en el código; lo estimado se marca **(estimado)**.
 | ficha_antigua | 180 | C-07 ficha individual antigua: más de |
 | ficha_reciente | 30 | C-07 ficha reciente: hasta |
 | ficha_fae | 120 | C-08: ingreso hace más de, sin ficha FAE |
-| Tribunal no reconocido | 30 | `reglas_espera.py` umbral por defecto (sin observación: el tribunal fuera de Laja/Mulchén/Tomé no se evalúa, `work.py::analyze`) |
+| Otros tribunales válidos (Espera) | perfil Tomé | `espera_tome` / `proyecto_tome` configurables; DCE conserva solo correo (`motor/utilidades.py::perfil_tribunal`) |
+| Tribunal vacío, marcador o ambiguo | revisión manual | Sin observación ni acciones automáticas; aviso específico (`work.py::analyze`, `motor.rs`) |
 | Margen DCE | 10 | `reglas_informes.py::MARGEN_DCE` |
 | Ventana correo preventivo C-10 | 60 | `work.py::VENTANA_POR_VENCER_DIAS` |
 | Mayoría de edad | 18 años; 29-feb → 28-feb | `motor/utilidades.py::fecha_mayoria` |
@@ -43,8 +44,8 @@ Todo lo que sigue se leyó en el código; lo estimado se marca **(estimado)**.
 | prorroga_reciente | 90 | config.py: solo reglas de historia (no incluidas en esta versión) |
 | ventana_busqueda | 60 | config.py: solo reglas de historia (no incluidas en esta versión) |
 
-## Tribunal — `src/nurus/rus/util.py::tribunal`
-Texto normalizado contiene MULCHEN → MULCHEN; LAJA → LAJA; TOME → TOME; si no, sin reglas (aviso).
+## Tribunal — `src/nurus/personal/motor/utilidades.py::perfil_tribunal`
+Laja, Mulchén y Tomé inequívocos usan su perfil; cualquier otro tribunal válido usa el perfil Tomé (conservando su tribunal de origen para identidad, cruces, destinatarios y matrices). Vacíos, marcadores de ausencia (ej. `SIN INFORMACIÓN`, `N/A`, `---`) y rótulos compuestos/ambiguos (ej. `Laja / Mulchén`) quedan en revisión manual sin observación ni acciones.
 
 ## Composición — `motor/composicion.py::componer`, `motor/textos.py`
 - Prefijo `PrimerNombre XXX: ` (primer nombre sin paréntesis, en Title Case; XXX = 3 primeros caracteres del
@@ -65,8 +66,8 @@ Texto normalizado contiene MULCHEN → MULCHEN; LAJA → LAJA; TOME → TOME; si
 3. Mayoría en 1..60 días → PROXIMA_MAYORIA.
 4. FEC. RESOLUCIÓN hace 0..29 días → E04_RESOLUCION_RECIENTE (principal).
 5. T ESPERA ausente/negativo → incidencia.
-6. Umbral: DCE → espera_dce; Laja/Mulchén/Tomé → espera_<tribunal>. Si T ESPERA ≥ umbral: DCE → E05_SOLO_CORREO;
-   Laja/Mulchén → E05_PROYECTO_Y_CORREO; Tomé → PROYECTO_Y_CORREO si ≥ proyecto_tome, si no SOLO_CORREO.
+6. Umbral: DCE → espera_dce; Laja/Mulchén/Tomé → espera_<tribunal>; otros tribunales válidos → perfil Tomé. Si T ESPERA ≥ umbral: DCE → E05_SOLO_CORREO;
+   Laja/Mulchén → E05_PROYECTO_Y_CORREO; perfil Tomé → PROYECTO_Y_CORREO si ≥ proyecto_tome, si no SOLO_CORREO.
 7. Sin principal → E06_SIN_RESOLUCION.
 8. Complementarias: OIDO (0..45 días), audiencias futuras (una: PROX_AUDIENCIA; varias: PROX_AUDIENCIAS),
    curador (columna presente sin RUT ni "Institución:" → CURADOR; ≥2 instituciones → T5_INSTITUCIONES).

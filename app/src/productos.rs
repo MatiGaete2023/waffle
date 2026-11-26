@@ -338,7 +338,7 @@ pub fn preparar_borradores(w: &Trabajo, cfg: &Config, o: &OpcionesCorreo) -> Vec
             por_trib.entry(w.tribunal_clave(r)).or_default().push(*i);
         }
         for (trib, ids) in por_trib {
-            if crate::util::tribunal(&trib).is_none() {
+            if crate::util::perfil_tribunal(&trib).is_none() {
                 continue;
             }
             let trib_nombre = cfg.tribunal_nombre(&trib, &trib);
@@ -947,6 +947,11 @@ fn docx_desde_plantilla(paquete: &[u8], p: &Proyecto) -> Result<Vec<u8>, String>
         salida.write_all(&datos).map_err(|e| e.to_string())?;
     }
     Ok(salida.finish().map_err(|e| e.to_string())?.into_inner())
+}
+
+/// Indica si existe una matriz Word configurada (propia o empaquetada) para el tribunal y tipo dados.
+pub fn tiene_matriz(tribunal_clave: &str, tipo: &str) -> bool {
+    paquete_plantilla(tribunal_clave, tipo).is_some()
 }
 
 /// Párrafos del proyecto ya completados, desde la misma plantilla que usará el Word.
@@ -2794,5 +2799,53 @@ mod cotejo_correos {
         let b = gestion["borradores"].as_array_mut().unwrap().iter_mut().find(|b| b["tipo"] == "programa_espera").unwrap();
         b["rits"] = serde_json::json!(["X-1-2026", "X-2-2026"]);
         assert!(!comparar(&datos, &gestion).is_empty(), "una gestión de correo esperada alterada no se detecta");
+    }
+
+    #[test]
+    fn tribunal_externo_conserva_identidad_en_proyectos_y_borradores() {
+        let mut cfg = Config::default();
+        cfg.umbrales.insert("espera_tome".into(), 50);
+        cfg.umbrales.insert("proyecto_tome".into(), 80);
+        let corte = NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
+        let mut libro = rust_xlsxwriter::Workbook::new();
+        let hoja = libro.add_worksheet();
+        let _ = hoja.set_name("Espera");
+        for (c, h) in ["RIT", "TRIBUNAL", "NOMBRE", "RUT", "NOMBRE CENTRO", "T ESPERA"].iter().enumerate() {
+            hoja.write_string(0, c as u16, *h).unwrap();
+        }
+        let filas = [
+            ["X-77-2099", "Juzgado de Familia de Coronel", "Uno Ejemplo", "11111111-1", "PRM Sin Contacto"],
+            ["X-77-2099", "Juzgado de Familia de Talcahuano", "Uno Ejemplo", "11111111-1", "PRM Sin Contacto"],
+        ];
+        for (r, vals) in filas.iter().enumerate() {
+            for (c, v) in vals.iter().enumerate() {
+                hoja.write_string(r as u32 + 1, c as u16, *v).unwrap();
+            }
+            hoja.write_number(r as u32 + 1, 5, 80.0).unwrap();
+        }
+        let mut w = Trabajo::abrir(PathBuf::from("externos.xlsx"), libro.save_to_buffer().unwrap(), Some(Mode::Espera), corte, &cfg).unwrap();
+        assert_eq!(w.registros[0].acciones, vec!["programa_espera", "PC_IE"]);
+        assert_eq!(w.registros[1].acciones, vec!["programa_espera", "PC_IE"]);
+        // Agrupación de proyectos Word por tribunal de origen (sin mezclar con Tomé ni entre sí).
+        let proyectos = preparar_proyectos(&w, &cfg, false);
+        assert_eq!(proyectos.len(), 2);
+        let claves: std::collections::BTreeSet<&str> = proyectos.iter().map(|p| p.tribunal_clave.as_str()).collect();
+        assert_eq!(claves, std::collections::BTreeSet::from(["JUZGADO DE FAMILIA DE CORONEL", "JUZGADO DE FAMILIA DE TALCAHUANO"]));
+        assert!(!tiene_matriz("JUZGADO DE FAMILIA DE CORONEL", "PC_IE"));
+        // Borradores separados por tribunal de origen; sin destinatario conservan la propuesta para revisión.
+        let o = OpcionesCorreo { modalidades: &["RES", "AMB", "FAE", "DCE"], tribunales: &[], solo_seleccionadas: false };
+        let borradores = preparar_borradores(&w, &cfg, &o);
+        let espera: Vec<_> = borradores.iter().filter(|b| b.kind == "programa_espera").collect();
+        assert_eq!(espera.len(), 2);
+        assert!(espera.iter().all(|b| b.para.trim().is_empty()));
+        assert_ne!(espera[0].tribunal, espera[1].tribunal);
+        // Recálculo con anulación de tribunal conserva texto humano y recalcula propuestas.
+        w.registros[0].editada = Some("Nota humana".into());
+        let mut anulaciones = std::collections::BTreeMap::new();
+        anulaciones.insert("tribunal".into(), "SIN INFORMACIÓN".into());
+        w.aplicar_anulaciones(0, anulaciones, &cfg).unwrap();
+        assert_eq!(w.registros[0].editada.as_deref(), Some("Nota humana"));
+        assert!(w.registros[0].propuesta.is_empty() && w.registros[0].acciones.is_empty());
+        assert!(w.registros[0].avisos.iter().any(|a| a.contains("Tribunal sin identificar o ambiguo")));
     }
 }

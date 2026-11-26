@@ -395,18 +395,94 @@ pub fn contiene_token(texto: &str, tokens: &[&str]) -> bool {
     tokens.iter().any(|t| palabras.contains(&normalizar(t).as_str()))
 }
 
-/// Tribunal reconocido (Laja, Mulchén o Tomé).
-pub fn tribunal(txt: &str) -> Option<&'static str> {
-    let t = normalizar(txt).to_uppercase();
-    if t.contains("MULCHEN") {
-        Some("MULCHEN")
-    } else if t.contains("LAJA") {
-        Some("LAJA")
-    } else if t.contains("TOME") {
-        Some("TOME")
-    } else {
-        None
+const MARCADORES_AUSENCIA_TRIBUNAL: &[&str] = &[
+    "nan", "nat", "none", "null", "na", "n a", "s i", "s d", "s n", "sd", "sn",
+    "sin dato", "sin datos", "sin informacion", "sin tribunal", "sin asignar",
+    "sin especificar", "sin registro", "no informado", "no aplica", "no indica",
+    "no especificado", "no identificado", "no disponible", "no registra",
+    "ninguno", "ninguna", "desconocido", "desconocida", "indeterminado",
+    "pendiente", "por definir", "por confirmar", "otro", "otros", "varios",
+    "multiple", "todos", "total",
+];
+
+fn es_compuesto_ambiguo(bruto: &str) -> bool {
+    if !bruto.contains(['/', '|', ';']) {
+        return false;
     }
+    bruto
+        .split(['/', '|', ';'])
+        .filter(|p| normalizar(p).bytes().any(|b| b.is_ascii_alphabetic()))
+        .count()
+        >= 2
+}
+
+fn normalizar_tribunal(bruto: &str) -> String {
+    let sin_acentos: String = bruto
+        .nfkd()
+        .filter(|c| c.is_ascii())
+        .map(|c| {
+            let b = c.to_ascii_lowercase();
+            if matches!(b, '-' | '(' | ')' | '.' | '_' | ',' | ':' | '/' | '\\' | '|' | ';') {
+                ' '
+            } else {
+                b
+            }
+        })
+        .collect();
+    sin_acentos.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Tribunal reconocido inequívocamente (Laja, Mulchén o Tomé).
+pub fn tribunal(txt: &str) -> Option<&'static str> {
+    let bruto = txt.trim();
+    if bruto.is_empty() || es_compuesto_ambiguo(bruto) {
+        return None;
+    }
+    let norm = normalizar_tribunal(bruto);
+    let palabras: Vec<&str> = norm
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut conocido: Option<&'static str> = None;
+    for (tok, nombre) in [("mulchen", "MULCHEN"), ("laja", "LAJA"), ("tome", "TOME")] {
+        if palabras.contains(&tok) {
+            if conocido.is_some() {
+                return None;
+            }
+            conocido = Some(nombre);
+        }
+    }
+    conocido
+}
+
+/// Perfil de reglas del tribunal (`LAJA`, `MULCHEN` o `TOME`), idéntico a `motor/utilidades.py::perfil_tribunal`.
+/// Otros tribunales válidos usan el perfil `TOME`; vacíos, marcadores de ausencia y rótulos ambiguos devuelven `None`.
+pub fn perfil_tribunal(txt: &str) -> Option<&'static str> {
+    let bruto = txt.trim();
+    if bruto.is_empty() || es_compuesto_ambiguo(bruto) {
+        return None;
+    }
+    let norm = normalizar_tribunal(bruto);
+    if norm.bytes().filter(|b| b.is_ascii_alphabetic()).count() < 3 {
+        return None;
+    }
+    if MARCADORES_AUSENCIA_TRIBUNAL.contains(&norm.as_str()) {
+        return None;
+    }
+    let palabras: Vec<&str> = norm
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut conocido: Option<&'static str> = None;
+    for (tok, nombre) in [("mulchen", "MULCHEN"), ("laja", "LAJA"), ("tome", "TOME")] {
+        if palabras.contains(&tok) {
+            if conocido.is_some() {
+                return None;
+            }
+            conocido = Some(nombre);
+        }
+    }
+    Some(conocido.unwrap_or("TOME"))
 }
 
 /// Clave de identidad para cruces: sin paréntesis, minúscula, espacios únicos.

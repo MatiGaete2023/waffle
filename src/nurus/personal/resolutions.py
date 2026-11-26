@@ -547,7 +547,9 @@ def prepare_projects(work, selections, template_dir, fallback_kind='PC_IE'):
     for row in work.rows:
         if row.excluded:
             continue
-        if tribunal(value(work, row, 'tribunal')) is None:
+        from .motor.utilidades import perfil_tribunal
+
+        if perfil_tribunal(value(work, row, 'tribunal')) is None:
             continue
         court = tribunal(value(work, row, 'tribunal')) or value(work, row, 'tribunal')
         rit = value(work, row, 'rit').strip()
@@ -560,7 +562,9 @@ def prepare_projects(work, selections, template_dir, fallback_kind='PC_IE'):
         row = by_id[rid]
         if row.excluded:
             continue
-        if tribunal(value(work, row, 'tribunal')) is None:
+        from .motor.utilidades import perfil_tribunal
+
+        if perfil_tribunal(value(work, row, 'tribunal')) is None:
             continue
         court = tribunal(value(work, row, 'tribunal')) or value(work, row, 'tribunal')
         rit = value(work, row, 'rit').strip()

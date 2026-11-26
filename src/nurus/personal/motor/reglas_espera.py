@@ -5,7 +5,7 @@ from .contexto import datetime as Clock, current
 from .composicion import componer, prefijo, fecha_valida, Incidencias
 from .utilidades import (fecha_es, limpiar_nombre, es_dce, es_derivacion_sin_seg,
     tiene_curador_real, get_int, calcular_edad_exacta, dias_para_mayoria, fecha_mayoria,
-    titulo_programa, fechas_varias, lista_fechas_es)
+    titulo_programa, fechas_varias, lista_fechas_es, perfil_tribunal)
 from .textos import render, con_grupo
 from . import reglas_historia as H
 
@@ -142,14 +142,15 @@ def generar_observacion_espera(row, tribunal, cols, incidencias=None, fila_excel
         incidencias.agregar(fila_excel, _rit(row, cols), 'E-05/E-06',
                             'tiempo de espera ausente o inválido (G-05)')
     # Los días de espera no se escriben en la observación (decisión del usuario, 11-nov-2026): solo deciden la gestión.
+    perfil = tribunal if tribunal in ('LAJA', 'MULCHEN', 'TOME') else (perfil_tribunal(tribunal) or '')
     threshold = (parametro('espera_dce') if es_dce(programa) else
-                 parametro('espera_' + tribunal.lower()) if tribunal in ('LAJA','MULCHEN','TOME') else 30)
+                 parametro('espera_' + perfil.lower()) if perfil in ('LAJA','MULCHEN','TOME') else 30)
     if espera is not None and espera >= threshold and not proyeccion:
         if es_dce(programa):
             frags.append(render('ESPERA','E05_SOLO_CORREO')); principal=True
-        elif tribunal in ('LAJA','MULCHEN'):
+        elif perfil in ('LAJA','MULCHEN'):
             frags.append(render('ESPERA','E05_PROYECTO_Y_CORREO')); principal=True
-        elif tribunal == 'TOME':
+        elif perfil == 'TOME':
             frags.append(render('ESPERA','E05_PROYECTO_Y_CORREO' if espera >= parametro('proyecto_tome') else 'E05_SOLO_CORREO')); principal=True
         else:
             incidencias.agregar(fila_excel, _rit(row, cols), 'E-05', 'tribunal no reconocido — regla omitida (G-06)')

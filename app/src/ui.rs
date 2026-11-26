@@ -2644,6 +2644,13 @@ impl App {
                             if !faltan.is_empty() {
                                 ui.label(RichText::new(format!("Falta: {}", faltan.join(", "))).size(11.5).color(p.amber));
                             }
+                            if !crate::productos::tiene_matriz(&pr.tribunal_clave, &pr.tipo) {
+                                ui.label(
+                                    RichText::new("Sin matriz Word configurada para este tribunal (importa la matriz en Ajustes o revisa el formato genérico).")
+                                        .size(11.5)
+                                        .color(p.amber),
+                                );
+                            }
                         }));
                         if r.response.clicked() {
                             self.psel = Some(j);

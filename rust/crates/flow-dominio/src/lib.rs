@@ -65,17 +65,92 @@ impl Tribunal {
             Tribunal::Tome => "Tomé",
         }
     }
-    /// Reconoce el tribunal dentro del texto de la celda (igual que `rus/util.py::tribunal`).
+    /// Reconoce el tribunal inequívoco dentro del texto de la celda (igual que `rus/util.py::tribunal`).
     pub fn desde(texto: &str) -> Option<Self> {
-        let t = texto::normalizar_columna(texto).to_uppercase();
-        if t.contains("MULCHEN") {
-            Some(Tribunal::Mulchen)
-        } else if t.contains("LAJA") {
-            Some(Tribunal::Laja)
-        } else if t.contains("TOME") {
-            Some(Tribunal::Tome)
-        } else {
-            None
+        let bruto = texto.trim();
+        if bruto.is_empty() || es_compuesto_ambiguo(bruto) {
+            return None;
         }
+        let norm = normalizar_tribunal(bruto);
+        let palabras: Vec<&str> = norm
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut conocido = None;
+        for (tok, trib) in [("mulchen", Tribunal::Mulchen), ("laja", Tribunal::Laja), ("tome", Tribunal::Tome)] {
+            if palabras.contains(&tok) {
+                if conocido.is_some() {
+                    return None;
+                }
+                conocido = Some(trib);
+            }
+        }
+        conocido
     }
+
+    /// Resuelve el perfil de reglas (`Laja`, `Mulchen` o `Tome`), idéntico a `motor/utilidades.py::perfil_tribunal`.
+    /// Cualquier otro tribunal válido usa el perfil `Tome`; vacíos, marcadores de ausencia y rótulos ambiguos devuelven `None`.
+    pub fn perfil(texto: &str) -> Option<Self> {
+        let bruto = texto.trim();
+        if bruto.is_empty() || es_compuesto_ambiguo(bruto) {
+            return None;
+        }
+        let norm = normalizar_tribunal(bruto);
+        if norm.bytes().filter(|b| b.is_ascii_alphabetic()).count() < 3 {
+            return None;
+        }
+        if MARCADORES_AUSENCIA_TRIBUNAL.contains(&norm.as_str()) {
+            return None;
+        }
+        let palabras: Vec<&str> = norm
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut conocido = None;
+        for (tok, trib) in [("mulchen", Tribunal::Mulchen), ("laja", Tribunal::Laja), ("tome", Tribunal::Tome)] {
+            if palabras.contains(&tok) {
+                if conocido.is_some() {
+                    return None;
+                }
+                conocido = Some(trib);
+            }
+        }
+        Some(conocido.unwrap_or(Tribunal::Tome))
+    }
+}
+
+const MARCADORES_AUSENCIA_TRIBUNAL: &[&str] = &[
+    "nan", "nat", "none", "null", "na", "n a", "s i", "s d", "s n", "sd", "sn",
+    "sin dato", "sin datos", "sin informacion", "sin tribunal", "sin asignar",
+    "sin especificar", "sin registro", "no informado", "no aplica", "no indica",
+    "no especificado", "no identificado", "no disponible", "no registra",
+    "ninguno", "ninguna", "desconocido", "desconocida", "indeterminado",
+    "pendiente", "por definir", "por confirmar", "otro", "otros", "varios",
+    "multiple", "todos", "total",
+];
+
+fn es_compuesto_ambiguo(bruto: &str) -> bool {
+    if !bruto.contains(['/', '|', ';']) {
+        return false;
+    }
+    bruto
+        .split(['/', '|', ';'])
+        .filter(|p| texto::normalizar(p).bytes().any(|b| b.is_ascii_alphabetic()))
+        .count()
+        >= 2
+}
+
+fn normalizar_tribunal(bruto: &str) -> String {
+    let norm = texto::normalizar(bruto);
+    let limpio: String = norm
+        .chars()
+        .map(|c| {
+            if matches!(c, '-' | '(' | ')' | '.' | '_' | ',' | ':' | '/' | '\\' | '|' | ';') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    limpio.split_whitespace().collect::<Vec<_>>().join(" ")
 }

@@ -316,9 +316,10 @@ def esperado(caso):
             if end and end > corte and any(n is not None and n < 0 for n in counts):
                 avisos.append('Días negativos y egreso futuro: verifica la contradicción; no se afirma que la medida esté vencida.')
                 ctx['invalid'].append('CUMPLIMIENTO.C04_VENCIDA')
-        court = tribunal(values.get('tribunal', '')) or ''
+        from nurus.personal.motor.utilidades import perfil_tribunal
+        court = perfil_tribunal(values.get('tribunal', '')) or ''
         if not court:
-            avisos.append('Tribunal fuera de Laja, Mulchén y Tomé: sin reglas configuradas; requiere revisión manual.')
+            avisos.append('Tribunal sin identificar o ambiguo: sin reglas configuradas; requiere revisión manual.')
         args = {'incidencias': inc, 'fila_excel': 1}
         if etapa == 'CUMPLIMIENTO':
             args['fecha_hoja2'] = hoja2
