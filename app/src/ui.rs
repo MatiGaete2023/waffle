@@ -904,6 +904,18 @@ impl App {
                 self.descargador.ejemplo();
                 self.vista = Vista::Descargador;
             }
+            "descargador-lite-alcance" => {
+                self.descargador.ejemplo_lite(0);
+                self.vista = Vista::Descargador;
+            }
+            "descargador-lite-ejecucion" => {
+                self.descargador.ejemplo_lite(1);
+                self.vista = Vista::Descargador;
+            }
+            "descargador-lite-resultados" => {
+                self.descargador.ejemplo_lite(2);
+                self.vista = Vista::Descargador;
+            }
             "meta4" => self.vista = Vista::Meta4,
             "ajustes" => self.vista = Vista::Ajustes,
             "oscuro" => self.cfg.tema_oscuro = true,

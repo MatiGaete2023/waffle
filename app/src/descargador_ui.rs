@@ -1861,6 +1861,17 @@ impl Descargador {
         }
     }
 
+    pub fn ejemplo_lite(&mut self, tab_idx: usize) {
+        self.edicion = Edicion::Lite;
+        self.ejemplo();
+        self.tab = match tab_idx {
+            1 => TabDescargador::Ejecucion,
+            2 => TabDescargador::Resultados,
+            _ => TabDescargador::Alcance,
+        };
+        self.resultados.solo_originales = true;
+    }
+
     pub fn ejemplo(&mut self) {
         self.catalogo = serde_json::from_value(serde_json::json!({
             "pantalla": "seguimiento",
