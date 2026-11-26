@@ -1,19 +1,18 @@
 # Estado de Flow Rust
 
-Actualizado: 26 de noviembre de 2026, tras la integración de E-Q11 (Agente B · ChatGPT Terra) y, el 25-nov, de los Agentes B (E-R3) y C (E-Q8, paquetes parciales), E-A10, E-U2, E-I2, E-A9, E-A8, E-A7, E-A6, E-X1, E-X2, E-R1 y E-R2, E-S1 (con su vista), E-V1 a E-V3, E-Q7 el producto de Trabajo sin consolidado (E-W1) E-A1, E-U1, E-A2, E-A3, E-A4, E-T1, E-T2, E-T3 y E-A5. Es la única fuente del estado: se edita en el mismo commit que cierra cada encargo.
+Actualizado: 26 de noviembre de 2026, tras la integración en Linux de la **Tanda 1** del plan consolidado: **E-P0-C1** (Agente C · ChatGPT: rango único de captura, pausa en reanudación, diagnóstico hermano y Meta 4), **E-P0-B1** (Agente B · ChatGPT: entrega Windows con manifiesto, SHA-256 obligatorio y anonimizador v1.2.0) y **E-P1-A1** (Agente A · ChatGPT: integridad de `NURUS_DECISIONES`, Word por fila sin ciclos, conciliación/estadísticas/OB y seguridad de correos), más actualización del workflow CI (`rust/**`, `descargador_lite/**`, `installer/LEEME.txt`). Es la única fuente del estado: se edita en el mismo commit que cierra cada encargo.
 
 - Aplicación: `app/` (`flow_rust.exe`). Referencia funcional: rama `flow-python`.
 - Rama única: `estudio/paridad-python-rust-20261119`.
 - Estados: **Sí** (existe y tiene contraste con Python), **Parcial** (falta lo que se indica), **No** (ausente). Ninguno significa «aceptado»: eso solo lo declara el usuario en un acta.
-- Origen: registro y encargos hasta el 24 de noviembre. En esta fecha solo se repitió la suite en Linux (`tools/probar_app.sh todo`: 61 y 43 pruebas, 0 fallos).
+- Origen: registro y encargos hasta el 26 de noviembre. Tanda 1 validada en Linux (`tools/probar_app.sh todo`, `flow-anonimo`, `clippy --lib` y los 6 verificadores estáticos); pasa a `HECHO` solo cuando la CI de Windows de la rama principal termine en verde.
 
 ## Siguiente paso
 
-1. **Coordinación (orquestador):** tres agentes trabajan en paralelo en ramas propias: **A** (E-A10 y E-P1 `HECHO`; siguiente E-I1, en la rama principal), **B** (Meta 4: E-R3 `HECHO` e integrado; sin encargo nuevo) **B** (E-R3 `HECHO`; ahora E-Q9, rama `estudio/agente-b-flujo-20261125`) y **C** (E-Q8 `HECHO`; ahora E-S2, rama `estudio/agente-c-conjuntos-20261125`). Cada uno entrega un informe en `informes/AGENTE_<letra>_<fecha>.md`; el orquestador lo revisa, lo integra a la rama principal y valida de nuevo. Reparto, procedimiento y prompt en [CONTINUACION.md](CONTINUACION.md).
-2. **E-U2** (correcciones de la primera prueba con el `.exe`) está `HECHO` con CI verde (run 45648680625); falta que el usuario lo confirme con el `.exe` nuevo.
-3. Orden de trabajo del Asistente (agente A): **E-A10 `HECHO`** (CI Windows verde con todos los oráculos regenerados, run 45665516823) y **E-P1 `HECHO`** (run 45665516823; entrega de A en el run 45663684583) ( anulaciones de columnas de origen por fila con recálculo de pares y sincronización; 13 casos en `anulaciones.json` y 31 en `sync.json`); siguiente **E-P1** (Word por tribunal con índice y salto de página) y después **E-I1** (instalador; necesita la decisión de firma y alojamiento).
-4. **E-I2 cerrado** (run 45644045890, commit `5f21612`): el artefacto `Flow_Rust_Windows_exe` de ese run (13,4 MB) es el primer `.exe` con actualizador; la primera vez se reemplaza a mano.
-4. Decisiones ya tomadas por el usuario (13 respuestas del 25-nov y la de actualización sin reinstalar): ver «Decisiones del usuario vigentes» de [PLAN.md](PLAN.md). Descartados: M6, M7, formatos antiguos de Meta 4, conteo del Anonimizador y paginación del Word manual.
+1. **Coordinación (orquestador Antigravity + 3 agentes ChatGPT en paralelo, modo ZIP + `.patch`):** **Tanda 1 integrada en `estudio/paridad-python-rust-20261119`** (`E-P0-C1`, `E-P0-B1`, `E-P1-A1`, pendientes de CI Windows). Siguiente: **Tanda 2** (`P1-08` puente/lectores/cuotas + `P1-09` `BackgroundJob`/estabilidad UI + `P2` rediseño visual WCAG AA y `V-01`..`V-04` aceleración segura del Descargador **sin caché entre lotes del día**). Cada agente entrega un parche unificado + informe firmado en `informes/AGENTE_<letra>_<fecha>_<tema>.md`; el orquestador aplica, compila, corrige si corresponde, valida e integra.
+2. **Validación Windows y entrega nueva:** al publicar esta rama en GitHub, verificar en verde `linux` y `validar` (incluyendo `verify_flow_rust_installer.ps1`, `flow-anonimo` v1.2.0 y los 23 oráculos) y lanzar `workflow_dispatch` con `entrega=true` para probar el `.exe` actualizado con los 3 bloques de Tanda 1.
+3. **E-U2** (correcciones de la primera prueba con el `.exe`) está `HECHO` con CI verde (run 45648680625); falta que el usuario lo confirme con el `.exe` nuevo.
+4. Decisiones ya tomadas por el usuario (13 respuestas del 25-nov, actualización sin reinstalar y plan consolidado del 26-nov sin caché entre lotes del día): ver «Decisiones del usuario vigentes» de [PLAN.md](PLAN.md). Descartados: M6, M7, formatos antiguos de Meta 4, conteo del Anonimizador, paginación del Word manual y caché entre lotes del día.
 
 ## Pendiente del usuario
 

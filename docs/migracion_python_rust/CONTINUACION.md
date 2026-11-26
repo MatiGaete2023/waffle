@@ -1,34 +1,33 @@
 # Continuación · relevo del orquestador (26 de noviembre de 2026)
 
-Para abrir un chat nuevo como **orquestador**, con dos agentes: **A · Antigravity** y **C · ChatGPT**. La fuente del estado es [ESTADO.md](ESTADO.md); este archivo resume el proyecto, el reparto, el procedimiento, las lecciones y el prompt de arranque.
+Para continuar la coordinación como **Orquestador (Antigravity)** con tres agentes ChatGPT en paralelo (**A**, **B**, **C**) en modo ZIP + `.patch`. La fuente del estado es [ESTADO.md](ESTADO.md); este archivo resume el proyecto, el reparto, el procedimiento y las lecciones.
 
 ## Resumen
 
-**Hechos (26-nov, 02:15 UTC)**
+**Hechos (26-nov, tras integración de Tanda 1 en Linux)**
 
-- Avance funcional ~88 %: 28 capacidades, 21 en «Sí» y 7 en «Parcial» (F02, F08, F10, F11, F13, F23, F24). Aceptado 0 %: el acta la da el usuario.
-- `HECHO` el 25-nov: E-A10, E-P1, E-P2, E-I1, E-I3, E-A11 y E-T6 (A); E-R3, E-Q9 y E-Q10 (B); E-Q8, E-S2 y E-S3 (C).
-- **E-Q11** (descarga conjunta CSMP y «Retomar pendientes», B · ChatGPT Terra) integrado en `55cba7c` (documentos en `6181828` y `279df9a`). Queda `HECHO` cuando el run de la rama principal 45740546126 (commit `6181828`) termine en verde y su paso «Regenerar los oráculos» muestre `flujo_csmp: 8 casos` y «Oráculos regenerados sin diferencias.». En Linux, el oráculo es idéntico (SHA `ca3fd849…`).
-- Última corrida de entrega: 45708908715 (`60fe600`), verde. Su artefacto `Flow_Rust_Windows_exe` (vence el 9-dic) **no** trae E-A11, E-T6 ni E-Q11. Hay que lanzar una entrega nueva (`workflow_dispatch` con `entrega=true`).
-- Fuera del proyecto por decisión del usuario: manuales, registrador de observaciones RUS, extractores de estructura, variables Word por fila, exclusión manual de una fila, paginación del Word manual, M6, M7, formatos antiguos de Meta 4 y firma Authenticode del instalador. Las actualizaciones llegan por OneDrive institucional (E-I3).
+- **Tanda 1 integrada en `estudio/paridad-python-rust-20261119`** (pendiente CI Windows para pasar a `HECHO`; nada marcado `ACEPTADO`):
+  - **E-P0-C1** (Agente C · ChatGPT): rango único de captura en todas las acciones, «Todas las fechas» explícito, pausa/alcance/versión persistidos en `proceso.json` y `bitacoras.rs`, pareja ZIP + diagnóstico hermano, separación período de observaciones vs alcance acreditado en Meta 4, corrección de `Quitar` y `leer()` en Resultados.
+  - **E-P0-B1** (Agente B · ChatGPT): manifiesto `FlowRustOwnership/1` y desinstalación sin borrado recursivo, `Instalar_Flow.cmd` con `"%~dp0."` y `-RequireSha256`, `actualizacion.rs` con SHA-256 obligatorio + publicación atómica y rollback, `flow-anonimo` v1.0/1.1/1.2 + cuota real ZIP (40/40 pruebas; ajuste del orquestador en `texto.rs` para no registrar `STATE_WORDS` como nombres).
+  - **E-P1-A1** (Agente A · ChatGPT): codificador canónico único `NURUS_DECISIONES` (32.000 UTF-16, proyección preservada), selección Word por fila + protección de ciclos `.rels`, conciliación de `resolucion`/`excluido`, estadísticas con propuestas aprobadas, `null` en OB, procedencia `Para`, migración Python por fuente, CC exacto y sanitización MIME (`SYNC: 38/38`; 3 ajustes menores del orquestador al compilar y contrastar oráculos).
+  - **Orquestador (CI):** `.github/workflows/flow-rust-local.yml` ahora incluye `rust/**`, `descargador_lite/**` en `paths:` y copia `installer/LEEME.txt` en `app/target/entrega`.
+- **Fuera del proyecto por decisión del usuario:** manuales, registrador de observaciones RUS, extractores de estructura, variables Word por fila, exclusión manual de una fila, paginación del Word manual, M6, M7, formatos antiguos de Meta 4, firma Authenticode del instalador y **caché entre lotes del día** en el Descargador.
 
-**Inferencias (N2)**
+**Siguiente tanda planificada (Tanda 2, tras CI Windows verde de Tanda 1)**
 
-- Casi todo lo que sigue en «Parcial» depende de pruebas del usuario con el `.exe`: Outlook real (F13), Chrome y SITFA reales (F17, F19), plantilla real de Meta 4 (F23 y F24). En F02 no hay en Python una conducta multifila distinta de la ya cotejada. Los próximos encargos saldrán de lo que falle en la prueba corta, más que del plan.
-- B queda sin ejecutor. Sus archivos (`flujo_paquete.rs`, `flujo_csmp.rs`, `meta4.rs` y sus generadores) pasan a C.
+- **Agente A:** `P1-09` (`BackgroundJob<T>` para COM/Word/Anonimizador/Actualizaciones, `on_exit()`, `.id_source` único, error inline en `Corte`, 1× `copia_excel::base`) + `P2` Display Asistente (contraste WCAG AA en `theme.rs`, Trabajo con pestañas/teclado/`.scroll_to_row()`, Ajustes con sub-pestañas).
+- **Agente B:** `P1-08` (lectores/cuotas `lectura.rs`, `xls.rs`, `flow-meta4/plantilla.rs`, validación canónica en `cargar_historias`) + endurecimiento de migración de instalaciones legadas sin manifiesto si se solicita.
+- **Agente C:** `P1-08` (`puente.rs` presupuestos coherentes, `chunked`, timeout y recuperación de mutex) + `P2` Descargador/Meta 4 (`Dos Calendarios`, stepper, `ScrollArea` Resultados, caché de índice) + `V-01`..`V-04` («Modo Rápido Seguro» medido, sin caché entre lotes del día).
 
-**Especulación (N3):** que el acta de un mes real (~25-dic) no obligue a reabrir encargos ya `HECHO`.
+## Reparto vigente (decisión del usuario del 26-nov; revertible)
 
-## Reparto (decisión del usuario del 26-nov; revertible)
+| Agente · ejecutor | Rama | Territorio |
+|---|---|---|
+| A · ChatGPT | `estudio/agente-a-<tema>-<fecha>` | Asistente: `sincronizar.rs`, `trabajo.rs`, `copia_excel.rs`, `producto_excel.rs`, `productos.rs`, `conciliar.rs`, `estadisticas.rs`, `ordenes.rs`, `config.rs`, `outlook.rs`, `preparados.rs`, `theme.rs`, `ui.rs` |
+| B · ChatGPT | `estudio/agente-b-<tema>-<fecha>` | Entrega, seguridad y herramientas auxiliares: `installer/`, `tools/verify_flow_rust_installer.ps1`, `app/tests/instalador.rs`, `actualizacion.rs`, `anon.rs`, `rust/crates/flow-anonimo/`, `rust/crates/flow-meta4/`, `lectura.rs` |
+| C · ChatGPT | `estudio/agente-c-<tema>-<fecha>` | Descargador y Meta 4 UI: `descargador/`, `descargador_ui.rs`, `descargador_resultados_ui.rs`, `meta4_ui.rs` |
 
-| Agente · ejecutor | Rama | Encargo | Archivos propios |
-|---|---|---|---|
-| A · Antigravity | `estudio/agente-a-<tema>-<fecha>` (hasta ahora trabajaba en la principal; desde aquí, rama propia) | Sin encargo | Asistente: `sincronizar.rs`, `trabajo.rs`, `productos.rs`, `outlook.rs`, `actualizacion.rs`, `installer/`, `ui.rs` en sus secciones, y sus generadores y oráculos |
-| C · ChatGPT (GPT-5.6 Terra) | `estudio/agente-c-<tema>-<fecha>` | Sin encargo | Descargador: `descargador/`, `descargador_ui.rs`, `descargador_resultados_ui.rs`, `meta4_ui.rs`, y sus generadores y oráculos (incluye lo que era de B) |
-
-- Ni DeepSeek ni Gemini tienen papel. Los informes y commits anteriores conservan su firma (B · DeepSeek, B · ChatGPT Terra, C · ChatGPT Luna).
-- **El orquestador va en una sesión aparte de los agentes.** Si es ChatGPT, nunca en la misma conversación ni en el mismo clon que C. No implementa encargos de A ni de C.
-- Cada agente entrega `informes/AGENTE_<letra>_<fecha>.md` con firma y no edita `ESTADO`, `PLAN`, `REGISTRO`, `AGENTS`, `CONTINUACION` ni el workflow. La única excepción es la línea de su oráculo en el workflow, si el prompt la autoriza.
+- **El Orquestador (Antigravity)** compila, prueba (`tools/probar_app.sh todo`, `flow-anonimo`, `clippy --lib`, 6 verificadores), resuelve ajustes de compilación/oráculos, integra con `merge --no-ff` y es el único que edita `ESTADO.md`, `PLAN.md`, `REGISTRO_IMPLEMENTACION.md`, `AGENTS.md`, `CONTINUACION.md` y `.github/workflows/**`.
 
 ## Capacidades de cada ejecutor (observadas el 25 y 26-nov)
 

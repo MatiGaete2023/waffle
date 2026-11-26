@@ -4,7 +4,7 @@ on:
   push:
     # Las ramas de agentes en paralelo (`estudio/agente-*`) también validan; el coordinador las integra a la rama principal.
     branches: [estudio/paridad-python-rust-20261119, 'estudio/agente-**']
-    paths: [app/**, installer/**, tools/**, descargador/**, src/**, tests/**, .github/workflows/flow-rust-local.yml]
+    paths: [app/**, rust/**, installer/**, tools/**, descargador/**, descargador_lite/**, src/**, tests/**, .github/workflows/flow-rust-local.yml]
   workflow_dispatch:
     inputs:
       entrega:
@@ -143,7 +143,7 @@ jobs:
       - name: Preparar instalador por usuario (E-I1)
         shell: pwsh
         run: |
-          Copy-Item installer/Instalar_Flow.cmd, installer/Instalar_Flow.ps1, installer/Desinstalar_Flow.ps1 -Destination app/target/entrega -Force
+          Copy-Item installer/Instalar_Flow.cmd, installer/Instalar_Flow.ps1, installer/Desinstalar_Flow.ps1, installer/LEEME.txt -Destination app/target/entrega -Force
           $innoInstaller = ''
           if ('${{ inputs.entrega }}' -eq 'true') {
             $compiler = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName

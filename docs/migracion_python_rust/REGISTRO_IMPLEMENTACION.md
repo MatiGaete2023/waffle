@@ -16,6 +16,24 @@ Una entrada por encargo, de diez líneas como máximo, la más reciente arriba:
 
 No se copian salidas completas ni listas de mutaciones: la prueba afirma sus conteos y la CI del commit es la evidencia.
 
+## 2026-11-26 · E-P1-A1: integridad de decisiones, Word por fila, conciliación y correos (Agente A · ChatGPT)
+- Cambió: `sincronizar.rs`, `copia_excel.rs`, `producto_excel.rs`, `productos.rs`, `conciliar.rs`, `estadisticas.rs`, `ordenes.rs`, `config.rs`, `outlook.rs`, `preparados.rs`, `ui.rs` e informe `AGENTE_A_20261126_integridad_decisiones.md`.
+- Acredita: unificación canónica `NURUS_DECISIONES` (límite 32.000 UTF-16, proyección preservada), precedencia Word por fila + protección de ciclos `.rels`, conciliación de `resolucion`/`excluido`, estadísticas con propuestas aprobadas, `null` en OB, procedencia de `Para`, migración Python por fuente, CC exacto y sanitización MIME; `SYNC: 38/38`, suite Linux completa verde y 6 verificadores PASA.
+- Ajustes del orquestador: dereferencia `**k != "res"` (`sincronizar.rs:518`), `tiene_res_origen` por fila de paquete (`productos.rs:610`) y paridad `sync.py:177` en `overrides` sin cambio de origen.
+- Pendiente: CI de Windows y validación real con Excel/COM y Outlook del usuario (no `ACEPTADO`).
+
+## 2026-11-26 · E-P0-B1: entrega Windows segura, actualizador SHA-256 y anonimizador v1.2.0 (Agente B · ChatGPT)
+- Cambió: `installer/{Instalar_Flow.cmd,Instalar_Flow.ps1,Desinstalar_Flow.ps1,FlowRust.iss}`, `tools/verify_flow_rust_installer.ps1`, `app/tests/instalador.rs`, `app/src/{actualizacion.rs,anon.rs}`, `rust/crates/flow-anonimo/src/{archivos.rs,formatos.rs,texto.rs}`, `rust/crates/flow-anonimo/tests/paridad.rs`, `rust/datos/captura_anonima.json`, `tools/inventario_escrituras.py` e informe `AGENTE_B_20261126_entrega_anonimo.md`.
+- Acredita: manifiesto de propiedad `FlowRustOwnership/1` y desinstalación sin borrado recursivo, `Instalar_Flow.cmd` con `"%~dp0."` y `-RequireSha256`, SHA-256 obligatorio + publicación atómica y rollback en `actualizacion.rs`, soporte `CSMP_CAPTURE` 1.0/1.1/1.2 y cuota real ZIP en `flow-anonimo` (40/40 pruebas del crate), suite Linux completa verde y 6 verificadores PASA.
+- Ajuste del orquestador: `Sesion::persona` omite `STATE_WORDS` (p. ej. `Centro` en `bitacoras.author`) para no corromper `origin=CENTRO` en v1.2.0 (`author` sigue seudonimizándose). Workflow actualizado con `rust/**`, `descargador_lite/**` y `installer/LEEME.txt`.
+- Pendiente: CI de Windows (incluyendo verificador PS1 en runner real) y validación del usuario (no `ACEPTADO`).
+
+## 2026-11-26 · E-P0-C1: rango único de captura, pausa en reanudación y Meta 4 (Agente C · ChatGPT)
+- Cambió: `app/src/descargador/{bitacoras.rs,flujo_paquete.rs}`, `app/src/{descargador_ui.rs,descargador_resultados_ui.rs,meta4_ui.rs}`, `tools/inventario_escrituras.py` e informe `AGENTE_C_20261126_rango_captura.md`.
+- Acredita: lectura de fechas visibles en todas las acciones de descarga, opción explícita «Todas las fechas», persistencia de alcance/pausa/versión en `proceso.json` y `bitacoras.rs`, publicación segura de pareja ZIP + diagnóstico hermano, separación de período de observaciones vs alcance acreditado en Meta 4, corrección de botones `Quitar` y `leer()` en Resultados; suite Linux completa verde y 6 verificadores PASA.
+- Diferencias declaradas: descarga conjunta CSMP se bloquea con rango explícito hasta ampliar su contrato (`flujo_csmp.rs`, Tanda 2).
+- Pendiente: CI de Windows y repetición real del rango del usuario (no `ACEPTADO`).
+
 ## 2026-11-26 · Destinatarios y firma de Outlook, período de Meta 4
 
 - Cambió: migración de destinatarios y alias de Flow Python, resolución al volver a preparar y edición de borradores en Outlook clásico sin reemplazar la firma.
