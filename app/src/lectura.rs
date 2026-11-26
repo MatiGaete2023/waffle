@@ -15,7 +15,14 @@ pub struct Sheet {
     pub rows: Vec<Vec<Cell>>,
 }
 
+use flow_rust::descargador::xls::{
+    validar_xml, validar_zip_excel, MAX_CELDAS, MAX_COLUMNAS, MAX_ENTRADA, MAX_FILAS,
+};
+#[cfg(test)]
+use flow_rust::descargador::xls::{validar_dimensiones_ooxml, validar_zip_excel_con_limite};
+
 pub fn read_sheets(bytes: &[u8]) -> Result<Vec<Sheet>, String> {
+    if bytes.len() as u64 > MAX_ENTRADA { return Err("El Excel supera el límite de lectura.".into()); }
     let head = &bytes[..bytes.len().min(4096)];
     let low = String::from_utf8_lossy(head).to_lowercase();
     if bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(&[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]) {
@@ -29,6 +36,12 @@ pub fn read_sheets(bytes: &[u8]) -> Result<Vec<Sheet>, String> {
     }
     if let Ok(s) = std::str::from_utf8(bytes) {
         if s.contains(';') || s.contains(',') || s.contains('\t') {
+            let mut total = 0usize;
+            let sep = [';', '\t', ','].into_iter().max_by_key(|c| s.lines().next().unwrap_or("").matches(*c).count()).unwrap_or(';');
+            for (i, linea) in s.lines().enumerate() {
+                let n = linea.split(sep).count(); total = total.saturating_add(n);
+                if i >= MAX_FILAS || n > MAX_COLUMNAS || total > MAX_CELDAS { return Err("El CSV excede los límites de lectura.".into()); }
+            }
             return Ok(vec![read_csv(s)]);
         }
     }
@@ -36,11 +49,20 @@ pub fn read_sheets(bytes: &[u8]) -> Result<Vec<Sheet>, String> {
 }
 
 fn read_calamine(bytes: &[u8]) -> Result<Vec<Sheet>, String> {
+    if bytes.starts_with(b"PK\x03\x04") { validar_zip_excel(bytes)?; }
+    let mut total = 0usize;
+    let mut total_filas = 0usize;
     let mut wb = calamine::open_workbook_auto_from_rs(Cursor::new(bytes.to_vec())).map_err(|e| format!("No se pudo abrir el libro: {e}"))?;
     let mut out = Vec::new();
     for name in wb.sheet_names().to_owned() {
-        let Ok(range) = wb.worksheet_range(&name) else { continue };
+        let range = wb.worksheet_range(&name).map_err(|e| format!("No se pudo leer una hoja del Excel: {e}"))?;
         let (r0, c0) = range.start().unwrap_or((0, 0));
+        let (filas, cols) = range.get_size();
+        let alto = (r0 as usize).saturating_add(filas);
+        let ancho = (c0 as usize).saturating_add(cols);
+        total = total.saturating_add(filas.saturating_mul(ancho));
+        total_filas = total_filas.saturating_add(alto);
+        if total_filas > MAX_FILAS || ancho > MAX_COLUMNAS || total > MAX_CELDAS { return Err("Las dimensiones del Excel exceden los límites de lectura.".into()); }
         let mut rows: Vec<Vec<Cell>> = vec![Vec::new(); r0 as usize];
         for row in range.rows() {
             let mut cells: Vec<Cell> = vec![Cell::Empty; c0 as usize];
@@ -117,10 +139,13 @@ pub fn read_html(html: &str) -> Result<Vec<Sheet>, String> {
     static TABLE: OnceLock<Regex> = OnceLock::new();
     static TR: OnceLock<Regex> = OnceLock::new();
     static TD: OnceLock<Regex> = OnceLock::new();
+    let mut total = 0usize;
     let mut out = Vec::new();
+    if html.len() as u64 > MAX_ENTRADA { return Err("El HTML supera el límite de lectura.".into()); }
     for (n, t) in re(&TABLE, r"(?is)<table[^>]*>(.*?)</table>").captures_iter(html).enumerate() {
         let mut rows = Vec::new();
         for tr in re(&TR, r"(?is)<tr[^>]*>(.*?)</tr>").captures_iter(&t[1]) {
+            if rows.len() >= MAX_FILAS { return Err("El HTML excede los límites de lectura.".into()); }
             let mut cells = Vec::new();
             for td in re(&TD, r#"(?is)<t([dh])([^>]*)>(.*?)</t[dh]>"#).captures_iter(&tr[1]) {
                 cells.push(text_cell(strip_tags(&td[3])));
@@ -130,7 +155,10 @@ pub fn read_html(html: &str) -> Result<Vec<Sheet>, String> {
                         cells.push(Cell::Empty);
                     }
                 }
+                if cells.len() > MAX_COLUMNAS || total.saturating_add(cells.len()) > MAX_CELDAS { return Err("El HTML excede los límites de lectura.".into()); }
             }
+            total = total.saturating_add(cells.len());
+            if rows.len() >= MAX_FILAS || cells.len() > MAX_COLUMNAS || total > MAX_CELDAS { return Err("El HTML excede los límites de lectura.".into()); }
             rows.push(cells);
         }
         if !rows.is_empty() {
@@ -144,6 +172,9 @@ pub fn read_html(html: &str) -> Result<Vec<Sheet>, String> {
 }
 
 pub fn read_xml2003(xml: &str) -> Result<Vec<Sheet>, String> {
+    if xml.len() as u64 > MAX_ENTRADA { return Err("El XML supera el límite de lectura.".into()); }
+    validar_xml(xml, true)?;
+    let mut total = 0usize;
     static WS: OnceLock<Regex> = OnceLock::new();
     static ROW: OnceLock<Regex> = OnceLock::new();
     static CELL: OnceLock<Regex> = OnceLock::new();
@@ -156,11 +187,10 @@ pub fn read_xml2003(xml: &str) -> Result<Vec<Sheet>, String> {
             let mut cells: Vec<Cell> = Vec::new();
             let body = r.get(1).map(|m| m.as_str()).unwrap_or("");
             for c in re(&CELL, r"(?is)<(?:ss:)?Cell([^>]*?)(?:/>|>(.*?)</(?:ss:)?Cell>)").captures_iter(body) {
-                if let Some(i) = re(&IDX, r#"(?:ss:)?Index="(\d+)""#).captures(&c[1]) {
+                if let Some(i) = re(&IDX, r#"(?:ss:)?Index\s*=\s*['"](\d+)['"]"#).captures(&c[1]) {
                     let target: usize = i[1].parse::<usize>().unwrap_or(1).saturating_sub(1);
-                    while cells.len() < target {
-                        cells.push(Cell::Empty);
-                    }
+                    if target >= MAX_COLUMNAS || target < cells.len() { return Err("Índice XML inválido.".into()); }
+                    cells.resize(target, Cell::Empty);
                 }
                 let inner = c.get(2).map(|m| m.as_str()).unwrap_or("");
                 let cell = match re(&DATA, r#"(?is)<(?:ss:)?Data[^>]*?(?:ss:)?Type="([^"]*)"[^>]*>(.*?)</(?:ss:)?Data>"#).captures(inner) {
@@ -175,7 +205,10 @@ pub fn read_xml2003(xml: &str) -> Result<Vec<Sheet>, String> {
                     None => Cell::Empty,
                 };
                 cells.push(cell);
+                if cells.len() > MAX_COLUMNAS || total.saturating_add(cells.len()) > MAX_CELDAS { return Err("El XML excede los límites de lectura.".into()); }
             }
+            total += cells.len();
+            if rows.len() >= MAX_FILAS { return Err("El XML excede los límites de lectura.".into()); }
             rows.push(cells);
         }
         out.push(Sheet { name: unescape(&w[1]), rows });
@@ -367,4 +400,36 @@ pub fn buscar_cruce(sheets: &[Sheet], principal: usize) -> Option<(usize, usize,
 
 pub fn date_of(c: &Cell) -> Option<NaiveDate> {
     crate::util::get_date(c)
+}
+
+#[cfg(test)]
+mod cuotas_lectura_tests {
+    use super::*;
+    #[test]
+    fn xml_rechaza_indices_y_anidacion() {
+        for i in ["0", "-1", "16385", "999999999999999999999999"] {
+            let xml = format!("<Workbook><Worksheet Name=\"X\"><Table><Row><Cell ss:Index=\"{i}\"/></Row></Table></Worksheet></Workbook>");
+            assert!(read_xml2003(&xml).is_err());
+        }
+        assert!(read_xml2003("<Workbook><Worksheet></Workbook>").is_err());
+        assert!(validar_dimensiones_ooxml("<worksheet><dimension ref=\"A1:XFD1048576\"/></worksheet>").is_err());
+        assert!(validar_xml(&format!("{}{}", "<a>".repeat(129), "</a>".repeat(129)), true).is_err());
+    }
+    #[test]
+    fn zip_cuota_real_y_acumulada() {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for nombre in ["a.bin", "b.bin"] {
+            zip.start_file(nombre, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(b"12345678").unwrap();
+        }
+        let bytes = zip.finish().unwrap().into_inner();
+        assert!(validar_zip_excel_con_limite(&bytes, 7, 20).is_err());
+        assert!(validar_zip_excel_con_limite(&bytes, 8, 15).is_err());
+        assert!(validar_zip_excel_con_limite(&bytes, 8, 16).is_ok());
+    }
+    #[test]
+    fn fecha_anterior_a_1982() {
+        assert_eq!(crate::util::excel_serial(25569.0), NaiveDate::from_ymd_opt(1970, 1, 1));
+    }
 }

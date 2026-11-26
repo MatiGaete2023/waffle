@@ -9,7 +9,7 @@ use super::xls;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub const VERSION: &str = "1.0.0";
@@ -220,6 +220,7 @@ fn escribir_captura_diagnosticada(
         zip.write_all(bruto).map_err(|e| e.to_string())?;
     }
     let bytes = zip.finish().map_err(|e| e.to_string())?.into_inner();
+    validar_zip_paquete(&bytes, 80 * 1024 * 1024)?;
     crate::captura::leer_captura(&bytes).map_err(|e| format!("El paquete generado no pasa la validación del contrato: {e}"))?;
     if let Some(padre) = destino.parent() {
         std::fs::create_dir_all(padre).map_err(|e| format!("No se pudo crear la carpeta del paquete: {e}"))?;
@@ -245,8 +246,28 @@ fn escribir_captura_diagnosticada(
 
 // ---------------------------------------------------------------- lote (`resultados.load_lot`)
 
+fn validar_zip_paquete(bytes: &[u8], max: u64) -> Result<(), String> {
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
+    let mut total = 0u64;
+    for i in 0..zip.len() {
+        let entrada = zip.by_index(i).map_err(|e| e.to_string())?;
+        let disponible = max.saturating_sub(total);
+        let real = std::io::copy(&mut entrada.take(disponible + 1), &mut std::io::sink()).map_err(|e| e.to_string())?;
+        if real > disponible { return Err("La expansión del ZIP supera el límite permitido.".into()); }
+        total += real;
+    }
+    Ok(())
+}
+
+pub(super) fn leer_archivo_acotado(ruta: &Path, max: u64) -> Result<Vec<u8>, String> {
+    if !std::fs::metadata(ruta).map_err(|e| e.to_string())?.is_file() { return Err("No es un archivo regular.".into()); }
+    let archivo = std::fs::File::open(ruta).map_err(|e| e.to_string())?;
+    if !archivo.metadata().map_err(|e| e.to_string())?.is_file() { return Err("No es un archivo regular.".into()); }
+    super::xls::leer_acotado(archivo, max)
+}
+
 pub(super) fn leer_json(ruta: &Path) -> Result<Value, String> {
-    let datos = std::fs::read(ruta).map_err(|_| format!("Falta {}.", ruta.file_name().and_then(|n| n.to_str()).unwrap_or("")))?;
+    let datos = leer_archivo_acotado(ruta, LOTE_MAX).map_err(|_| format!("Falta {}.", ruta.file_name().and_then(|n| n.to_str()).unwrap_or("")))?;
     serde_json::from_slice(&datos).map_err(|_| "Un JSON del lote no se pudo leer.".to_string())
 }
 
@@ -255,13 +276,23 @@ pub(super) fn dentro(carpeta: &Path, nombre: &str) -> Result<PathBuf, String> {
     if nombre.is_empty() || Path::new(nombre).file_name().and_then(|n| n.to_str()) != Some(nombre) || nombre.contains('\\') {
         return Err("El manifiesto contiene una ruta fuera del lote.".into());
     }
-    Ok(carpeta.join(nombre))
+    if nombre.contains(':') || !matches!(Path::new(nombre).components().next(), Some(std::path::Component::Normal(_))) {
+        return Err("El manifiesto contiene una ruta fuera del lote.".into());
+    }
+    let base = carpeta.canonicalize().map_err(|_| "No se pudo abrir la carpeta del lote.")?;
+    let ruta = base.join(nombre);
+    match ruta.canonicalize() {
+        Ok(real) if real != base && real.starts_with(&base) && real == ruta => Ok(real),
+        // Mantener el diagnóstico original de archivo ausente en los llamadores; nunca seguir un enlace roto.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && ruta.symlink_metadata().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) => Ok(ruta),
+        _ => Err("El manifiesto contiene una ruta fuera del lote.".into()),
+    }
 }
 
 /// `check_file`: el archivo verificado sigue íntegro (tamaño y huella).
 pub(super) fn comprobar(carpeta: &Path, item: &Value) -> Result<Vec<u8>, String> {
     let ruta = dentro(carpeta, item["archivo"].as_str().unwrap_or(""))?;
-    let datos = std::fs::read(&ruta).map_err(|_| "Falta un archivo o supera el límite de lectura.".to_string())?;
+    let datos = leer_archivo_acotado(&ruta, super::xls::MAX_ENTRADA).map_err(|_| "Falta un archivo o supera el límite de lectura.".to_string())?;
     if datos.len() > 80 * 1024 * 1024 {
         return Err("Falta un archivo o supera el límite de lectura.".into());
     }
@@ -300,7 +331,7 @@ pub fn cargar_lote_con(carpeta: &Path, parcial: bool) -> Result<Lote, String> {
         }
         .into());
     }
-    let resumen = leer_json(&carpeta.join("resumen.json"))?;
+    let resumen = leer_json(&dentro(&carpeta, "resumen.json")?)?;
     let incompleto = resumen["estado"] != "VALIDADA";
     if incompleto && !parcial {
         return Err("El lote es incompleto. Selecciona explícitamente una exportación parcial.".into());
@@ -329,6 +360,7 @@ pub fn cargar_lote_con(carpeta: &Path, parcial: bool) -> Result<Lote, String> {
             .collect();
         nombres.sort();
         for ruta in nombres {
+            let ruta = dentro(&carpeta, ruta.file_name().and_then(|n| n.to_str()).unwrap_or(""))?;
             if vistas.contains(&ruta) {
                 continue;
             }
@@ -947,7 +979,8 @@ fn copia_local(carpeta: &Path, nombre: &str, fuera: &str) -> Result<Vec<u8>, Opt
     if meta.len() > COPIA_MAX {
         return Err(Some(fuera.into()));
     }
-    std::fs::read(&ruta).map_err(|_| None)
+    let ruta = dentro(carpeta, nombre).map_err(|_| Some(fuera.into()))?;
+    leer_archivo_acotado(&ruta, COPIA_MAX).map_err(|_| None)
 }
 
 fn cadena<'a>(v: &'a Value, k: &str) -> Result<&'a str, Option<String>> {
@@ -1094,7 +1127,7 @@ pub(super) fn importar_lote_completo(manifiesto: &Path) -> Result<LoteImportado,
     if meta.len() > LOTE_MAX {
         return Err("Lote de bitácoras demasiado grande.".into());
     }
-    let bruto = std::fs::read(manifiesto).map_err(|_| ausente())?;
+    let bruto = leer_archivo_acotado(manifiesto, LOTE_MAX).map_err(|_| ausente())?;
     let datos: Value = std::str::from_utf8(&bruto).ok().and_then(|s| serde_json::from_str(s).ok())
         .filter(Value::is_object).ok_or("El control de bitácoras no es un JSON válido.")?;
     if datos["tipo"] != "BITACORAS_LECTURA" || datos["version"] != 1 {
@@ -1299,21 +1332,32 @@ pub(super) struct Causa {
 
 /// `historias.cargar`: (estado, causas). Cada causa leída se relee del HTML respaldado y se verifica su SHA-256.
 pub(super) fn cargar_historias(manifiesto: &Path) -> Result<(Value, Vec<Causa>), String> {
-    let estado: Value = std::fs::read(manifiesto).ok().and_then(|b| serde_json::from_slice(&b).ok())
-        .ok_or("No se pudo leer historias.json.")?;
+    let (estado, causas, _) = cargar_historias_con_huella(manifiesto)?;
+    Ok((estado, causas))
+}
+
+#[cfg(test)]
+std::thread_local! { static CARGAS_HISTORIAS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+fn cargar_historias_con_huella(manifiesto: &Path) -> Result<(Value, Vec<Causa>, String), String> {
+    #[cfg(test)]
+    CARGAS_HISTORIAS.with(|n| n.set(n.get() + 1));
+    let carpeta = manifiesto.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let ruta = dentro(carpeta, manifiesto.file_name().and_then(|n| n.to_str()).unwrap_or(""))?;
+    let bytes = leer_archivo_acotado(&ruta, LOTE_MAX).map_err(|_| "No se pudo leer historias.json.")?;
+    let huella = sha256(&bytes);
+    let estado: Value = serde_json::from_slice(&bytes).map_err(|_| "No se pudo leer historias.json.")?;
     if estado["version"] != 1 || estado["tipo"] != "HISTORIA_LECTURA" {
         return Err("El archivo no es una lectura de historias.".into());
     }
-    let carpeta = manifiesto.parent().ok_or("historias.json sin carpeta.")?;
     let meses = estado["meses"].as_u64().unwrap_or(4) as u32;
     let mut causas = Vec::new();
     for (clave, causa) in estado["causas"].as_object().ok_or("historias.json sin causas.")? {
         let mut item = Causa { clave: clave.clone(), causa: causa.clone(), lectura: None, ventana: vec![], anteriores: vec![],
             escritos: None, escritos_error: String::new() };
         if matches!(causa["estado"].as_str(), Some("LEIDA" | "VACIA_COMPROBADA")) {
-            let ruta = carpeta.join(causa["archivo"].as_str().ok_or("Falta el respaldo de una historia leída.")?);
-            let meta = std::fs::metadata(&ruta).ok().filter(|m| m.is_file() && m.len() <= HISTORIA_MAX);
-            let datos = meta.and_then(|_| std::fs::read(&ruta).ok()).ok_or("Falta el respaldo de una historia leída.")?;
+            let ruta = dentro(carpeta, causa["archivo"].as_str().ok_or("Falta el respaldo de una historia leída.")?)?;
+            let datos = leer_archivo_acotado(&ruta, HISTORIA_MAX).map_err(|_| "Falta el respaldo de una historia leída.")?;
             if json!(sha256(&datos)) != causa["sha256"] {
                 return Err("El respaldo de una historia no coincide con su SHA-256.".into());
             }
@@ -1345,7 +1389,7 @@ pub(super) fn cargar_historias(manifiesto: &Path) -> Result<(Value, Vec<Causa>),
         }
         causas.push(item);
     }
-    Ok((estado, causas))
+    Ok((estado, causas, huella))
 }
 
 /// `contexto_anterior`: último trámite anterior a la ventana de cada nomenclatura de contexto, en orden de fila.
@@ -1539,7 +1583,7 @@ fn historico_pendientes(bitacoras: &[PathBuf], historico: &Path, entradas: Optio
         if ruta.parent() != Some(carpeta.as_path()) {
             continue;
         }
-        let Some(control) = std::fs::read(&ruta).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else { continue };
+        let Some(control) = leer_archivo_acotado(&ruta, LOTE_MAX).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else { continue };
         let registros = control["registros"].as_array().into_iter().flatten()
             .chain(control["anteriores_no_reenumeradas"].as_array().into_iter().flatten());
         for r in registros {
@@ -1800,11 +1844,26 @@ pub fn empaquetar_lote(
     Ok(r)
 }
 
+fn validar_rutas_historico(base: &Path, bytes: &[u8]) -> Result<(), String> {
+    let estado: Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let carpeta = dentro(base, "historico")?;
+    for entrada in estado["capturas"].as_object().into_iter().flat_map(Map::values) {
+        if let Some(nombre) = entrada["archivo"].as_str().filter(|n| !n.is_empty()) {
+            // El lector delegado ya degrada archivos ausentes o nombres inválidos por entrada.
+            if carpeta.exists() {
+                let ruta = dentro(&carpeta, nombre)?;
+                if ruta.exists() { leer_archivo_acotado(&ruta, HISTORIA_MAX)?; }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `export_capture`: lotes de listados (E-Q5a) más bitácoras, calendario por ingreso, historia, Escritos e
 /// histórico (E-Q5c), calendario de informes con su asociación y Carga (E-Q5b).
 pub fn exportar_con(carpetas: &[PathBuf], destino: &Path, op: &Opciones) -> Result<Exportado, String> {
     let lotes: Vec<Lote> = carpetas.iter().map(|c| cargar_lote(c).map_err(|error| {
-        let Ok(resumen) = leer_json(&c.join("resumen.json")) else { return error };
+        let Ok(resumen) = dentro(c, "resumen.json").and_then(|r| leer_json(&r)) else { return error };
         let terminadas = resumen["consultas"].as_array().into_iter().flatten();
         let mensual_pendiente = resumen["plan"].as_array().into_iter().flatten().any(|p|
             p["screen"] == "calendario_informes" && !terminadas.clone().any(|q| q["seleccion"] == *p));
@@ -1836,7 +1895,7 @@ pub fn exportar_con(carpetas: &[PathBuf], destino: &Path, op: &Opciones) -> Resu
     if !op.bitacoras.is_empty() {
         let mut hashes = Vec::new();
         for r in rutas_bitacoras(&op.bitacoras) {
-            let b = std::fs::read(&r).map_err(|_| format!("No se encuentra el control de bitácoras: {}. Recupera bitacoras.json con sus \
+            let b = leer_archivo_acotado(&r, LOTE_MAX).map_err(|_| format!("No se encuentra el control de bitácoras: {}. Recupera bitacoras.json con sus \
                 HTML originales o excluye esa referencia del paquete.", r.display()))?;
             hashes.push(sha256(&b));
         }
@@ -1844,8 +1903,9 @@ pub fn exportar_con(carpetas: &[PathBuf], destino: &Path, op: &Opciones) -> Resu
         huella += &json_python(&json!(hashes), false);
         huella += if op.emparejar { "MATCH" } else { "ALL" };
     }
-    if let Some(h) = &op.historia {
-        huella += &format!("HISTORIA{}", sha256(&std::fs::read(h).map_err(|_| "No se encuentra historias.json.".to_string())?));
+    let historia = op.historia.as_deref().map(cargar_historias_con_huella).transpose()?;
+    if let Some((_, _, hash)) = &historia {
+        huella += &format!("HISTORIA{hash}");
     }
     let mut entradas_historico: Option<Vec<Value>> = None;
     if let Some(h) = &op.historico {
@@ -1854,7 +1914,10 @@ pub fn exportar_con(carpetas: &[PathBuf], destino: &Path, op: &Opciones) -> Resu
             entradas_historico = Some(Vec::new());
             "AUSENTE".to_string()
         } else {
-            match std::fs::read(&manifiesto).map_err(|e| e.to_string()).and_then(|b| super::historico::cargar(h, &ahora).map(|e| (sha256(&b), e))) {
+            match dentro(h, super::historico::MANIFIESTO).and_then(|r| leer_archivo_acotado(&r, LOTE_MAX)).and_then(|b| {
+                validar_rutas_historico(h, &b)?;
+                super::historico::cargar(h, &ahora).map(|e| (sha256(&b), e))
+            }) {
                 Ok((s, e)) => {
                     entradas_historico = Some(e);
                     s
@@ -2091,12 +2154,10 @@ pub fn exportar_con(carpetas: &[PathBuf], destino: &Path, op: &Opciones) -> Resu
             }
         }
     }
-    if let Some(h) = &op.historia {
-        let (estado, causas) = cargar_historias(h)?;
+    if let (Some(h), Some((estado, causas, _))) = (&op.historia, &historia) {
         let lote = nombre_lote(h);
-        exportar_historia(&estado, &causas, &lote, &mut d, &capturada);
-        let (_, causas) = cargar_historias(h)?;
-        exportar_escritos(&causas, &lote, &mut d, &capturada);
+        exportar_historia(estado, causas, &lote, &mut d, &capturada);
+        exportar_escritos(causas, &lote, &mut d, &capturada);
     }
     if let Some(h) = &op.historico {
         let pendientes = historico_pendientes(&op.bitacoras, h, entradas_historico.as_deref());
@@ -2148,9 +2209,35 @@ pub fn exportar_con(carpetas: &[PathBuf], destino: &Path, op: &Opciones) -> Resu
 mod tests {
     use super::*;
     use base64::Engine;
-    use std::io::Read;
 
     /// Una carpeta que no es un lote de registros dice qué es y qué carpeta elegir, en vez de solo «falta resumen.json».
+    #[test]
+    fn historia_rechaza_traversal_y_zip_supera_cuota_real() {
+        let base = std::env::temp_dir().join(format!("flow-historia-cuota-{}", std::process::id()));
+        std::fs::create_dir(&base).unwrap();
+        let control = base.join("historias.json");
+        std::fs::write(&control, serde_json::to_vec(&json!({"version":1,"tipo":"HISTORIA_LECTURA","causas":{"sintetica":{"estado":"LEIDA","archivo":"../fuera.html"}}})).unwrap()).unwrap();
+        assert!(cargar_historias(&control).err().unwrap().contains("fuera del lote"));
+        for nombre in ["../fuera.html", "..\\fuera.html", "/fuera.html", "C:\\fuera.html", "C:fuera.html"] {
+            assert!(dentro(&base, nombre).is_err());
+        }
+        #[cfg(unix)]
+        {
+            let enlace = base.join("enlace.html");
+            std::os::unix::fs::symlink(base.parent().unwrap(), &enlace).unwrap();
+            assert!(dentro(&base, "enlace.html").is_err());
+            std::fs::remove_file(enlace).unwrap();
+        }
+        std::fs::remove_file(&control).unwrap();
+        std::fs::remove_dir(&base).unwrap();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("data/a.csv", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(b"12345678").unwrap();
+        let bytes = zip.finish().unwrap().into_inner();
+        assert!(validar_zip_paquete(&bytes, 7).is_err());
+        assert!(validar_zip_paquete(&bytes, 8).is_ok());
+    }
+
     #[test]
     fn una_carpeta_sin_resumen_dice_que_es_y_que_elegir() {
         let base = std::env::temp_dir().join(format!("flow-lote-sin-resumen-{}", std::process::id()));
@@ -2322,7 +2409,8 @@ mod tests {
             let salida = if e.get("bitacoras").is_some() {
                 let bitacoras = base.join("bitacoras").join(e["bitacoras"]["carpeta"].as_str().unwrap());
                 reconstruir(&bitacoras, &e["bitacoras"]["archivos"]);
-                empaquetar_lote(&carpeta, &bitacoras.join("bitacoras.json"), &destino, Some(&bitacoras.join("historia").join("historias.json")),
+                CARGAS_HISTORIAS.with(|n| n.set(0));
+                let resultado = empaquetar_lote(&carpeta, &bitacoras.join("bitacoras.json"), &destino, Some(&bitacoras.join("historia").join("historias.json")),
                     Some(&bitacoras), 4, &[], false)
                     .map(|mut r| {
                         r.as_object_mut().unwrap().remove("path");
@@ -2330,7 +2418,9 @@ mod tests {
                         if r != e["resultado"] {
                             diferencias.push(format!("resultado:\n    Rust   {r}\n    Python {}", e["resultado"]));
                         }
-                    })
+                    });
+                if resultado.is_ok() { assert_eq!(CARGAS_HISTORIAS.with(|n| n.get()), 1, "la construcción carga historias una sola vez"); }
+                resultado
             } else {
                 let mut carpetas = vec![carpeta.clone()];
                 for otro in e["otros_lotes"].as_array().into_iter().flatten() {

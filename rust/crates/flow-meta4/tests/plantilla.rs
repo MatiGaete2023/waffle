@@ -156,3 +156,55 @@ fn plantilla_tambien_funciona_al_regenerar_registros() {
     assert_eq!(reporte["plantilla"], "Plantilla XLSX personalizada, estilos verificados");
     assert_eq!(std::fs::read(revisados.join("Registros.xlsx")).unwrap(), antes);
 }
+
+fn modificar_estilos(ruta: &Path, destino: &Path, conteo: &str, con_formato: bool) {
+    use std::io::Write;
+    let mut zip = ZipArchive::new(std::fs::File::open(ruta).unwrap()).unwrap();
+    let mut escritor = zip::ZipWriter::new(std::fs::OpenOptions::new().write(true).create_new(true).open(destino).unwrap());
+    for i in 0..zip.len() {
+        let mut entrada = zip.by_index(i).unwrap();
+        let nombre = entrada.name().to_string();
+        if entrada.is_dir() { continue; }
+        let mut bytes = Vec::new();
+        entrada.read_to_end(&mut bytes).unwrap();
+        if nombre == "xl/styles.xml" {
+            let mut xml = String::from_utf8(bytes).unwrap();
+            let formato = if con_formato { "<numFmt numFmtId=\"164\" formatCode=\"0.00\"/>" } else { "" };
+            let bloque = format!("<numFmts count=\"{conteo}\">{formato}</numFmts>");
+            if let Some(inicio) = xml.find("<numFmts") {
+                let fin = inicio + xml[inicio..].find('>').unwrap() + 1;
+                let fin = if xml[inicio..fin].ends_with("/>") { fin } else { fin + xml[fin..].find("</numFmts>").unwrap() + "</numFmts>".len() };
+                xml.replace_range(inicio..fin, &bloque);
+            } else {
+                let inicio = xml.find("<styleSheet").unwrap();
+                let fin = inicio + xml[inicio..].find('>').unwrap() + 1;
+                xml.insert_str(fin, &bloque);
+            }
+            bytes = xml.into_bytes();
+        }
+        escritor.start_file(nombre, zip::write::SimpleFileOptions::default()).unwrap();
+        escritor.write_all(&bytes).unwrap();
+    }
+    escritor.finish().unwrap();
+}
+
+#[test]
+fn plantilla_contadores_cero_ceros_iniciales_y_malformado() {
+    let tmp = Temporal::nueva();
+    let original = tmp.0.join("modelo.xlsx");
+    plantilla(&original, false);
+    for (i, (conteo, con_formato, valido)) in [("01", true, true), ("0", false, true), ("abc", false, false), ("", false, false)].into_iter().enumerate() {
+        let alterada = tmp.0.join(format!("modelo-{i}.xlsx"));
+        modificar_estilos(&original, &alterada, conteo, con_formato);
+        let destino = tmp.0.join(format!("Resultado-{i}"));
+        let resultado = salida::publicar_con_plantilla(&meta(), &destino, Some(&alterada));
+        if valido {
+            let rutas = resultado.unwrap();
+            let estilos = parte(&rutas[0], "xl/styles.xml");
+            assert!(estilos.contains("dd-mm-yyyy"));
+        } else {
+            assert!(resultado.is_err());
+            assert!(!destino.exists());
+        }
+    }
+}

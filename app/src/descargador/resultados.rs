@@ -133,7 +133,7 @@ fn json_sangrado(v: &Value) -> String {
 
 /// `export_book(lots, destination, csmp)`: libro con Resumen, SITFA_ARCHIVOS, una hoja por familia y esquema,
 /// Vencimientos y su metadato JSON al lado. Devuelve la ruta del XLSX.
-pub fn exportar_libro(lotes: &[Lote], destino: Option<&Path>, csmp: bool, ahora: &Ahora) -> Result<PathBuf, String> {
+pub(super) fn hojas_consolidadas(lotes: &[Lote], csmp: bool) -> Result<(Vec<Hoja>, Value), String> {
     if lotes.is_empty() {
         return Err("Selecciona al menos un lote.".into());
     }
@@ -304,33 +304,39 @@ pub fn exportar_libro(lotes: &[Lote], destino: Option<&Path>, csmp: bool, ahora:
         hojas.push(hoja);
     }
     hojas.push(presentada("Vencimientos", &cab_venc, vencimientos));
-    let bytes = excel::libro(&hojas)?;
     let parcial = lotes.iter().any(|l| l.parcial);
-    let etiqueta = format!("{}{}", if csmp { "Para CSMP" } else { "Consolidado" }, if parcial { " INCOMPLETO" } else { "" });
-    let carpeta = destino.map(Path::to_path_buf).unwrap_or_else(|| lotes[0].carpeta.clone());
-    let ruta = publicar(&carpeta, &etiqueta, ".xlsx", ahora, &bytes)?;
     let metadato = json!({
         "version_contrato": 1,
-        "archivo": ruta.file_name().unwrap().to_string_lossy(),
-        "sha256": sha256(&bytes),
         "filas": filas_fuente,
         "estado": if parcial { "INCOMPLETO" } else { "VALIDADA" },
         "fuentes": fuentes,
         "compatibilidad": reportes,
         "hojas": nombres.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>(),
-        "fecha_exportacion": ahora.to_rfc3339_opts(chrono::SecondsFormat::Micros, false),
     });
+    Ok((hojas, metadato))
+}
+
+pub fn exportar_libro(lotes: &[Lote], destino: Option<&Path>, csmp: bool, ahora: &Ahora) -> Result<PathBuf, String> {
+    let (hojas, meta) = hojas_consolidadas(lotes, csmp)?;
+    let bytes = excel::libro(&hojas)?;
+    let parcial = lotes.iter().any(|l| l.parcial);
+    let etiqueta = format!("{}{}", if csmp { "Para CSMP" } else { "Consolidado" }, if parcial { " INCOMPLETO" } else { "" });
+    let carpeta = destino.map(Path::to_path_buf).unwrap_or_else(|| lotes[0].carpeta.clone());
+    let ruta = publicar(&carpeta, &etiqueta, ".xlsx", ahora, &bytes)?;
+    // Mantener el orden de claves del contrato original.
+    let metadato = json!({"version_contrato": 1, "archivo": ruta.file_name().unwrap().to_string_lossy(),
+        "sha256": sha256(&bytes), "filas": meta["filas"], "estado": meta["estado"], "fuentes": meta["fuentes"],
+        "compatibilidad": meta["compatibilidad"], "hojas": meta["hojas"],
+        "fecha_exportacion": ahora.to_rfc3339_opts(chrono::SecondsFormat::Micros, false)});
     let json_ruta = ruta.with_extension("json");
-    std::fs::write(&json_ruta, json_sangrado(&metadato)).map_err(|e| format!("No se pudo guardar el metadato del libro: {e}"))?;
+    super::lote::guardar_exclusivo(&json_ruta, json_sangrado(&metadato).as_bytes()).map_err(|e| format!("No se pudo guardar el metadato del libro: {e}"))?;
     Ok(ruta)
 }
 
-/// `consolidated_workbook`: el libro «Para CSMP» de los lotes como bytes, en una carpeta temporal propia.
-pub fn libro_consolidado(lotes: &[Lote], ahora: &Ahora) -> Result<Vec<u8>, String> {
-    let carpeta = std::env::temp_dir().join(format!("consolidado-{}-{}", std::process::id(), ahora.timestamp_micros()));
-    let resultado = exportar_libro(lotes, Some(&carpeta), true, ahora).and_then(|r| std::fs::read(r).map_err(|e| e.to_string()));
-    let _ = std::fs::remove_dir_all(&carpeta);
-    resultado
+/// `consolidated_workbook`: el libro «Para CSMP» se serializa directamente a memoria.
+pub fn libro_consolidado(lotes: &[Lote], _ahora: &Ahora) -> Result<Vec<u8>, String> {
+    let (hojas, _) = hojas_consolidadas(lotes, true)?;
+    excel::libro(&hojas)
 }
 
 // ---------------------------------------------------------------- `export_csv`, `export_ics`, `export_zip`, `compare_lots`
@@ -509,8 +515,8 @@ pub fn exportar_ics(lote: &Lote, ahora: &Ahora) -> Result<PathBuf, String> {
 
 /// `export_zip(lot)`: entrega con `INDICE.txt`, `MANIFIESTO.json` y cada archivo del lote, comprobados dentro del ZIP.
 pub fn exportar_zip(lote: &Lote, ahora: &Ahora) -> Result<PathBuf, String> {
-    use std::io::{Read, Write};
-    let mut rutas: BTreeSet<PathBuf> = BTreeSet::from([lote.carpeta.join("resumen.json")]);
+    use std::io::Write;
+    let mut rutas: BTreeSet<PathBuf> = BTreeSet::from([paquete::dentro(&lote.carpeta, "resumen.json")?]);
     for (q, m) in &lote.consultas {
         if let Some(v) = q["verificacion"].as_str().filter(|v| !v.is_empty()) {
             rutas.insert(paquete::dentro(&lote.carpeta, v)?);
@@ -527,8 +533,11 @@ pub fn exportar_zip(lote: &Lote, ahora: &Ahora) -> Result<PathBuf, String> {
     let nombre = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let mut archivos = Vec::new();
     let mut entradas = Vec::new();
+    let mut total = 0u64;
     for r in &rutas {
-        let b = std::fs::read(r).map_err(|e| format!("No se pudo leer un archivo del lote: {e}"))?;
+        let max = super::xls::MAX_ENTRADA.min((200u64 * 1024 * 1024).saturating_sub(total));
+        let b = paquete::leer_archivo_acotado(r, max).map_err(|e| format!("No se pudo leer un archivo del lote: {e}"))?;
+        total += b.len() as u64;
         entradas.push(json!({"archivo": nombre(r), "bytes": b.len(), "sha256": sha256(&b)}));
         archivos.push((nombre(r), b));
     }
@@ -547,10 +556,9 @@ pub fn exportar_zip(lote: &Lote, ahora: &Ahora) -> Result<PathBuf, String> {
         zip.write_all(&b).map_err(|x| x.to_string())?;
     }
     let bytes = zip.finish().map_err(e)?.into_inner();
-    let mut lectura = zip::ZipArchive::new(std::io::Cursor::new(bytes.clone())).map_err(e)?;
+    let mut lectura = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).map_err(e)?;
     for (n, b) in &archivos {
-        let mut copia = Vec::new();
-        lectura.by_name(n).map_err(e)?.read_to_end(&mut copia).map_err(|x| x.to_string())?;
+        let copia = super::xls::leer_acotado(lectura.by_name(n).map_err(e)?, b.len() as u64)?;
         if sha256(&copia) != sha256(b) {
             return Err("Un archivo cambió durante la entrega.".into());
         }
