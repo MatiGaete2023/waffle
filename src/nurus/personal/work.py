@@ -503,10 +503,12 @@ class Work:
                             'Días negativos y egreso futuro: verifica la contradicción; no se afirma que la medida esté vencida.'
                         )
                         ctx['invalid'].append('CUMPLIMIENTO.C04_VENCIDA')
-                court = tribunal(values.get(cols.get('tribunal', ''), '')) or ''
+                from .motor.utilidades import perfil_tribunal
+
+                court = perfil_tribunal(values.get(cols.get('tribunal', ''), '')) or ''
                 if not court:
                     warnings.append(
-                        'Tribunal fuera de Laja, Mulchén y Tomé: sin reglas configuradas; requiere revisión manual.'
+                        'Tribunal sin identificar o ambiguo: sin reglas configuradas; requiere revisión manual.'
                     )
                 key = tuple(historical_match(values.get(cols.get(k, ''), '')) for k in key_fields)
                 args = {'incidencias': inc, 'fila_excel': record.source.row_number}

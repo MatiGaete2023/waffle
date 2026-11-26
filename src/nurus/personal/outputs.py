@@ -434,9 +434,9 @@ def prepare_drafts(
             or not selected_row(work, row, modality_keys)
         ):
             continue
-        from nurus.rus.util import tribunal
+        from .motor.utilidades import perfil_tribunal
 
-        if tribunal(value(work, row, 'tribunal')) is None:
+        if perfil_tribunal(value(work, row, 'tribunal')) is None:
             continue
         # Las comunicaciones automáticas respetan la regla por fila. Una entrada externa
         # sin trazabilidad solo conserva el uso histórico cuando el tipo se pidió de forma
