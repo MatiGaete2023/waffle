@@ -8,16 +8,17 @@ La versión anterior, con los comandos de PowerShell paso a paso y el crate `.ai
 |---|---|---|
 | Rápido | Mientras se trabaja un módulo | `tools/probar_app.sh rapido <filtro>` |
 | Completo | Antes de publicar un encargo | `tools/probar_app.sh todo` |
-| CI | En cada push que toca `app/` | Flujo «Flow Rust local · Windows» |
+| Crates reutilizados | Si cambia `rust/crates/` | `cargo test --manifest-path rust/Cargo.toml --locked -p flow-meta4 -p flow-anonimo --features serde_json/preserve_order` |
+| Clippy | Antes de publicar cambios en `app/` | `cargo clippy --manifest-path app/Cargo.toml --locked --lib -- -D warnings` |
+| CI | En cada push a `estudio/paridad-python-rust-20261119` o `estudio/agente-*` | Flujo [`.github/workflows/flow-rust-local.yml`](../../.github/workflows/flow-rust-local.yml) |
 
-- El script fija `FLOW_CASOS`, `FLOW_FIXTURES` y `FLOW_REFERENCIA` con los datos del repositorio, agrega `--features eframe/x11` en Linux y muestra solo las líneas de resultado y los fallos.
+- `tools/probar_app.sh` fija `FLOW_CASOS`, `FLOW_FIXTURES` y `FLOW_REFERENCIA` con los datos del repositorio y filtra la salida a resultados y fallos.
 - `todo` agrega `--include-ignored`: corre los oráculos (`oraculo_python`, `oraculo_historia`, paquete B, cronología) y las pruebas con datos versionados.
-- Resultado de referencia en Linux (24-nov-2026): biblioteca `61 passed`, binario `43 passed; 10 filtered out`, en unos 5 s con la compilación en caché.
-- Sin el script, en Linux: `cargo test --manifest-path app/Cargo.toml --locked --features eframe/x11`. Sin esa característica la compilación falla con `not supported by winit`.
+- En Linux, `eframe/x11` ya está declarado en `app/Cargo.toml` bajo `[target.'cfg(target_os = "linux")'.dependencies]` (E-V2), por lo que `cargo test --manifest-path app/Cargo.toml --locked --all-targets` compila y corre sin banderas adicionales.
 
 ## Pruebas que necesitan un ZIP generado por Flow Python
 
-Quedan fuera de `todo` si falta la variable. La CI las ejecuta siempre.
+Quedan fuera de `todo` si falta `FLOW_E3_PAQUETE`. La CI de Windows las ejecuta siempre.
 
 ```bash
 python app/qa/generar_contexto_e3.py <checkout de flow-python> <carpeta>
@@ -30,22 +31,30 @@ tools/probar_app.sh todo
 
 Requiere Python 3.12 con `requirements/linux-py312.lock` o `windows-py312.lock`. `exporta_mismo_lote_de_python` (`FLOW_P2_PAQUETE`) y `velocidad_20000` se omiten por diseño.
 
-## Oráculos grabados
+## Oráculos grabados (23)
 
-- Datos: `app/tests/datos/{a78,lecturas,vinculos,bitacoras,lote,paquete,excel}.json`. Generadores: `app/qa/generar_<nombre>.py`.
-- Regenerar solo si cambian el generador o la referencia Python: `python app/qa/generar_<nombre>.py` y revisar `git diff -- app/tests/datos`.
-- Corpus del motor: `rust/casos/*.json`, generado por `rust/oraculo/generar_casos.py`.
+- Datos en `app/tests/datos/`: `a78`, `anulaciones`, `archivo_local`, `bitacoras`, `catastro`, `conciliacion`, `correos`, `estadisticas`, `excel`, `flujo_csmp`, `flujo_paquete`, `historial_local`, `lecturas`, `lote`, `meta4`, `ordenes`, `paquete`, `personalizacion`, `resultados`, `sync`, `sync_paquete`, `vinculos` y `word_tribunal` (`.json`).
+- Generadores: `app/qa/generar_<nombre>.py`. Regenerar solo si cambian el generador o la referencia Python (`app/qa/REFERENCIA_PYTHON.json`), y revisar `git diff -- app/tests/datos`.
+- Corpus del motor: `rust/casos/*.json`, generado por `rust/oraculo/generar_casos.py` y verificado con `cargo test --manifest-path rust/Cargo.toml --locked -p flow-motor`.
 
 ## Verificadores estáticos
 
-Solo cuando el cambio toca lo que revisan; la CI los corre siempre.
+Solo se corren en local cuando el cambio toca lo que revisan; la CI (`linux`) los corre en cada push:
 
-- Identidades y contactos, antes de publicar datos o fixtures nuevos: `python tools/check_real_ids.py app/src app/tests` y `python tools/check_contactos.py app/src`.
-- Textos y umbrales, si cambia `config.rs`: `python tools/verificar_textos_umbrales.py`.
-- Escrituras a disco, si se agrega una: `python tools/inventario_escrituras.py`.
+```bash
+python3 tools/check_real_ids.py app/src
+python3 tools/check_contactos.py app/src
+python3 tools/verificar_textos_umbrales.py
+python3 tools/inventario_escrituras.py
+python3 tools/verificar_solo_lectura.py --autoprueba
+python3 tools/verificar_solo_lectura.py
+python3 tools/verificar_referencia_python.py
+python3 tools/check_links.py
+```
 
-## Windows
+## Windows y entrega
 
-- El `.exe` sale del artefacto `Flow_Rust_Windows_exe` del flujo, con su `SHA256.txt`. Las capturas salen en `Flow_Rust_Local_Capturas_Windows` y se comparan con [DISENO.md](DISENO.md).
-- La sesión en la nube no puede descargar artefactos de Actions: la revisión visual y la prueba con Chrome, SITFA y Outlook reales son del usuario.
-- Compilar para Windows desde Linux, sin ejecutar: `rustup target add x86_64-pc-windows-gnu` y `cargo check --manifest-path app/Cargo.toml --locked --target x86_64-pc-windows-gnu --all-targets`.
+- El `.exe` y el instalador salen en el artefacto `Flow_Rust_Windows_exe` (`flow_rust.exe`, `SHA256.txt`, `Instalar_Flow.cmd`, `Instalar_Flow.ps1`, `Desinstalar_Flow.ps1`, `LEEME.txt` y, con `entrega=true`, el instalador Inno Setup `Instalar_Flow_Rust_*_Windows.exe`).
+- Con `workflow_dispatch` y `entrega=true`, la CI además compila `--release`, corre `--self-test`, verifica el contraste V1 con `rust/` y sube las capturas sintéticas en `Flow_Rust_Local_Capturas_Windows` (contrastables con [DISENO.md](DISENO.md)).
+- Verificación del instalador en Windows: `./tools/verify_flow_rust_installer.ps1 -BundleDir app/target/entrega`.
+- Comprobación cruzada desde Linux (sin ejecutar): `rustup target add x86_64-pc-windows-gnu` y `cargo check --manifest-path app/Cargo.toml --locked --target x86_64-pc-windows-gnu --all-targets`.

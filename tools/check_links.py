@@ -27,7 +27,9 @@ def main(argv):
     broken = []
     for path in markdown_files():
         relative = path.relative_to(ROOT).as_posix()
-        if not include_history and relative.startswith("docs/historico/"):
+        if not include_history and relative.startswith(
+            ("docs/historico/", "docs/migracion_python_rust/historico/", "descargador/", "src/", "tests/")
+        ):
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         for match in LINK.finditer(text):

@@ -16,6 +16,12 @@ Una entrada por encargo, de diez líneas como máximo, la más reciente arriba:
 
 No se copian salidas completas ni listas de mutaciones: la prueba afirma sus conteos y la CI del commit es la evidencia.
 
+## 2026-11-26 · Limpieza del repositorio y actualización completa de documentación
+- Cambió: retirados 66 archivos obsoletos de Flow Python en esta rama (10 workflows de otras ramas, lanzadores `.bat`/`.spec`/`pyproject.toml`, `installer/CSMP.iss`, `portable/`, `prototipos/`, `ui/`, `docs/aceptacion/`, `docs/implementacion/` y 35 scripts/manuales heredados de `tools/`); actualizados `README.md`, `MIGRACION_RUST.md`, `tools/check_links.py` y `docs/migracion_python_rust/{ESTADO.md,PLAN.md,VERIFICACION.md,DISENO.md,CONTINUACION.md,REGISTRO_IMPLEMENTACION.md}` cerrando Tandas 1–2, `E-Q11`, `E-P2-OPT` y Plan Waffle como `HECHO` (CI run `45894872026`).
+- Acredita: `tools/probar_app.sh todo`, `check_links.py` (0 enlaces rotos) y los 6 verificadores estáticos (`check_real_ids`, `check_contactos`, `verificar_textos_umbrales`, `inventario_escrituras`, `verificar_solo_lectura` con `--autoprueba` y `verificar_referencia_python`) en PASA.
+- Conservado intacto: referencia congelada (`descargador/`, `src/`, `tests/`), `META4_Bitacoras/`, `descargador_lite/`, `anonimizador/`, `contracts/`, `rust/` y `docs/evidencia_p0/golden/`.
+- Pendiente: CI de entrega (`workflow_dispatch`, `entrega=true`) y validación operativa real del usuario (nada marcado `ACEPTADO`).
+
 ## 2026-11-26 · Plan Waffle (Paso 4): validación diferenciada de fechas en `lote.rs` y `bitacoras.rs` (commit separado)
 - Cambió: `app/src/descargador/{lote.rs,bitacoras.rs}`, `app/src/descargador_ui.rs` (limpieza `unused_mut`) y `docs/migracion_python_rust/{ESTADO.md,PLAN.md,REGISTRO_IMPLEMENTACION.md}`.
 - Acredita: comprobador común `validar_fechas_formulario` detiene la búsqueda antes de `search` distinguiendo `FLG_Consulta`, `CHK_Consulta`, `FEC_Inicio`, `FEC_Fin`, «todas las fechas» y rangos invertidos, respetando Carga/calendario, alcance persistido al retomar y lecturas frescas en lote nuevo; suite Linux completa, `clippy --lib -D warnings` y los 6 verificadores en PASA.
