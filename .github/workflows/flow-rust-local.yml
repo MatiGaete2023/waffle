@@ -265,3 +265,4 @@ jobs:
           path: app/target/capturas/
           if-no-files-found: error
           retention-days: 14
+ 
