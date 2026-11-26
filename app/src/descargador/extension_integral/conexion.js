@@ -62,7 +62,14 @@ async function bridge(path,body) {
   if (!response.ok) throw failure(["CONNECTION_CODE","EXTENSION_ORIGIN","EXTENSION_CHANGED","TASK_EXPIRED","PAYLOAD_TOO_LARGE","LOCAL_TIMEOUT"].includes(data?.error)?data.error:"LOCAL_PROTOCOL");
   return data;
 }
+const allowedCommands=new Set([
+  "catalog","capabilities","lock","unlock","prepare","search","download",
+  "evidence_open","evidence_capture","evidence_close",
+  "diary_open","history_open","calendar_open","historico_open",
+]);
+const allowedInjectCommands=new Set([...allowedCommands,"evidence_show","navigate"]);
 async function inject(command,payload={}) {
+  if(!allowedInjectCommands.has(command)) throw failure("SITFA_TASK");
   let results;
   try {
     results=await chrome.scripting.executeScript({target:frameId===null||command==="catalog"?{tabId,allFrames:true}:{tabId,frameIds:[frameId]},
@@ -76,6 +83,7 @@ async function inject(command,payload={}) {
   frameId=candidates[0].frameId;return candidates[0].result;
 }
 async function execute(command,payload={}) {
+  if(!allowedCommands.has(command)) throw failure("SITFA_TASK");
   if(command==="evidence_capture") {
     let changed=false,stage="pestaña";
     const activated=info=>{if(info.windowId===windowId&&info.tabId!==tabId)changed=true;};
@@ -166,7 +174,9 @@ byId("connect").addEventListener("click",async()=>{
           if(++fallas>=2)degradado=true;
           status(messages[error.code]);
           // Entrega el diagnóstico pequeño al mismo solicitante; no repite la lectura SITFA.
-          await bridge("/complete",{id:task.id,ok:false,error:error.code});return;
+          try {await bridge("/complete",{id:task.id,ok:false,error:error.code});}
+          catch(e){if(e?.code!=="TASK_EXPIRED")throw e;}
+          return;
         }
         throw error;
       }

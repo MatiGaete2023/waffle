@@ -5,6 +5,7 @@
 use crate::theme::{self, Pal};
 use chrono::NaiveDate;
 use egui::{RichText, Ui};
+use flow_rust::descargador::preferencias::Preferencias;
 use flow_rust::descargador::{flujo_paquete, meta4};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -39,6 +40,7 @@ pub struct Meta4Vista {
     pub estado: Option<Result<String, String>>,
     pub avisos: Vec<String>,
     pub ultima: Option<PathBuf>,
+    recientes: Option<Vec<PathBuf>>,
     ocupado: bool,
     recepcion: Option<Receiver<Mensaje>>,
 }
@@ -66,6 +68,7 @@ impl Default for Meta4Vista {
             estado: None,
             avisos: Vec::new(),
             ultima: None,
+            recientes: None,
             ocupado: false,
             recepcion: None,
         }
@@ -372,6 +375,42 @@ impl Meta4Vista {
                     self.seleccion_lote = None;
                     self.refrescar(&ctx);
                 }
+                let recientes = self.recientes.get_or_insert_with(|| {
+                    Preferencias::cargar(&Preferencias::ruta())
+                        .historial_lotes
+                        .into_iter()
+                        .map(PathBuf::from)
+                        .filter(|ruta| ruta.is_dir())
+                        .collect()
+                });
+                let mut elegir_reciente: Option<PathBuf> = None;
+                let mut refrescar_recientes = false;
+                if !recientes.is_empty() {
+                    egui::ComboBox::from_id_salt("meta4_lotes_recientes")
+                        .selected_text("Lotes recientes del Descargador…")
+                        .show_ui(ui, |ui| {
+                            for ruta in recientes.iter() {
+                                let ya = self.lotes.contains(ruta);
+                                let nombre = ruta.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| ruta.display().to_string());
+                                if ui.add_enabled(!self.ocupado && !ya, egui::Button::new(nombre)).on_hover_text(ruta.display().to_string()).clicked() {
+                                    elegir_reciente = Some(ruta.clone());
+                                }
+                            }
+                        });
+                }
+                if ui.add_enabled(!self.ocupado, egui::Button::new("↻")).on_hover_text("Actualizar lista de lotes recientes").clicked() {
+                    refrescar_recientes = true;
+                }
+                if refrescar_recientes {
+                    self.recientes = None;
+                }
+                if let Some(c) = elegir_reciente {
+                    if !self.lotes.contains(&c) {
+                        self.lotes.push(c);
+                        self.proponer_corte();
+                        self.refrescar(&ctx);
+                    }
+                }
             });
         });
         ui.add_space(8.0);
@@ -423,7 +462,7 @@ impl Meta4Vista {
                     "Período de búsqueda: {} al {}, ambos incluidos.",
                     a.format("%d/%m/%Y"), b.format("%d/%m/%Y")
                 )).color(p.muted)); }
-                Err(e) => { ui.label(RichText::new(e).color(p.amber)); }
+                Err(e) => { ui.label(RichText::new(e).color(p.red)); }
             }
             if !self.tribunales.is_empty() {
                 ui.label("Tribunales (todos marcados = todos)");
@@ -462,10 +501,7 @@ impl Meta4Vista {
             });
             ui.horizontal_wrapped(|ui| {
                 let listo = !self.ocupado && !self.lotes.is_empty() && (!sin_acreditar(&self.alcance_ingresos) || self.aceptar_sin_acreditar);
-                if ui
-                    .add_enabled(listo, egui::Button::new(RichText::new("Generar Meta 4").color(egui::Color32::WHITE).strong()).fill(p.accent))
-                    .clicked()
-                {
+                if ui.add_enabled_ui(listo, |ui| theme::primary(ui, p, "Generar Meta 4")).inner.clicked() {
                     self.lanzar_generar(&ctx);
                 }
                 if ui.add_enabled(!self.ocupado, egui::Button::new("Regenerar desde Registros revisado…")).clicked() {
@@ -492,7 +528,7 @@ impl Meta4Vista {
                     ui.label(RichText::new(t).color(p.green));
                 }
                 Some(Err(e)) => {
-                    ui.label(RichText::new(e).color(p.amber));
+                    ui.label(RichText::new(e).color(p.red));
                 }
                 None => {}
             }

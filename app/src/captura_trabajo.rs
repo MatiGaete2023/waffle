@@ -47,26 +47,31 @@ impl PaqueteTrabajo {
     /// Incidencias del paquete agrupadas por código y mensaje, de la más repetida a la menos. El paquete conserva una
     /// fila por registro (contrato de Flow Python); aquí se muestran una sola vez, con su cantidad.
     pub fn avisos_agrupados(&self) -> Vec<AvisoPaquete> {
-        let mut grupos: Vec<(AvisoPaquete, HashSet<String>)> = Vec::new();
+        let mut grupos: HashMap<(&str, &str, &str), (AvisoPaquete, HashSet<&str>)> = HashMap::new();
         for i in self.fuente.filas("incidencias") {
             let clave = (i.get("code"), i.get("severity"), i.get("message"));
-            let pos = grupos.iter().position(|(a, _)| (a.codigo.as_str(), a.severidad.as_str(), a.mensaje.as_str()) == clave);
-            let (aviso, consultas) = match pos {
-                Some(p) => &mut grupos[p],
-                None => {
-                    grupos.push((
-                        AvisoPaquete { codigo: clave.0.into(), severidad: clave.1.into(), mensaje: clave.2.into(), incidencias: 0, consultas: 0 },
-                        HashSet::new(),
-                    ));
-                    grupos.last_mut().unwrap()
-                }
-            };
+            let (aviso, consultas) = grupos.entry(clave).or_insert_with(|| {
+                (
+                    AvisoPaquete {
+                        codigo: clave.0.into(),
+                        severidad: clave.1.into(),
+                        mensaje: clave.2.into(),
+                        incidencias: 0,
+                        consultas: 0,
+                    },
+                    HashSet::new(),
+                )
+            });
             aviso.incidencias += 1;
-            consultas.insert(i.get("query_id").to_string());
+            consultas.insert(i.get("query_id"));
             aviso.consultas = consultas.len();
         }
-        let mut avisos: Vec<_> = grupos.into_iter().map(|(a, _)| a).collect();
-        avisos.sort_by_key(|a| std::cmp::Reverse(a.incidencias));
+        let mut avisos: Vec<_> = grupos.into_values().map(|(a, _)| a).collect();
+        avisos.sort_by(|a, b| {
+            b.incidencias
+                .cmp(&a.incidencias)
+                .then_with(|| (&a.codigo, &a.severidad, &a.mensaje).cmp(&(&b.codigo, &b.severidad, &b.mensaje)))
+        });
         avisos
     }
 

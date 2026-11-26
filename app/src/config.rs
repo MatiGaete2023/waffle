@@ -480,12 +480,7 @@ impl Config {
 
 /// Guardado atómico: escribe un temporal y lo renombra.
 pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
-    if let Some(p) = path.parent() {
-        std::fs::create_dir_all(p)?;
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)
+    crate::util::guardar_atomico(path, data).map_err(std::io::Error::other)
 }
 
 pub fn save(c: &Config) -> Result<(), String> {

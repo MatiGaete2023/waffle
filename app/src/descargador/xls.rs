@@ -199,7 +199,7 @@ fn texto_celda_con(dato: &Data, formato_fecha: &str) -> String {
 
 fn grillas_calamine_con(datos: &[u8], formato_fecha: &str) -> Result<Vec<Grilla>, String> {
     if datos.starts_with(b"PK\x03\x04") { validar_zip_excel(datos)?; }
-    let mut libro = calamine::open_workbook_auto_from_rs(Cursor::new(datos.to_vec()))
+    let mut libro = calamine::open_workbook_auto_from_rs(Cursor::new(datos))
         .map_err(|_| "No se pudo abrir/parsear el archivo Excel; requiere revision local.")?;
     let mut celdas = 0usize;
     let mut grillas = Vec::new();
@@ -467,7 +467,7 @@ pub fn grilla_tipada(datos: &[u8], carga: bool) -> Result<Vec<Vec<Celda>>, Strin
         return Ok(texto[i].iter().map(|f| f.iter().map(|v| Celda::Texto(v.clone())).collect()).collect());
     }
     let biff = formato == "XLS-BIFF";
-    let mut libro = calamine::open_workbook_auto_from_rs(Cursor::new(datos.to_vec()))
+    let mut libro = calamine::open_workbook_auto_from_rs(Cursor::new(datos))
         .map_err(|_| "No se pudo abrir/parsear el archivo Excel; requiere revision local.")?;
     let (_, rango) = libro.worksheets().into_iter().nth(i).ok_or("Hoja del listado ausente.")?;
     Ok(rango

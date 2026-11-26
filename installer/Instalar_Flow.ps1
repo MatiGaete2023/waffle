@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$SourceDir = $PSScriptRoot,
     [string]$Destination = (Join-Path $env:LOCALAPPDATA 'Programs\FlowRust'),
     [string]$DataBaseDir = (Join-Path $env:LOCALAPPDATA 'FlowRust'),
@@ -269,11 +269,10 @@ if ($CreateDesktopShortcut -and $DesktopDir) {
 
 if (-not $SkipRegistry -and $UninstallRegistryKey) {
     New-Item -Path $UninstallRegistryKey -Force | Out-Null
-    # Comando PowerShell con literales escapados, sin alternativa de borrado recursivo.
-    $quotedDest = $destFull.Replace("'", "''")
-    $quotedScript = $uninstallDest.Replace("'", "''")
-    $uninstCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command `"& '$quotedScript' -Destination '$quotedDest'`""
-    $quietCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command `"& '$quotedScript' -Destination '$quotedDest' -Silent`""
+    # Comando PowerShell con ruta absoluta y -File (sin evaluación de expresiones).
+    $psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $uninstCmd = "`"$psExe`" -NoProfile -ExecutionPolicy Bypass -File `"$uninstallDest`" -Destination `"$destFull`""
+    $quietCmd = "`"$psExe`" -NoProfile -ExecutionPolicy Bypass -File `"$uninstallDest`" -Destination `"$destFull`" -Silent"
     New-ItemProperty -Path $UninstallRegistryKey -Name 'DisplayName' -Value 'Flow Rust' -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $UninstallRegistryKey -Name 'DisplayVersion' -Value $Version -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $UninstallRegistryKey -Name 'Publisher' -Value 'NuRus' -PropertyType String -Force | Out-Null

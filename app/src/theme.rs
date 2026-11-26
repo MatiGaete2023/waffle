@@ -13,6 +13,7 @@ pub struct Pal {
     pub accent: Color32,
     pub accent_soft: Color32,
     pub primary_bg: Color32,
+    pub danger_bg: Color32,
     pub reviewed_bg: Color32,
     pub green: Color32,
     pub amber: Color32,
@@ -34,10 +35,11 @@ pub fn pal(dark: bool) -> Pal {
             accent: Color32::from_rgb(96, 145, 255),
             accent_soft: Color32::from_rgb(36, 50, 84),
             primary_bg: Color32::from_rgb(37, 99, 235),
+            danger_bg: Color32::from_rgb(185, 28, 28),
             reviewed_bg: Color32::from_rgb(16, 122, 74),
             green: Color32::from_rgb(70, 190, 130),
             amber: Color32::from_rgb(235, 170, 60),
-            red: Color32::from_rgb(240, 100, 100),
+            red: Color32::from_rgb(248, 113, 113),
             gray: Color32::from_rgb(120, 128, 142),
             nav: Color32::from_rgb(13, 16, 22),
             nav_text: Color32::from_rgb(200, 207, 220),
@@ -53,10 +55,11 @@ pub fn pal(dark: bool) -> Pal {
             accent: Color32::from_rgb(37, 99, 235),
             accent_soft: Color32::from_rgb(226, 236, 254),
             primary_bg: Color32::from_rgb(37, 99, 235),
+            danger_bg: Color32::from_rgb(185, 28, 28),
             reviewed_bg: Color32::from_rgb(15, 118, 70),
             green: Color32::from_rgb(15, 118, 70),
             amber: Color32::from_rgb(161, 98, 7),
-            red: Color32::from_rgb(210, 55, 55),
+            red: Color32::from_rgb(198, 40, 40),
             gray: Color32::from_rgb(130, 138, 152),
             nav: Color32::from_rgb(22, 30, 48),
             nav_text: Color32::from_rgb(205, 213, 230),
@@ -125,6 +128,46 @@ pub fn primary(ui: &mut Ui, p: &Pal, text: &str) -> egui::Response {
     ui.add(egui::Button::new(RichText::new(text).color(Color32::WHITE).strong()).fill(p.primary_bg).corner_radius(CornerRadius::same(7)))
 }
 
+pub fn danger_button(ui: &mut Ui, p: &Pal, text: &str) -> egui::Response {
+    ui.add(egui::Button::new(RichText::new(text).color(Color32::WHITE).strong()).fill(p.danger_bg).corner_radius(CornerRadius::same(7)))
+}
+
+pub fn status_pill(ui: &mut Ui, dot_color: Color32, text: &str, p: &Pal, dark: bool) {
+    let fill = if dark { dot_color.gamma_multiply(0.20) } else { dot_color.gamma_multiply(0.10) };
+    Frame::new()
+        .fill(fill)
+        .stroke(Stroke::new(1.0_f32, dot_color.gamma_multiply(0.35)))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                ui.label(RichText::new("●").size(10.0).color(dot_color));
+                ui.label(RichText::new(text).size(12.0).color(p.text));
+            });
+        });
+}
+
+pub fn segmented_tab<V: PartialEq>(ui: &mut Ui, current: &mut V, value: V, label: &str, p: &Pal) -> egui::Response {
+    let active = *current == value;
+    let btn = if active {
+        egui::Button::new(RichText::new(label).color(Color32::WHITE).strong())
+            .fill(p.primary_bg)
+            .stroke(Stroke::NONE)
+            .corner_radius(CornerRadius::same(7))
+    } else {
+        egui::Button::new(RichText::new(label).color(p.text))
+            .fill(p.card)
+            .stroke(Stroke::new(1.0_f32, p.border))
+            .corner_radius(CornerRadius::same(7))
+    };
+    let resp = ui.add(btn);
+    if resp.clicked() {
+        *current = value;
+    }
+    resp
+}
+
 pub fn titulo(ui: &mut Ui, p: &Pal, t: &str, sub: &str) {
     ui.label(RichText::new(t).size(22.0).strong().color(p.text));
     if !sub.is_empty() {
@@ -153,7 +196,17 @@ mod pruebas_contraste {
     fn cinco_pares_aa_sin_redondear() {
         let claro = pal(false);
         let oscuro = pal(true);
-        for color in [claro.amber, claro.green, claro.muted, oscuro.primary_bg, oscuro.reviewed_bg] {
+        for color in [
+            claro.amber,
+            claro.green,
+            claro.muted,
+            claro.red,
+            claro.primary_bg,
+            claro.danger_bg,
+            oscuro.primary_bg,
+            oscuro.danger_bg,
+            oscuro.reviewed_bg,
+        ] {
             let ratio = (luminancia(Color32::WHITE) + 0.05) / (luminancia(color) + 0.05);
             assert!(ratio >= 4.5, "{color:?}: {ratio}");
         }

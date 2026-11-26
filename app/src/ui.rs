@@ -66,6 +66,37 @@ struct DialogoSincronia {
     filas: Vec<Vec<Cell>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SortCol {
+    Estado,
+    Rit,
+    Nombre,
+    Programa,
+    Tribunal,
+}
+
+struct ViewCache {
+    rev_conteos: u64,
+    conteos: std::collections::BTreeMap<&'static str, usize>,
+    rev_avisos: u64,
+    avisos_paquete: Vec<crate::captura_trabajo::AvisoPaquete>,
+    exe_actual: Option<Option<PathBuf>>,
+    tiene_anterior: Option<bool>,
+}
+
+impl Default for ViewCache {
+    fn default() -> Self {
+        Self {
+            rev_conteos: u64::MAX,
+            conteos: std::collections::BTreeMap::new(),
+            rev_avisos: u64::MAX,
+            avisos_paquete: Vec::new(),
+            exe_actual: None,
+            tiene_anterior: None,
+        }
+    }
+}
+
 // Un canal de resultados y otro de progreso. No se hace join en el hilo de egui.
 #[derive(Clone)]
 struct Progreso {
@@ -299,6 +330,8 @@ pub struct App {
     ultima_marca: Option<usize>,
     cache_key: String,
     cache: Vec<usize>,
+    sort: Option<(SortCol, bool)>,
+    view_cache: ViewCache,
     revision: u64,
     /// Qué productos preparados quedaron desactualizados (se recalcula cuando cambia `revision`).
     obsoletos: (u64, Vec<bool>, Vec<bool>),
@@ -331,6 +364,7 @@ pub struct App {
     /// Lo que se está editando en cada fila de contactos (correos y alias) antes de guardarlo.
     contactos_pendientes: BTreeSet<String>,
     cfg_sucia: bool,
+    cfg_guardar_en: Option<Instant>,
     contacto_buf: std::collections::BTreeMap<String, (String, String)>,
     /// Anulaciones de columnas de origen en edición para la fila seleccionada: (fila, revisión, mapa clave → texto).
     origen_buf: Option<(usize, u64, std::collections::BTreeMap<String, String>)>,
@@ -398,6 +432,8 @@ impl App {
             ultima_marca: None,
             cache_key: String::new(),
             cache: vec![],
+            sort: None,
+            view_cache: ViewCache::default(),
             revision: 0,
             obsoletos: (u64::MAX, Vec::new(), Vec::new()),
             trib_cache: (u64::MAX, vec![]),
@@ -422,6 +458,7 @@ impl App {
             contacto_buf: std::collections::BTreeMap::new(),
             contactos_pendientes: BTreeSet::new(),
             cfg_sucia: false,
+            cfg_guardar_en: None,
             origen_buf: None,
             plantilla_sel: "espera".into(),
             plantilla_edicion: None,
@@ -567,6 +604,7 @@ impl App {
 
     fn guardar_cfg(&mut self) {
         self.revision += 1;
+        self.cfg_guardar_en = None;
         if self.screenshot.is_some() {
             return;
         }
@@ -575,6 +613,15 @@ impl App {
             self.cfg_sucia = true;
             self.aviso(format!("No se pudo guardar la configuración: {e}"), true);
         }
+    }
+
+    fn marcar_cfg_sucia(&mut self) {
+        self.revision += 1;
+        if self.screenshot.is_some() {
+            return;
+        }
+        self.cfg_sucia = true;
+        self.cfg_guardar_en = Some(Instant::now());
     }
 
     fn marcar_sucio(&mut self) {
@@ -1022,15 +1069,42 @@ impl App {
             }
         }
         self.sondear_producto();
-        if let Some((job, _)) = &self.producto_job {
+        let p = self.p();
+        if let Some(job_estado) = self.producto_job.as_ref().map(|(job, _)| job.estado.clone()) {
             if ctx.input(|i| i.viewport().close_requested()) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.heading("Operación en curso");
-                ui.horizontal(|ui| { ui.spinner(); ui.label(&job.estado); });
-                ui.label("La ventana sigue respondiendo. La edición y el cierre se habilitan al confirmar el resultado, para proteger las decisiones y recibos.");
-            });
+            self.nav(ctx, &p);
+            self.barra_estado_global(ctx, &p);
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(p.bg))
+                .show(ctx, |_ui| {});
+            egui::Area::new(egui::Id::new("progreso_overlay"))
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(p.panel)
+                        .stroke(egui::Stroke::new(1.0_f32, p.border))
+                        .corner_radius(10)
+                        .inner_margin(20)
+                        .shadow(egui::Shadow { offset: [0, 4], blur: 18, spread: 0, color: Color32::from_black_alpha(60) })
+                        .show(ui, |ui| {
+                            ui.set_max_width(460.0);
+                            ui.heading("Operación en curso");
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(&job_estado);
+                            });
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new("La ventana sigue respondiendo. La edición y el cierre se habilitan al confirmar el resultado, para proteger las decisiones y recibos.")
+                                    .color(p.muted)
+                                    .size(12.5),
+                            );
+                        });
+                });
             return;
         }
         if ctx.input(|i| i.viewport().close_requested()) && !self.guardar_pendiente() {
@@ -1038,6 +1112,41 @@ impl App {
         }
         let vista_anterior = self.vista;
         // Atajos
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            if self.confirmar_reinicio {
+                self.confirmar_reinicio = false;
+            } else if self.sincronia.is_some() {
+                self.sincronia = None;
+            } else if self.conciliacion.is_some() {
+                self.conciliacion = None;
+            } else if self.revision_bitacoras.is_some() {
+                self.revision_bitacoras = None;
+            }
+        }
+        if ctx.input(|i| i.key_pressed(Key::F1)) && self.guardar_pendiente() {
+            self.vista = Vista::Ajustes;
+            self.ajustes_tab = 3;
+        }
+        if self.vista == Vista::Trabajo
+            && !ctx.wants_keyboard_input()
+            && ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Z)))
+        {
+            if self.work.as_mut().is_some_and(|w| w.deshacer()) {
+                self.aviso("Edición masiva deshecha.", false);
+                self.marcar_sucio();
+            }
+        }
+        if !ctx.wants_keyboard_input() {
+            const NUM_KEYS: [Key; 9] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
+            for (idx, key) in NUM_KEYS.into_iter().enumerate() {
+                if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, key))) {
+                    if self.guardar_pendiente() {
+                        self.vista = VISTAS[idx].0;
+                    }
+                    break;
+                }
+            }
+        }
         if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::O))) {
             if self.vista == Vista::Descargador {
                 self.descargador.abrir_dialogo();
@@ -1045,7 +1154,9 @@ impl App {
                 self.abrir_dialogo();
             }
         }
-        if !matches!(self.vista, Vista::Descargador | Vista::Meta4) && ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::S))) {
+        if matches!(self.vista, Vista::Trabajo | Vista::Correos | Vista::Resoluciones | Vista::Resultados)
+            && ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::S)))
+        {
             self.iniciar_excel(ctx);
         }
         if self.producto_job.is_some() { return; }
@@ -1060,6 +1171,14 @@ impl App {
                 self.abrir(dropped[0].clone());
             }
         }
+        // Guardado automático de configuración (debounce 400 ms)
+        if let Some(t) = self.cfg_guardar_en {
+            if t.elapsed().as_millis() >= 400 && self.screenshot.is_none() {
+                self.guardar_cfg();
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+        }
         // Guardado automático de decisiones
         if let Some(t) = self.sucio {
             if t.elapsed().as_millis() > 800 && self.screenshot.is_none() {
@@ -1071,10 +1190,10 @@ impl App {
                 ctx.request_repaint_after(std::time::Duration::from_millis(300));
             }
         }
-        let p = self.p();
         self.aviso_actualizacion(ctx, &p);
         self.nav(ctx, &p);
-        if !matches!(self.vista, Vista::Descargador | Vista::Meta4) {
+        self.barra_estado_global(ctx, &p);
+        if matches!(self.vista, Vista::Trabajo | Vista::Correos | Vista::Resoluciones | Vista::Resultados) {
             self.barra(ctx, &p);
         }
         if self.producto_job.is_some() { return; }
@@ -1246,6 +1365,53 @@ impl App {
             });
     }
 
+    fn barra_estado_global(&mut self, ctx: &egui::Context, p: &Pal) {
+        let dark = self.cfg.tema_oscuro;
+        let (chrome_ok, chrome_lbl) = self.descargador.estado_barra();
+        let descarga_activa = self.descargador.activo_barra();
+        let job_activo = self.producto_job.as_ref().map(|(j, _)| j.estado.clone());
+        let buscando_act = self.actualizacion_rx.is_some();
+        let sin_guardar = self.sucio.is_some() || self.cfg_sucia;
+        let mut ir_ayuda = false;
+        egui::TopBottomPanel::bottom("estado_global")
+            .exact_height(28.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(p.panel)
+                    .inner_margin(egui::Margin::symmetric(14, 3))
+                    .stroke(egui::Stroke::new(1.0_f32, p.border)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    theme::status_pill(ui, if chrome_ok { p.green } else { p.gray }, chrome_lbl, p, dark);
+                    ui.separator();
+                    if sin_guardar {
+                        ui.label(RichText::new("● Cambios sin guardar").size(12.0).color(p.amber));
+                    } else {
+                        ui.label(RichText::new("✓ Guardado").size(12.0).color(p.green));
+                    }
+                    if let Some(estado) = job_activo.as_deref().or(descarga_activa) {
+                        ui.separator();
+                        ui.spinner();
+                        ui.label(RichText::new(estado).size(12.0).color(p.muted));
+                    } else if buscando_act {
+                        ui.separator();
+                        ui.spinner();
+                        ui.label(RichText::new("Buscando actualizaciones…").size(12.0).color(p.muted));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("? Ayuda (F1)").clicked() {
+                            ir_ayuda = true;
+                        }
+                    });
+                });
+            });
+        if ir_ayuda && self.producto_job.is_none() && self.guardar_pendiente() {
+            self.vista = Vista::Ajustes;
+            self.ajustes_tab = 3;
+        }
+    }
+
     fn avisos_panel(&mut self, ctx: &egui::Context, p: &Pal) {
         self.avisos.retain(|(_, e, t)| t.elapsed().as_secs() < if *e { 14 } else { 7 });
         if self.avisos.is_empty() {
@@ -1254,7 +1420,7 @@ impl App {
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
         let mut cerrar = None;
         egui::Area::new(egui::Id::new("avisos"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -38.0))
             .show(ctx, |ui| {
                 for (i, (t, e, _)) in self.avisos.iter().enumerate().rev().take(4) {
                     let c = if *e { p.red } else { p.accent };
@@ -1296,12 +1462,12 @@ impl App {
 
     fn filtrados(&mut self) -> Vec<usize> {
         let Some(w) = &self.work else { return vec![] };
-        let key = format!("{}|{:?}|{}|{}|{}", self.filtro, self.filtro_estado, self.filtro_trib, self.solo_marcadas, self.revision);
+        let key = format!("{}|{:?}|{}|{}|{:?}|{}", self.filtro, self.filtro_estado, self.filtro_trib, self.solo_marcadas, self.sort, self.revision);
         if key == self.cache_key {
             return self.cache.clone();
         }
         let q = clave(&self.filtro);
-        let out: Vec<usize> = w
+        let mut out: Vec<usize> = w
             .registros
             .iter()
             .enumerate()
@@ -1315,6 +1481,20 @@ impl App {
             })
             .map(|(i, _)| i)
             .collect();
+        if let Some((col, asc)) = self.sort {
+            out.sort_by(|&a, &b| {
+                let ra = &w.registros[a];
+                let rb = &w.registros[b];
+                let ord = match col {
+                    SortCol::Estado => ra.estado().label().cmp(rb.estado().label()),
+                    SortCol::Rit => clave(&w.value(ra, "rit")).cmp(&clave(&w.value(rb, "rit"))),
+                    SortCol::Nombre => clave(&limpiar_nombre(&w.value(ra, "nombre"))).cmp(&clave(&limpiar_nombre(&w.value(rb, "nombre")))),
+                    SortCol::Programa => clave(&w.value(ra, "programa")).cmp(&clave(&w.value(rb, "programa"))),
+                    SortCol::Tribunal => w.tribunal_clave(ra).cmp(&w.tribunal_clave(rb)),
+                };
+                if asc { ord } else { ord.reverse() }
+            });
+        }
         self.cache_key = key;
         self.cache = out.clone();
         out
@@ -1434,12 +1614,25 @@ impl App {
             return;
         }
         let dark = self.cfg.tema_oscuro;
-        let (conteos, total, ms, modo, cruce) = {
+        if self.view_cache.rev_conteos != self.revision {
+            self.view_cache.conteos = self.work.as_ref().unwrap().conteos();
+            self.view_cache.rev_conteos = self.revision;
+        }
+        if self.view_cache.rev_avisos != self.revision {
+            self.view_cache.avisos_paquete = self.work.as_ref().and_then(|w| w.paquete.as_ref()).map(|p| p.avisos_agrupados()).unwrap_or_default();
+            self.view_cache.rev_avisos = self.revision;
+        }
+        let (total, ms, modo, cruce) = {
             let w = self.work.as_ref().unwrap();
-            (w.conteos(), w.registros.len(), w.analisis_ms, w.mode(), w.cruce.clone())
+            (w.registros.len(), w.analisis_ms, w.mode(), w.cruce.clone())
         };
+        let n_propuesta = *self.view_cache.conteos.get("Propuesta").unwrap_or(&0);
+        let n_revisar = *self.view_cache.conteos.get("Revisar").unwrap_or(&0);
+        let n_revisada = *self.view_cache.conteos.get("Revisada").unwrap_or(&0);
+        let n_excluido = *self.view_cache.conteos.get("Excluido").unwrap_or(&0);
+        let n_sin_obs = *self.view_cache.conteos.get("Sin observación").unwrap_or(&0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("Trabajo · {}", modo.label())).size(22.0).strong());
+            ui.label(RichText::new(format!("Trabajo · {}", modo.label())).size(20.0).strong());
             ui.label(RichText::new(format!("análisis en {ms} ms{}", cruce.map(|c| format!(" · cruce con «{c}»")).unwrap_or_default())).color(p.muted).size(12.5));
         });
         let estado = self.work.as_ref().unwrap().paquete.as_ref()
@@ -1484,13 +1677,12 @@ impl App {
                 }
             });
         }
-        let avisos = self.work.as_ref().and_then(|w| w.paquete.as_ref()).map(|p| p.avisos_agrupados()).unwrap_or_default();
-        if !avisos.is_empty() {
-            let total: usize = avisos.iter().map(|a| a.incidencias).sum();
-            egui::CollapsingHeader::new(format!("Avisos del paquete · {} tipos · {total} incidencias", avisos.len()))
+        if !self.view_cache.avisos_paquete.is_empty() {
+            let total_inc: usize = self.view_cache.avisos_paquete.iter().map(|a| a.incidencias).sum();
+            egui::CollapsingHeader::new(format!("Avisos del paquete · {} tipos · {total_inc} incidencias", self.view_cache.avisos_paquete.len()))
                 .id_salt("avisos del paquete")
                 .show(ui, |ui| {
-                    for a in &avisos {
+                    for a in &self.view_cache.avisos_paquete {
                         let donde = if a.consultas == 1 { "1 consulta".to_string() } else { format!("{} consultas", a.consultas) };
                         ui.label(RichText::new(format!("{} · {} · {} en {donde}", a.codigo, a.severidad, a.incidencias)).strong());
                         ui.label(RichText::new(&a.mensaje).color(p.muted).size(12.5));
@@ -1518,41 +1710,39 @@ impl App {
                 self.registrar(json, "Revisión de bitácoras · JSON");
             }
         }
-        ui.add_space(4.0);
+        ui.add_space(2.0);
         let mut nuevo_filtro: Option<Option<Estado>> = None;
         ui.horizontal_wrapped(|ui| {
             let filtro_actual = self.filtro_estado;
             let mut tarjeta = |ui: &mut egui::Ui, label: &str, n: usize, color: Color32, estado: Option<Estado>| {
                 let activo = filtro_actual == estado;
-                let mut fr = theme::card(p).inner_margin(egui::Margin::symmetric(14, 10));
+                let mut fr = theme::card(p).inner_margin(egui::Margin::symmetric(10, 6));
                 if activo && estado.is_some() {
                     fr = fr.stroke(egui::Stroke::new(1.5_f32, color));
                 }
                 let r = fr.show(ui, |ui| {
-                    ui.set_min_width(112.0);
-                    ui.label(RichText::new(n.to_string()).size(24.0).strong().color(color));
-                    ui.label(RichText::new(label).size(12.5).color(p.muted));
+                    ui.set_min_width(94.0);
+                    ui.label(RichText::new(n.to_string()).size(19.0).strong().color(color));
+                    ui.label(RichText::new(label).size(12.0).color(p.muted));
                 });
                 if ui.interact(r.response.rect, egui::Id::new(("card", label)), egui::Sense::click()).clicked() {
                     nuevo_filtro = Some(if activo { None } else { estado });
                 }
             };
             tarjeta(ui, "Registros", total, p.text, None);
-            tarjeta(ui, "Propuestas", *conteos.get("Propuesta").unwrap_or(&0), p.accent, Some(Estado::Propuesta));
-            tarjeta(ui, "Para revisar", *conteos.get("Revisar").unwrap_or(&0), p.amber, Some(Estado::Atencion));
-            tarjeta(ui, "Revisadas", *conteos.get("Revisada").unwrap_or(&0), p.green, Some(Estado::Revisada));
-            tarjeta(ui, "Excluidos", *conteos.get("Excluido").unwrap_or(&0), p.gray, Some(Estado::Excluido));
-            tarjeta(ui, "Sin observación", *conteos.get("Sin observación").unwrap_or(&0), p.muted, Some(Estado::SinObservacion));
+            tarjeta(ui, "Propuestas", n_propuesta, p.accent, Some(Estado::Propuesta));
+            tarjeta(ui, "Para revisar", n_revisar, p.amber, Some(Estado::Atencion));
+            tarjeta(ui, "Revisadas", n_revisada, p.green, Some(Estado::Revisada));
+            tarjeta(ui, "Excluidos", n_excluido, p.gray, Some(Estado::Excluido));
+            tarjeta(ui, "Sin observación", n_sin_obs, p.muted, Some(Estado::SinObservacion));
         });
-        let revisadas = *conteos.get("Revisada").unwrap_or(&0);
-        let excluidas = *conteos.get("Excluido").unwrap_or(&0);
-        let revisables = total.saturating_sub(excluidas);
-        let fraccion = if revisables == 0 { 0.0 } else { revisadas as f32 / revisables as f32 };
-        ui.add(egui::ProgressBar::new(fraccion).text(format!("Revisión: {revisadas}/{revisables} (sin excluidas)")));
+        let revisables = total.saturating_sub(n_excluido);
+        let fraccion = if revisables == 0 { 0.0 } else { n_revisada as f32 / revisables as f32 };
+        ui.add(egui::ProgressBar::new(fraccion).desired_height(16.0).text(format!("Revisión: {n_revisada}/{revisables} (sin excluidas)")));
         if let Some(f) = nuevo_filtro {
             self.filtro_estado = f;
         }
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         if self.trib_cache.0 != self.revision {
             let w = self.work.as_ref().unwrap();
             let mut t: Vec<String> = w.registros.iter().map(|r| w.tribunal_clave(r)).collect();
@@ -1669,11 +1859,15 @@ impl App {
         };
         let mut nueva_sel = None;
         let mut cambio = false;
+        let mut toggle_all: Option<bool> = None;
+        let mut click_sort: Option<SortCol> = None;
+        let sort_actual = self.sort;
         let mayus = ui.input(|i| i.modifiers.shift);
         let mut ultima = self.ultima_marca;
         let mut rango: Option<(usize, usize, bool)> = None;
         let sel = self.sel;
         let w = self.work.as_mut().unwrap();
+        let todos_marcados = !ids.is_empty() && ids.iter().all(|&i| w.registros[i].seleccionada);
         // Anchos proporcionales al espacio: la tabla nunca se sale de su tarjeta.
         let libre = (ui.available_width() - 26.0 - 104.0 - 74.0 - 80.0 - 70.0).max(300.0);
         let mut tabla = TableBuilder::new(ui);
@@ -1694,9 +1888,38 @@ impl App {
             .column(Column::initial(80.0).at_least(50.0).clip(true))
             .column(Column::remainder().at_least(120.0).clip(true))
             .header(26.0, |mut h| {
-                for t in ["", "Estado", "RIT", "Nombre", "Programa", "Tribunal", metric_label, "Observación propuesta"] {
+                h.col(|ui| {
+                    let mut m = todos_marcados;
+                    if ui.add_enabled(!ids.is_empty(), egui::Checkbox::new(&mut m, "")).on_hover_text("Marcar o desmarcar todas las filas visibles").changed() {
+                        toggle_all = Some(m);
+                    }
+                });
+                for (t, sc) in [
+                    ("Estado", Some(SortCol::Estado)),
+                    ("RIT", Some(SortCol::Rit)),
+                    ("Nombre", Some(SortCol::Nombre)),
+                    ("Programa", Some(SortCol::Programa)),
+                    ("Tribunal", Some(SortCol::Tribunal)),
+                    (metric_label, None),
+                    ("Observación propuesta", None),
+                ] {
                     h.col(|ui| {
-                        ui.label(RichText::new(t).size(12.5).strong().color(p.muted));
+                        if let Some(col) = sc {
+                            let flecha = match sort_actual {
+                                Some((c, true)) if c == col => " ▲",
+                                Some((c, false)) if c == col => " ▼",
+                                _ => "",
+                            };
+                            let txt = RichText::new(format!("{t}{flecha}"))
+                                .size(12.5)
+                                .strong()
+                                .color(if flecha.is_empty() { p.muted } else { p.accent });
+                            if ui.add(egui::Label::new(txt).sense(egui::Sense::click())).on_hover_text("Clic para ordenar").clicked() {
+                                click_sort = Some(col);
+                            }
+                        } else {
+                            ui.label(RichText::new(t).size(12.5).strong().color(p.muted));
+                        }
                     });
                 }
             })
@@ -1711,7 +1934,8 @@ impl App {
                     let nombre = limpiar_nombre(&w.value(&w.registros[i], "nombre"));
                     let prog = w.value(&w.registros[i], "programa");
                     let metric = w.value(&w.registros[i], metric_key);
-                    let obs: String = w.registros[i].observacion().chars().take(220).collect();
+                    let obs_full = w.registros[i].observacion().to_string();
+                    let obs: String = obs_full.chars().take(220).collect();
                     let editada = w.registros[i].editada.is_some();
                     let n_acc = w.registros[i].acciones.len();
                     row.col(|ui| {
@@ -1748,7 +1972,10 @@ impl App {
                         if n_acc > 0 {
                             ui.label(RichText::new(format!("✉{n_acc}")).color(p.accent).size(12.0)).on_hover_text("Genera correos o proyectos");
                         }
-                        ui.label(RichText::new(obs).size(12.5));
+                        let lbl = ui.label(RichText::new(obs).size(12.5));
+                        if !obs_full.is_empty() {
+                            lbl.on_hover_text(obs_full);
+                        }
                     });
                     if row.response().clicked() {
                         nueva_sel = Some(i);
@@ -1759,6 +1986,19 @@ impl App {
             self.sel = Some(s);
         }
         self.ultima_marca = ultima;
+        if let (Some(marcar), Some(w)) = (toggle_all, self.work.as_mut()) {
+            for &i in ids {
+                w.registros[i].seleccionada = marcar;
+            }
+            cambio = true;
+        }
+        if let Some(col) = click_sort {
+            self.sort = match self.sort {
+                Some((c, true)) if c == col => Some((col, false)),
+                Some((c, false)) if c == col => None,
+                _ => Some((col, true)),
+            };
+        }
         if let (Some((desde, hasta, marcar)), Some(w)) = (rango, self.work.as_mut()) {
             for &i in &ids[desde..=hasta.min(ids.len().saturating_sub(1))] {
                 w.registros[i].seleccionada = marcar;
@@ -2165,7 +2405,7 @@ impl App {
                 ui.label("Se descartarán tus ediciones, marcas de revisada y filas marcadas de este archivo, y se aplicarán las reglas desde cero.");
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.add(egui::Button::new(RichText::new("Descartar y analizar").color(Color32::WHITE)).fill(p.red)).clicked() {
+                    if theme::danger_button(ui, p, "Descartar y analizar").clicked() {
                         hecho = true;
                     }
                     if ui.button("Cancelar").clicked() {
@@ -2234,7 +2474,7 @@ impl App {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let hay = self.work.is_some();
-                if ui.add_enabled(hay, egui::Button::new(RichText::new("✉  Preparar borradores").color(Color32::WHITE).strong()).fill(p.primary_bg)).clicked() {
+                if ui.add_enabled_ui(hay, |ui| theme::primary(ui, p, "✉  Preparar borradores")).inner.clicked() {
                     accion = Some("preparar");
                 }
                 let particulares: Vec<(String, String)> = self
@@ -2299,13 +2539,18 @@ impl App {
             );
             return;
         }
-        let alto = ui.available_height();
         let mut guardar_uno = None;
         let mut guardar_nomina = None;
         let mut conciliar_incierto: Option<String> = None;
         let mut correo_editado = false;
-        ui.horizontal_top(|ui| {
-            ui.allocate_ui_with_layout(egui::vec2(330.0, alto), egui::Layout::top_down(egui::Align::Min), |ui| {
+        egui::SidePanel::left("correos_lista")
+            .resizable(true)
+            .default_width(320.0)
+            .min_width(240.0)
+            .max_width(480.0)
+            .show_separator_line(false)
+            .frame(egui::Frame::new().inner_margin(egui::Margin { left: 0, right: 10, top: 0, bottom: 0 }))
+            .show_inside(ui, |ui| {
                 egui::ScrollArea::vertical().id_salt("blist").show(ui, |ui| {
                     for (j, b) in self.borradores.iter_mut().enumerate() {
                         let activo = self.bsel == Some(j);
@@ -2315,8 +2560,7 @@ impl App {
                         }
                         // El clic de la tarjeta se registra debajo del contenido: el checkbox recibe su propio clic.
                         let r = ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| fr.show(ui, |ui| {
-                            ui.set_width(300.0);
-                            ui.set_max_width(300.0);
+                            ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
                                 correo_editado |= ui.checkbox(&mut b.incluir, "").changed();
                                 ui.add(egui::Label::new(RichText::new(&b.titulo).strong().size(13.0)).truncate()).on_hover_text(&b.titulo);
@@ -2343,10 +2587,9 @@ impl App {
                     }
                 });
             });
-            ui.add_space(8.0);
+        egui::CentralPanel::default().frame(egui::Frame::new()).show_inside(ui, |ui| {
             let Some(j) = self.bsel.filter(|j| *j < self.borradores.len()) else { return };
-            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), alto), egui::Layout::top_down(egui::Align::Min), |ui| {
-                egui::ScrollArea::vertical().id_salt("bedit").show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("bedit").show(ui, |ui| {
                     self.huellas_cache.resize(self.borradores.len(), None);
                     if self.huellas_cache[j].is_none() { self.huellas_cache[j] = Some(crate::preparados::huella_borrador(&self.borradores[j])); }
                     let huella = self.huellas_cache[j].clone().unwrap_or_default();
@@ -2388,6 +2631,16 @@ impl App {
                         theme::card(p).show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             theme::seccion(ui, p, "Nómina adjunta (edita, desmarca o agrega filas antes de guardar)");
+                            let col_widths: Vec<f32> = n.headers.iter().map(|h| {
+                                let u = h.to_uppercase();
+                                if u.contains("NOMBRE") || u.contains("PROGRAMA") || u.contains("OBSERVA") {
+                                    180.0
+                                } else if u.contains("RIT") || u.contains("RUT") || u.contains("FECHA") || u.contains("TIPO") {
+                                    110.0
+                                } else {
+                                    135.0
+                                }
+                            }).collect();
                             let mut quitar = None;
                             egui::ScrollArea::horizontal().id_salt("nomina").show(ui, |ui| {
                                 egui::Grid::new("nom").striped(true).spacing([8.0, 4.0]).show(ui, |ui| {
@@ -2400,7 +2653,7 @@ impl App {
                                     for (k, row) in n.rows.iter_mut().enumerate() {
                                         correo_editado |= ui.checkbox(&mut n.incluir[k], "").changed();
                                         for (c, v) in row.iter_mut().enumerate() {
-                                            let ancho = (v.chars().count().clamp(6, 40) as f32) * 7.5;
+                                            let ancho = col_widths.get(c).copied().unwrap_or(135.0);
                                             correo_editado |= ui.add(egui::TextEdit::singleline(v).id_source(("nomina", j, k, c)).desired_width(ancho).font(egui::TextStyle::Small)).changed();
                                         }
                                         if ui.small_button("✕").on_hover_text("Quitar fila de la nómina").clicked() {
@@ -2422,7 +2675,6 @@ impl App {
                             }
                         });
                     }
-                });
             });
         });
         if correo_editado { self.marcar_sucio(); }
@@ -2560,7 +2812,7 @@ impl App {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 let hay = self.work.is_some();
-                if ui.add_enabled(hay, egui::Button::new(RichText::new("⚖  Preparar proyectos").color(Color32::WHITE).strong()).fill(p.primary_bg)).clicked() {
+                if ui.add_enabled_ui(hay, |ui| theme::primary(ui, p, "⚖  Preparar proyectos")).inner.clicked() {
                     preparar = true;
                 }
                 ui.checkbox(&mut self.solo_sel_res, "Solo filas marcadas");
@@ -2612,9 +2864,14 @@ impl App {
             return;
         }
         let mut proyecto_editado = false;
-        let alto = ui.available_height();
-        ui.horizontal_top(|ui| {
-            ui.allocate_ui_with_layout(egui::vec2(330.0, alto), egui::Layout::top_down(egui::Align::Min), |ui| {
+        egui::SidePanel::left("proyectos_lista")
+            .resizable(true)
+            .default_width(320.0)
+            .min_width(240.0)
+            .max_width(480.0)
+            .show_separator_line(false)
+            .frame(egui::Frame::new().inner_margin(egui::Margin { left: 0, right: 10, top: 0, bottom: 0 }))
+            .show_inside(ui, |ui| {
                 egui::ScrollArea::vertical().id_salt("plist").show(ui, |ui| {
                     for (j, pr) in self.proyectos.iter_mut().enumerate() {
                         let activo = self.psel == Some(j);
@@ -2624,8 +2881,7 @@ impl App {
                         }
                         // El clic de la tarjeta se registra debajo del contenido: el checkbox recibe su propio clic.
                         let r = ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| fr.show(ui, |ui| {
-                            ui.set_width(300.0);
-                            ui.set_max_width(300.0);
+                            ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
                                 proyecto_editado |= ui.checkbox(&mut pr.incluir, "").changed();
                                 ui.label(RichText::new(format!("{} · {}", pr.tipo, pr.rit)).strong().monospace());
@@ -2659,10 +2915,9 @@ impl App {
                     }
                 });
             });
-            ui.add_space(8.0);
+        egui::CentralPanel::default().frame(egui::Frame::new()).show_inside(ui, |ui| {
             let Some(j) = self.psel.filter(|j| *j < self.proyectos.len()) else { return };
-            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), alto), egui::Layout::top_down(egui::Align::Min), |ui| {
-                theme::card(p).show(ui, |ui| {
+            theme::card(p).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     let pr = &mut self.proyectos[j];
                     ui.horizontal(|ui| {
@@ -2697,7 +2952,6 @@ impl App {
                             }
                         });
                     });
-                });
             });
         });
         if proyecto_editado { self.marcar_sucio(); }
@@ -2946,7 +3200,7 @@ impl App {
             self.exportar_contactos();
         }
         if guardar {
-            self.guardar_cfg();
+            self.marcar_cfg_sucia();
         }
     }
 
@@ -3002,7 +3256,7 @@ impl App {
                 ui.label(RichText::new(t).color(p.green));
             }
             Some(Err(e)) => {
-                ui.label(RichText::new(e).color(p.amber));
+                ui.label(RichText::new(e).color(p.red));
             }
             None => {}
         }
@@ -3200,7 +3454,7 @@ impl App {
             None => {}
         }
         if let Some(e) = &self.plantilla_error {
-            ui.label(RichText::new(e).color(p.amber));
+            ui.label(RichText::new(e).color(p.red));
         }
     }
 
@@ -3303,10 +3557,7 @@ impl App {
                     ui.end_row();
                 });
                 ui.add_space(6.0);
-                if ui
-                    .add_enabled(!self.anon_files.is_empty(), egui::Button::new(RichText::new("🛡  Crear copias anonimizadas").color(Color32::WHITE).strong()).fill(p.primary_bg))
-                    .clicked()
-                {
+                if ui.add_enabled_ui(!self.anon_files.is_empty(), |ui| theme::primary(ui, p, "🛡  Crear copias anonimizadas")).inner.clicked() {
                     ejecutar = true;
                 }
             });
@@ -3513,7 +3764,10 @@ impl App {
                 theme::card(p).show(ui, |ui| {
                     theme::seccion(ui, p, "Actualizaciones");
                     let carpeta_act = crate::actualizacion::carpeta();
-                    let actual_exe = std::env::current_exe().ok();
+                    let actual_exe = self.view_cache.exe_actual.get_or_insert_with(|| std::env::current_exe().ok()).clone();
+                    let tiene_anterior = *self.view_cache.tiene_anterior.get_or_insert_with(|| {
+                        actual_exe.as_deref().and_then(crate::actualizacion::anterior).is_some()
+                    });
                     ui.label(RichText::new(format!(
                         "Para actualizar sin reinstalar, deja el flow_rust.exe nuevo (y su SHA256.txt) en {}. Flow lo detecta y se actualiza con un botón; la extensión de Chrome solo cambia si cambia su código.",
                         carpeta_act.display()
@@ -3556,14 +3810,14 @@ impl App {
                     )).color(p.muted).size(12.5));
                     ui.horizontal(|ui| {
                         if ui.button("Buscar actualización").clicked() {
+                            self.view_cache.tiene_anterior = None;
                             self.revisar_actualizacion(ui.ctx());
-
                         }
                         if ui.button("Abrir la carpeta de actualizaciones").clicked() {
                             let _ = std::fs::create_dir_all(&carpeta_act);
                             abrir_en_sistema(&carpeta_act);
                         }
-                        if actual_exe.as_deref().and_then(crate::actualizacion::anterior).is_some()
+                        if tiene_anterior
                             && ui.button("Volver a la versión anterior").on_hover_text("Intercambia este programa con la copia anterior y se reinicia.").clicked()
                         {
                             let ctx = ui.ctx().clone();
@@ -3633,7 +3887,7 @@ impl App {
             }
         });
         if guardar {
-            self.guardar_cfg();
+            self.marcar_cfg_sucia();
         }
         if reanalizar {
             self.reanalizar();

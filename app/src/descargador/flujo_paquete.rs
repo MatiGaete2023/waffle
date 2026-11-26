@@ -483,8 +483,10 @@ fn publicar_captura(nuevo: &Path, objetivo: &Path, respaldo: &Path) -> Result<()
     // Los respaldos son exclusivos, incluso si el reloj repite una marca.
     for (origen, anterior) in [(objetivo, &anterior_zip), (diagnostico.as_path(), &anterior_diag)] {
         if origen.exists() {
-            let datos = std::fs::read(origen).map_err(|e| format!("No se pudo conservar el producto anterior: {e}"))?;
-            lote::guardar_exclusivo(anterior, &datos)?;
+            if anterior.exists() {
+                return Err("El archivo ya existe y no se sobrescribe.".into());
+            }
+            std::fs::copy(origen, anterior).map_err(|e| format!("No se pudo conservar el producto anterior: {e}"))?;
         }
     }
     if tenia_diag && !diagnostico_nuevo.is_file() {
@@ -784,7 +786,10 @@ fn correr(
                 return Err(e);
             }
         };
-        checkpoint(cancelar)?;
+        if let Err(e) = checkpoint(cancelar) {
+            let _ = std::fs::remove_dir_all(&temporal);
+            return Err(e);
+        }
         publicar_captura(&nuevo, &objetivo, &respaldo)?;
         let _ = std::fs::remove_dir_all(&temporal);
         let historico_fallido = op.historico && resultado.historico_incompleto;
@@ -887,7 +892,9 @@ fn informes(
         Ok(())
     })();
     // `finally`: la consulta siguiente parte en Seguimiento; si no se puede volver, el aviso lo dirá.
-    let _ = conexion.llamar("catalog", json!({"screen": "seguimiento"}), Duration::from_secs(75));
+    if !cancelar.load(Ordering::SeqCst) {
+        let _ = conexion.llamar("catalog", json!({"screen": "seguimiento"}), Duration::from_secs(75));
+    }
     match corrida {
         Ok(()) => Ok((carpetas.clone(), carpetas.len() == meses.len())),
         Err(e) => {

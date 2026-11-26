@@ -134,6 +134,14 @@ fn json_sangrado(v: &Value) -> String {
 /// `export_book(lots, destination, csmp)`: libro con Resumen, SITFA_ARCHIVOS, una hoja por familia y esquema,
 /// Vencimientos y su metadato JSON al lado. Devuelve la ruta del XLSX.
 pub(super) fn hojas_consolidadas(lotes: &[Lote], csmp: bool) -> Result<(Vec<Hoja>, Value), String> {
+    hojas_consolidadas_con_opciones(lotes, csmp, true)
+}
+
+pub(super) fn hojas_consolidadas_con_opciones(
+    lotes: &[Lote],
+    csmp: bool,
+    incluir_origen: bool,
+) -> Result<(Vec<Hoja>, Value), String> {
     if lotes.is_empty() {
         return Err("Selecciona al menos un lote.".into());
     }
@@ -232,7 +240,11 @@ pub(super) fn hojas_consolidadas(lotes: &[Lote], csmp: bool) -> Result<(Vec<Hoja
                         nombre = format!("{}_{}", nombre.chars().take(27).collect::<String>(), usados.len()).chars().take(31).collect();
                     }
                     usados.insert(nombre.clone());
-                    let cabeceras: Vec<String> = tabla.cabecera.iter().cloned().chain(ORIGEN.iter().map(|s| s.to_string())).collect();
+                    let cabeceras: Vec<String> = if incluir_origen {
+                        tabla.cabecera.iter().cloned().chain(ORIGEN.iter().map(|s| s.to_string())).collect()
+                    } else {
+                        tabla.cabecera.clone()
+                    };
                     grupos.push((clave, Hoja {
                         nombre,
                         filas: vec![cabeceras.iter().map(t).collect()],
@@ -248,9 +260,11 @@ pub(super) fn hojas_consolidadas(lotes: &[Lote], csmp: bool) -> Result<(Vec<Hoja
             let hoja = &mut grupos[indice].1;
             for (n, fila) in &tabla.filas {
                 let mut valores = fila.clone();
-                valores.extend([t(&carpeta), t(consulta_de(tabla)), excel::celda_json(&tabla.item["archivo"]),
-                    excel::celda_json(&tabla.item["pagina"]), Celda::Entero(*n as i64), excel::celda_json(&tabla.item["sha256"]),
-                    excel::celda_json(&fecha)]);
+                if incluir_origen {
+                    valores.extend([t(&carpeta), t(consulta_de(tabla)), excel::celda_json(&tabla.item["archivo"]),
+                        excel::celda_json(&tabla.item["pagina"]), Celda::Entero(*n as i64), excel::celda_json(&tabla.item["sha256"]),
+                        excel::celda_json(&fecha)]);
+                }
                 hoja.filas.push(valores);
             }
             filas_fuente += tabla.filas.len();
@@ -300,7 +314,8 @@ pub(super) fn hojas_consolidadas(lotes: &[Lote], csmp: bool) -> Result<(Vec<Hoja
     };
     let mut hojas = vec![presentada("Resumen", &cab_resumen, resumen), presentada("SITFA_ARCHIVOS", &cab_origen, origen)];
     for ((_, cabecera), mut hoja) in grupos {
-        hoja.filtro = Filtro::Rango(hoja.filas.len() as u32, (cabecera.len() + ORIGEN.len()) as u16);
+        let ancho = if incluir_origen { cabecera.len() + ORIGEN.len() } else { cabecera.len() };
+        hoja.filtro = Filtro::Rango(hoja.filas.len() as u32, ancho as u16);
         hojas.push(hoja);
     }
     hojas.push(presentada("Vencimientos", &cab_venc, vencimientos));
@@ -316,8 +331,14 @@ pub(super) fn hojas_consolidadas(lotes: &[Lote], csmp: bool) -> Result<(Vec<Hoja
     Ok((hojas, metadato))
 }
 
-pub fn exportar_libro(lotes: &[Lote], destino: Option<&Path>, csmp: bool, ahora: &Ahora) -> Result<PathBuf, String> {
-    let (hojas, meta) = hojas_consolidadas(lotes, csmp)?;
+fn exportar_libro_con_opciones(
+    lotes: &[Lote],
+    destino: Option<&Path>,
+    csmp: bool,
+    incluir_origen: bool,
+    ahora: &Ahora,
+) -> Result<PathBuf, String> {
+    let (hojas, meta) = hojas_consolidadas_con_opciones(lotes, csmp, incluir_origen)?;
     let bytes = excel::libro(&hojas)?;
     let parcial = lotes.iter().any(|l| l.parcial);
     let etiqueta = format!("{}{}", if csmp { "Para CSMP" } else { "Consolidado" }, if parcial { " INCOMPLETO" } else { "" });
@@ -331,6 +352,15 @@ pub fn exportar_libro(lotes: &[Lote], destino: Option<&Path>, csmp: bool, ahora:
     let json_ruta = ruta.with_extension("json");
     super::lote::guardar_exclusivo(&json_ruta, json_sangrado(&metadato).as_bytes()).map_err(|e| format!("No se pudo guardar el metadato del libro: {e}"))?;
     Ok(ruta)
+}
+
+pub fn exportar_libro(lotes: &[Lote], destino: Option<&Path>, csmp: bool, ahora: &Ahora) -> Result<PathBuf, String> {
+    exportar_libro_con_opciones(lotes, destino, csmp, true, ahora)
+}
+
+/// Consolidado de Descargador Lite con solo las columnas originales (sin las 7 columnas `ORIGEN` del Asistente).
+pub fn exportar_libro_solo_originales(lotes: &[Lote], destino: Option<&Path>, ahora: &Ahora) -> Result<PathBuf, String> {
+    exportar_libro_con_opciones(lotes, destino, false, false, ahora)
 }
 
 /// `consolidated_workbook`: el libro «Para CSMP» se serializa directamente a memoria.
@@ -376,7 +406,13 @@ pub fn exportar_csv(lote: &Lote, ahora: &Ahora) -> Result<Vec<PathBuf>, String> 
     for (numero, (fam, cabecera)) in esquemas.iter().enumerate() {
         let mut texto = String::from("\u{feff}");
         let linea = |valores: Vec<String>| valores.iter().map(|v| campo_csv(v)).collect::<Vec<_>>().join(";") + "\r\n";
-        texto += &linea(cabecera.iter().cloned().chain(ORIGEN.iter().map(|s| s.to_string())).collect());
+        texto += &linea(
+            cabecera
+                .iter()
+                .map(|h| valor_csv(&Celda::Texto(h.clone())))
+                .chain(ORIGEN.iter().map(|s| valor_csv(&Celda::Texto((*s).to_string()))))
+                .collect(),
+        );
         for t in datos.iter().filter(|t| familia(t) == *fam && t.cabecera == *cabecera) {
             for (n, fila) in &t.filas {
                 let mut valores: Vec<Celda> = fila.clone();
@@ -898,5 +934,35 @@ mod tests {
         println!("LIBROS: {iguales}/{}, fallos {}", casos.len(), fallos.len());
         assert_eq!(casos.len(), 14, "el oráculo debe traer 14 libros");
         assert!(fallos.is_empty());
+    }
+
+    #[test]
+    fn exportar_libro_solo_originales_omite_columnas_del_asistente() {
+        use calamine::Reader;
+        let paquete: Value = serde_json::from_str(include_str!("../../tests/datos/paquete.json")).unwrap();
+        let e = paquete["escenarios"].as_array().unwrap().iter().find(|e| e["escenario"] == "listados").unwrap();
+        let raiz = std::env::temp_dir().join(format!("flow-lite-solo-originales-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&raiz);
+        let carpeta = raiz.join("lotes").join(e["lote"]["carpeta"].as_str().unwrap());
+        reconstruir(&carpeta, &e["lote"]["archivos"]);
+        let lote = paquete::cargar_lote(&carpeta).unwrap();
+        let esperadas = tablas(&lote).unwrap()[0].cabecera.clone();
+        let destino = raiz.join("salida");
+        let ruta = exportar_libro_solo_originales(&[lote], Some(&destino), &ahora()).unwrap();
+        let mut libro = calamine::open_workbook_auto(&ruta).unwrap();
+        let mut hojas_datos = 0usize;
+        for (nombre, rango) in libro.worksheets() {
+            if matches!(nombre.as_str(), "Resumen" | "SITFA_ARCHIVOS" | "Vencimientos") {
+                continue;
+            }
+            hojas_datos += 1;
+            let cabecera_xlsx: Vec<String> = rango.rows().next().unwrap().iter().map(|c| c.to_string()).collect();
+            assert_eq!(cabecera_xlsx, esperadas, "la hoja {nombre} debe conservar solo las columnas originales");
+            for col in ORIGEN {
+                assert!(!cabecera_xlsx.iter().any(|h| h == col), "no debe incluir {col}");
+            }
+        }
+        assert!(hojas_datos >= 1, "debe generar al menos una hoja de datos");
+        let _ = std::fs::remove_dir_all(&raiz);
     }
 }

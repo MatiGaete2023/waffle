@@ -328,7 +328,7 @@ Es el «Prompt del Agente C · Segundo encargo» con un paso 0 que primero respa
 ## Prompt del Agente A · E-I3 actualizaciones desde OneDrive y ajustes de E-I1 (Antigravity)
 
 ```
-Eres el Agente A · Antigravity. Trabajas en MatiGaete2023/flow, directamente en la rama estudio/paridad-python-rust-20261119, clon C:\Users\matia\Downloads\nuevo. Otros agentes: B · DeepSeek (rama estudio/agente-b-hoja-20261125: flujo_paquete.rs, descargador_ui.rs) y C · ChatGPT Luna (rama estudio/agente-c-historial-20261125: descargador_resultados_ui.rs, archivo_local.rs, preferencias.rs). No toques lo suyo.
+Eres el Agente A · Antigravity. Trabajas en MatiGaete2023/flow, directamente en la rama estudio/paridad-python-rust-20261119, clon <repo>. Otros agentes: B · DeepSeek (rama estudio/agente-b-hoja-20261125: flujo_paquete.rs, descargador_ui.rs) y C · ChatGPT Luna (rama estudio/agente-c-historial-20261125: descargador_resultados_ui.rs, archivo_local.rs, preferencias.rs). No toques lo suyo.
 
 PASO 0 · CHECKOUT. git fetch origin; git checkout estudio/paridad-python-rust-20261119; git merge --ff-only origin/estudio/paridad-python-rust-20261119; comprueba que el último commit de origin sea ancestro de HEAD. Si hay cambios locales que no son tuyos, detente. Si ya existen commits de otra sesión que hagan E-I3, detente y avisa. Primera respuesta: ruta, rama y HEAD.
 
@@ -367,7 +367,7 @@ ESTILO: español chileno, primera línea = la respuesta, sin cortesías, código
 ```
 Eres el Agente B · DeepSeek. Trabajas en MatiGaete2023/flow, en la rama nueva estudio/agente-b-hoja-20261125. Otros agentes: A · Antigravity (actualizacion.rs, config.rs, ui.rs Ajustes, installer/**) y C · ChatGPT Luna (rama estudio/agente-c-historial-20261125: descargador_resultados_ui.rs, archivo_local.rs, preferencias.rs). No toques lo suyo.
 
-PASO 0 · CHECKOUT. En tu clon (C:\Users\matia\OneDrive\Documentos\deepseek-harness\default-workspace\flow, origin = MatiGaete2023/flow): git fetch origin; git checkout -b estudio/agente-b-hoja-20261125 origin/estudio/paridad-python-rust-20261119 (ya trae E-Q9 integrado y cerrado como HECHO, run 45685219486). Comprueba git merge-base --is-ancestor e71d666 HEAD (debe terminar en 0). Si falla: BLOQUEADO con el error literal. Primera respuesta: ruta, rama y HEAD.
+PASO 0 · CHECKOUT. En tu clon (<repo>, origin = MatiGaete2023/flow): git fetch origin; git checkout -b estudio/agente-b-hoja-20261125 origin/estudio/paridad-python-rust-20261119 (ya trae E-Q9 integrado y cerrado como HECHO, run 45685219486). Comprueba git merge-base --is-ancestor e71d666 HEAD (debe terminar en 0). Si falla: BLOQUEADO con el error literal. Primera respuesta: ruta, rama y HEAD.
 
 EVALUACIÓN DE TU ENTREGA ANTERIOR (E-Q9, HECHO): bien la corrección, la firma y la lista honesta de runs (incluidos los rojos). A corregir: tu primer informe dio por verde un run que había fallado y dejó un marcador sin completar. Cita solo lo que leas en GitHub en ese momento.
 
@@ -404,7 +404,7 @@ ESTILO: español chileno, primera línea = la respuesta, sin cortesías, código
 ```
 Eres el Agente C · ChatGPT Luna. Trabajas en MatiGaete2023/flow, en la rama nueva estudio/agente-c-historial-20261125. Otros agentes: A · Antigravity (actualizacion.rs, config.rs, ui.rs Ajustes, installer/**) y B · DeepSeek (rama estudio/agente-b-hoja-20261125: flujo_paquete.rs y su acción en descargador_ui.rs). No toques lo suyo.
 
-PASO 0 · CHECKOUT. En tu clon C:\Users\matia\Documents\flow-rust-a (origin = MatiGaete2023/flow): si hay cambios sin commit, detente. git fetch origin; git checkout -b estudio/agente-c-historial-20261125 origin/estudio/paridad-python-rust-20261119 (ya trae E-S2 integrado). Comprueba git merge-base --is-ancestor 0610040 HEAD (debe terminar en 0). Si falla: BLOQUEADO con el error literal. Primera respuesta: ruta, rama y HEAD.
+PASO 0 · CHECKOUT. En tu clon <repo> (origin = MatiGaete2023/flow): si hay cambios sin commit, detente. git fetch origin; git checkout -b estudio/agente-c-historial-20261125 origin/estudio/paridad-python-rust-20261119 (ya trae E-S2 integrado). Comprueba git merge-base --is-ancestor 0610040 HEAD (debe terminar en 0). Si falla: BLOQUEADO con el error literal. Primera respuesta: ruta, rama y HEAD.
 
 EVALUACIÓN DE TU ENTREGA ANTERIOR (E-S2, integrado): bien la firma, los trailers y el informe de runs. Al integrar, el coordinador corrigió el generador: el caso separadores_ambos dependía de que Python tratara «\» como separador (solo pasa en Windows); en Linux daba otro resultado y un error con ruta temporal. Regla: el oráculo debe regenerarse idéntico en Linux y Windows; si Python se comporta distinto según el sistema, emula la conducta de Windows en el generador y dilo.
 
@@ -445,7 +445,7 @@ ESTILO: español chileno, primera línea = la respuesta, sin cortesías, código
 ```
 Eres el Agente B · DeepSeek. Trabajas en MatiGaete2023/flow, en la rama nueva estudio/agente-b-conjunta-20261125. Otro agente activo: A · Antigravity (rama principal: sincronizar.rs, trabajo.rs, outlook.rs, ui.rs Ajustes). C no tiene encargo. No toques lo de A.
 
-PASO 0 · CHECKOUT. En tu clon (C:\Users\matia\OneDrive\Documentos\deepseek-harness\default-workspace\flow): git fetch origin; git checkout -b estudio/agente-b-conjunta-20261125 origin/estudio/paridad-python-rust-20261119; comprueba git merge-base --is-ancestor 0257981 HEAD (debe terminar en 0). Si falla: BLOQUEADO con el error literal. Primera respuesta: ruta, rama y HEAD.
+PASO 0 · CHECKOUT. En tu clon (<repo>): git fetch origin; git checkout -b estudio/agente-b-conjunta-20261125 origin/estudio/paridad-python-rust-20261119; comprueba git merge-base --is-ancestor 0257981 HEAD (debe terminar en 0). Si falla: BLOQUEADO con el error literal. Primera respuesta: ruta, rama y HEAD.
 
 EVALUACIÓN DE TU ENTREGA ANTERIOR (E-Q10, HECHO, run 45708628960): bien. Firma completa, CI verde con la regeneración corrida y oráculo idéntico en Linux. Sigue así.
 
@@ -482,7 +482,7 @@ ESTILO: español chileno, primera línea = la respuesta, sin cortesías, código
 ## Prompt del Agente A · E-A11 NURUS_DECISIONES completo y E-T6 borrador de prueba en Outlook (Antigravity)
 
 ```
-Eres el Agente A · Antigravity. Trabajas en MatiGaete2023/flow, directamente en la rama estudio/paridad-python-rust-20261119, clon C:\Users\matia\Downloads\nuevo. Otro agente activo: B · DeepSeek (rama estudio/agente-b-conjunta-20261125: flujo_csmp.rs, descargador_ui.rs, un botón en descargador_resultados_ui.rs). No toques lo suyo.
+Eres el Agente A · Antigravity. Trabajas en MatiGaete2023/flow, directamente en la rama estudio/paridad-python-rust-20261119, clon <repo>. Otro agente activo: B · DeepSeek (rama estudio/agente-b-conjunta-20261125: flujo_csmp.rs, descargador_ui.rs, un botón en descargador_resultados_ui.rs). No toques lo suyo.
 
 PASO 0 · CHECKOUT. git fetch origin; git checkout estudio/paridad-python-rust-20261119; git merge --ff-only origin/estudio/paridad-python-rust-20261119; comprueba git merge-base --is-ancestor 0257981 HEAD (debe terminar en 0). Si hay cambios locales que no son tuyos, detente. Si ya hay commits de otra sesión con E-A11 o E-T6, detente y avisa. Primera respuesta: ruta, rama y HEAD.
 

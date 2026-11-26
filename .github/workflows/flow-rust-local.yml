@@ -34,8 +34,8 @@ jobs:
         run: cargo test --manifest-path app/Cargo.toml --locked --all-targets
       - name: Verificadores estáticos
         run: |
-          python3 tools/check_real_ids.py app/src
-          python3 tools/check_contactos.py app/src
+          python3 tools/check_real_ids.py app/src app/qa app/tests/datos installer tools
+          python3 tools/check_contactos.py app/src installer tools
           python3 tools/verificar_textos_umbrales.py
           python3 tools/inventario_escrituras.py
           python3 tools/verificar_solo_lectura.py --autoprueba
@@ -86,13 +86,9 @@ jobs:
           cache-dependency-path: referencia-python-ci/requirements/windows-py312.lock
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: app
-      - name: Comprobar fuentes y ejemplos
-        shell: pwsh
-        run: |
-          python tools/check_real_ids.py app/src
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python tools/check_contactos.py app/src
+          workspaces: |
+            app
+            rust
       - name: Probar la aplicación desde app
         run: cargo test --manifest-path app/Cargo.toml --locked --all-targets
       - name: E-R0 · Meta 4 y Anonimizador reutilizados (sus pruebas con las características de app/)

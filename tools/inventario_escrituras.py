@@ -18,9 +18,9 @@ PATRON = re.compile(
     r'remove_dir_all|fs::remove_dir\(|\bwb\.save\('
 )
 
-# archivo: (cantidad, clase, destino). Auditado el 23-nov-2026.
+# archivo: (cantidad, clase, destino). Auditado el 26-nov-2026.
 CLASIFICACION = {
-    'config.rs': (3, 'perfil', 'config::atomic_write: config.json y sesiones en data_dir() (APPDATA/FlowRust); temporal + rename'),
+    'util.rs': (5, 'perfil/usuario', 'util::guardar_atomico: escritura atómica compartida (usada por config::atomic_write y manual::generar_word) con temporal único, sync_all, reintento de rename y limpieza ante fallo'),
     'trabajo.rs': (1, 'perfil', 'limpieza de sesiones antiguas propias en data_dir()/sesiones (RETENCION_DIAS, SESIONES_ANTERIORES)'),
     'descargador/preferencias.rs': (3, 'perfil', 'descargador_preferencias.json en LOCALAPPDATA/FlowRust, incluye historial local; temporal + rename'),
     'descargador/extension.rs': (3, 'perfil', 'archivos de la extensión Lite/Integral en LOCALAPPDATA/FlowRust/extension-<edición> (carpeta fija, actualizada en el lugar); solo escribe lo que cambió y quita los archivos que ya no son de la extensión'),
@@ -31,7 +31,7 @@ CLASIFICACION = {
     'descargador/excel.rs': (1, 'usuario', 'Excel del lote de bitácoras y de Resultados (E-Q5d/E-S1): Bitacoras_RUS.xlsx e Historia_SITFA.xlsx en la carpeta del lote (nombre con sufijo si existe) o en el destino elegido; crea la carpeta y guarda con guardar_exclusivo (nunca sobrescribe)'),
     'descargador/resultados.rs': (1, 'usuario', 'productos de Resultados (E-S1): carpeta del lote o la elegida; XLSX y metadato JSON con guardar_exclusivo; el libro «Para CSMP» del paquete se arma en memoria'),
     'descargador/paquete.rs': (2, 'usuario', 'ZIP CSMP_CAPTURE validado y diagnóstico de cobertura anónimo al lado, en el destino elegido, ambos con guardar_exclusivo; Resultados puede reunir lotes, fases de conjuntos y controles bitacoras.json; si falla el ZIP se retira solo el diagnóstico que se acaba de crear'),
-    'descargador/flujo_paquete.rs': (11, 'usuario', 'E-Q9: control atómico en respaldo/proceso.json; ZIP y diagnóstico hermano preparados en temporal propio y renombrados antes de limpiarlo; respaldos exclusivos de ambos productos anteriores; si falla el ZIP se devuelve el diagnóstico nuevo al temporal y se restaura el anterior desde respaldo'),
+    'descargador/flujo_paquete.rs': (13, 'usuario', 'E-Q9: control atómico en respaldo/proceso.json; ZIP y diagnóstico hermano preparados en temporal propio y renombrados antes de limpiarlo (incluye limpieza al cancelar); respaldos exclusivos de ambos productos anteriores por copia directa; si falla el ZIP se devuelve el diagnóstico nuevo al temporal y se restaura el anterior desde respaldo'),
     'descargador/flujo_csmp.rs': (5, 'usuario', 'E-Q11: carpeta del conjunto y de sus fases; flujo.json por temporal y renombrado; copias comprobadas y libro con nombres nuevos'),
     'descargador/lote.rs': (7, 'usuario', 'carpeta de destino del lote y subcarpeta nueva del lote (create_dir falla si existe); guardar_exclusivo nunca sobrescribe; resumen por temporal + rename; solo borra su propio archivo si la verificación falla'),
     'ui.rs': (5, 'usuario/perfil', 'carpeta de productos de Ajustes; contactos.csv por diálogo Guardar; plantillas, datos y carpeta de actualizaciones (solo crear carpeta) en data_dir() y LOCALAPPDATA/FlowRust'),
@@ -41,7 +41,6 @@ CLASIFICACION = {
     'personalizar.rs': (4, 'perfil', 'matrices Word importadas a data_dir()/plantillas (el original se respalda como .bak.docx; escritura por archivo temporal)'),
     'producto_excel.rs': (1, 'usuario', 'carpeta de productos de Ajustes; el libro se guarda en una ruta nueva (nueva_ruta nunca reemplaza un archivo)'),
     'estadisticas.rs': (2, 'usuario/perfil', 'resumen de constancias en la carpeta de productos con nombre nuevo; metricas.json solo con la opción activada, vía config::atomic_write'),
-    'manual.rs': (3, 'usuario', 'Word manual en la carpeta de productos con un nombre nuevo (no reemplaza; archivo temporal y renombrado); los favoritos y lo escrito van por config::atomic_write'),
     'outlook.rs': (5, 'temporal', 'borrador.json y la nómina en una carpeta temporal propia que se borra al terminar; Outlook solo recibe Save()'),
     'productos.rs': (5, 'usuario/temporal', 'EML/XLSX/resoluciones en la carpeta de productos (nombres nuevos, carpeta Resoluciones_* nueva; Word por tribunal conserva matriz, índice y saltos); borrador Outlook vía temp_dir() que se limpia'),
     'revision_ui.rs': (5, 'usuario', 'carpeta nueva de la revisión de bitácoras (create_dir falla si existe); ante error borra solo lo propio'),

@@ -10,8 +10,21 @@ use std::{io::{self, Read}, path::{Path, PathBuf}};
 
 const MAX_EXE: u64 = 256 * 1024 * 1024;
 const MAX_SHA: u64 = 64 * 1024;
+const MAX_SIG: u64 = 4 * 1024;
 
 pub const NOMBRE: &str = "flow_rust.exe";
+pub const NOMBRE_FIRMA: &str = "SHA256.txt.sig";
+
+/// Estado de la firma separada (`SHA256.txt.sig`), preparada para verificación Ed25519.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EstadoFirma {
+    /// No existe `SHA256.txt.sig` (modo actual sin firma).
+    Ausente,
+    /// Existe `SHA256.txt.sig` con formato Ed25519 válido (64 bytes crudos o 128 hex), sin clave pública configurada.
+    PresenteSinClave { firma_hex: String },
+    /// Verificada con la clave pública proporcionada.
+    Verificada,
+}
 
 pub const AVISO_SINCRONIZANDO: &str =
     "La actualización de la carpeta adicional todavía se está sincronizando; vuelve a intentar en unos minutos.";
@@ -83,6 +96,92 @@ fn declarada(carpeta: &Path) -> (Option<String>, String) {
     declarada_archivo(&carpeta.join("SHA256.txt"))
 }
 
+fn rechazar_enlace_o_especial(ruta: &Path, permitir_ausente: bool) -> Result<bool, String> {
+    match std::fs::symlink_metadata(ruta) {
+        Ok(meta) => {
+            #[cfg(windows)]
+            let es_reparse = {
+                use std::os::windows::fs::MetadataExt;
+                meta.file_attributes() & 0x0400 != 0
+            };
+            #[cfg(not(windows))]
+            let es_reparse = false;
+            if meta.file_type().is_symlink() || es_reparse || !meta.file_type().is_file() {
+                return Err(format!(
+                    "Se rechazó la actualización porque {} es un enlace o no es un archivo regular.",
+                    ruta.display()
+                ));
+            }
+            Ok(true)
+        }
+        Err(e) if permitir_ausente && e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("No se pudo inspeccionar {}: {e}", ruta.display())),
+    }
+}
+
+fn decodificar_firma_ed25519(crudo: &[u8]) -> Result<[u8; 64], String> {
+    if crudo.len() == 64 {
+        let mut out = [0u8; 64];
+        out.copy_from_slice(crudo);
+        return Ok(out);
+    }
+    let texto = std::str::from_utf8(crudo)
+        .map_err(|_| "SHA256.txt.sig no tiene un formato de firma Ed25519 válido.".to_string())?
+        .trim_start_matches('\u{feff}')
+        .trim();
+    if texto.len() != 128 || !texto.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("SHA256.txt.sig no tiene un formato de firma Ed25519 válido (64 bytes o 128 hex).".into());
+    }
+    let mut out = [0u8; 64];
+    for i in 0..64 {
+        out[i] = u8::from_str_radix(&texto[i * 2..i * 2 + 2], 16)
+            .map_err(|_| "SHA256.txt.sig contiene caracteres hexadecimales inválidos.".to_string())?;
+    }
+    Ok(out)
+}
+
+/// Gancho de verificación de firma separada (`SHA256.txt.sig`) preparado para Ed25519.
+/// Valida tipo de archivo regular, tamaño acotado y formato (64 bytes crudos o 128 hex); si se entrega un verificador
+/// criptográfico, valida la firma contra el contenido de `SHA256.txt`.
+pub fn verificar_firma_opcional(
+    carpeta: &Path,
+    verificador: Option<&dyn Fn(&[u8], &[u8; 64]) -> bool>,
+) -> Result<EstadoFirma, String> {
+    let ruta_firma = carpeta.join(NOMBRE_FIRMA);
+    if !rechazar_enlace_o_especial(&ruta_firma, true)? {
+        return Ok(EstadoFirma::Ausente);
+    }
+    let f = std::fs::File::open(&ruta_firma)
+        .map_err(|e| format!("No se pudo leer {}: {e}", ruta_firma.display()))?;
+    let mut crudo = Vec::new();
+    f.take(MAX_SIG + 1)
+        .read_to_end(&mut crudo)
+        .map_err(|e| format!("No se pudo leer {}: {e}", ruta_firma.display()))?;
+    if crudo.len() as u64 > MAX_SIG {
+        return Err("SHA256.txt.sig supera el tamaño permitido.".into());
+    }
+    let firma = decodificar_firma_ed25519(&crudo)?;
+    if let Some(verificar) = verificador {
+        let ruta_sha = carpeta.join("SHA256.txt");
+        rechazar_enlace_o_especial(&ruta_sha, false)?;
+        let f_sha = std::fs::File::open(&ruta_sha)
+            .map_err(|e| format!("No se pudo leer {}: {e}", ruta_sha.display()))?;
+        let mut sha_bytes = Vec::new();
+        f_sha
+            .take(MAX_SHA + 1)
+            .read_to_end(&mut sha_bytes)
+            .map_err(|e| format!("No se pudo leer {}: {e}", ruta_sha.display()))?;
+        if sha_bytes.len() as u64 > MAX_SHA {
+            return Err("SHA256.txt supera el tamaño permitido.".into());
+        }
+        if !verificar(&sha_bytes, &firma) {
+            return Err("La firma criptográfica en SHA256.txt.sig no es válida.".into());
+        }
+        return Ok(EstadoFirma::Verificada);
+    }
+    Ok(EstadoFirma::PresenteSinClave { firma_hex: crate::trabajo::hex(&firma) })
+}
+
 /// La versión nueva que espera en `carpeta`, si la hay y difiere del programa que corre (`actual`).
 pub fn buscar(carpeta: &Path, actual: &Path) -> Result<Option<Pendiente>, String> {
     let nuevo = carpeta.join(NOMBRE);
@@ -94,6 +193,7 @@ pub fn buscar(carpeta: &Path, actual: &Path) -> Result<Option<Pendiente>, String
     if esperada.as_deref() != Some(h.as_str()) {
         return Err("Falta SHA256.txt válido o la huella de la actualización no coincide: no se aplicó.".into());
     }
+    verificar_firma_opcional(carpeta, None)?;
     if huella(actual).is_ok_and(|a| a == h) {
         return Ok(None);
     }
@@ -297,6 +397,11 @@ fn anterior_de(actual: &Path) -> PathBuf {
     actual.with_file_name(format!("{nombre}.anterior"))
 }
 
+fn anterior_bak_de(actual: &Path) -> PathBuf {
+    let nombre = actual.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| NOMBRE.into());
+    actual.with_file_name(format!("{nombre}.anterior.bak"))
+}
+
 /// La copia del programa anterior, si existe (para volver atrás).
 pub fn anterior(actual: &Path) -> Option<PathBuf> {
     Some(anterior_de(actual)).filter(|p| p.is_file())
@@ -304,26 +409,57 @@ pub fn anterior(actual: &Path) -> Option<PathBuf> {
 
 /// Reemplaza `actual` por la versión pendiente. Si algo falla antes de terminar, el programa queda como estaba.
 pub fn aplicar(p: &Pendiente, actual: &Path) -> Result<PathBuf, String> {
+    aplicar_con(p, actual, |a, b| std::fs::rename(a, b))
+}
+
+fn aplicar_con(
+    p: &Pendiente,
+    actual: &Path,
+    mut mover: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> Result<PathBuf, String> {
+    rechazar_enlace_o_especial(&p.ruta, false)?;
+    rechazar_enlace_o_especial(actual, false)?;
     if huella_archivo(&p.ruta, true)? != p.huella ||
         p.ruta.parent().and_then(|dir| declarada(dir).0).as_deref() != Some(p.huella.as_str()) {
         return Err("La actualización cambió después de verificarse; vuelve a buscarla.".into());
     }
+    if let Some(carpeta) = p.ruta.parent() {
+        verificar_firma_opcional(carpeta, None)?;
+    }
     let anterior = anterior_de(actual);
-    let _ = std::fs::remove_file(&anterior);
+    let anterior_bak = anterior_bak_de(actual);
+    let habia_anterior = rechazar_enlace_o_especial(&anterior, true)?;
+    if rechazar_enlace_o_especial(&anterior_bak, true)? {
+        let _ = std::fs::remove_file(&anterior_bak);
+    }
     let sin_permiso = |e: std::io::Error| {
         format!("No se pudo reemplazar el programa en {}: {e}. Mueve Flow a una carpeta propia, por ejemplo %LOCALAPPDATA%\\FlowRust.", actual.display())
     };
-    std::fs::rename(actual, &anterior).map_err(sin_permiso)?;
-    let restaurar = |motivo: String| {
+    if habia_anterior {
+        mover(&anterior, &anterior_bak).map_err(sin_permiso)?;
+    }
+    if let Err(e) = mover(actual, &anterior) {
+        if habia_anterior {
+            let _ = mover(&anterior_bak, &anterior);
+        }
+        return Err(sin_permiso(e));
+    }
+    let mut restaurar = |motivo: String| {
         let _ = std::fs::remove_file(actual);
-        let _ = std::fs::rename(&anterior, actual);
+        let _ = mover(&anterior, actual);
+        if habia_anterior {
+            let _ = mover(&anterior_bak, &anterior);
+        }
         motivo
     };
-    if let Err(e) = std::fs::copy(&p.ruta, actual) {
+    if let Err(e) = copiar_limitado(&p.ruta, actual, MAX_EXE) {
         return Err(restaurar(format!("No se pudo copiar la actualización: {e}")));
     }
     if huella(actual).ok().as_deref() != Some(p.huella.as_str()) {
         return Err(restaurar("La copia del programa nuevo no coincide con la verificada; se conservó el anterior.".into()));
+    }
+    if habia_anterior {
+        let _ = std::fs::remove_file(&anterior_bak);
     }
     // La actualización ya aplicada se guarda aparte para que no se vuelva a ofrecer.
     if let Some(carpeta) = p.ruta.parent() {
@@ -332,6 +468,10 @@ pub fn aplicar(p: &Pendiente, actual: &Path) -> Result<PathBuf, String> {
             let corto = &p.huella[..8.min(p.huella.len())];
             let _ = std::fs::rename(&p.ruta, aplicadas.join(format!("flow_rust-{corto}.exe")));
             let _ = std::fs::rename(carpeta.join("SHA256.txt"), aplicadas.join(format!("SHA256-{corto}.txt")));
+            let sig = carpeta.join(NOMBRE_FIRMA);
+            if sig.is_file() {
+                let _ = std::fs::rename(&sig, aplicadas.join(format!("SHA256-{corto}.txt.sig")));
+            }
         }
     }
     Ok(anterior)
@@ -619,6 +759,60 @@ mod pruebas {
         assert_eq!(std::fs::read(&actual).unwrap(), b"MZactual");
         assert_eq!(std::fs::read(&anterior).unwrap(), b"MZanterior");
         assert!(!base.join("flow_rust.exe.intercambio").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn aplicar_preserva_anterior_si_falla_renombrado_y_rechaza_no_regular() {
+        let base = carpeta_temporal("rollback-anterior");
+        let (programa, nuevas) = (base.join("programa"), base.join("actualizaciones"));
+        std::fs::create_dir_all(&programa).unwrap();
+        std::fs::create_dir_all(&nuevas).unwrap();
+        let actual = programa.join(NOMBRE);
+        let anterior = anterior_de(&actual);
+        exe(&actual, "version actual");
+        exe(&anterior, "version previa");
+        exe(&nuevas.join(NOMBRE), "version nueva");
+        let h = huella(&nuevas.join(NOMBRE)).unwrap();
+        std::fs::write(nuevas.join("SHA256.txt"), format!("{h}  flow_rust.exe\n")).unwrap();
+        let pendiente = buscar(&nuevas, &actual).unwrap().unwrap();
+
+        // Si falla mover `actual` a `anterior`, el respaldo previo debe restaurarse intacto.
+        let res = aplicar_con(&pendiente, &actual, |a, b| {
+            if a == actual.as_path() && b == anterior.as_path() {
+                Err(io::Error::other("fallo inyectado"))
+            } else {
+                std::fs::rename(a, b)
+            }
+        });
+        assert!(res.is_err());
+        assert_eq!(std::fs::read(&actual).unwrap(), b"MZversion actual");
+        assert_eq!(std::fs::read(&anterior).unwrap(), b"MZversion previa");
+        assert!(!anterior_bak_de(&actual).exists());
+
+        // Rechaza `anterior` que no sea archivo regular (p. ej. directorio o enlace).
+        std::fs::remove_file(&anterior).unwrap();
+        std::fs::create_dir(&anterior).unwrap();
+        assert!(aplicar(&pendiente, &actual).unwrap_err().contains("enlace o no es un archivo regular"));
+        assert_eq!(std::fs::read(&actual).unwrap(), b"MZversion actual");
+        std::fs::remove_dir(&anterior).unwrap();
+
+        // Gancho de firma separada SHA256.txt.sig (ausente, formato válido, inválido y verificador).
+        assert_eq!(verificar_firma_opcional(&nuevas, None).unwrap(), EstadoFirma::Ausente);
+        std::fs::write(nuevas.join(NOMBRE_FIRMA), "firma-invalida").unwrap();
+        assert!(verificar_firma_opcional(&nuevas, None).is_err());
+        let firma_hex = "ab".repeat(64);
+        std::fs::write(nuevas.join(NOMBRE_FIRMA), format!("{firma_hex}\n")).unwrap();
+        assert_eq!(
+            verificar_firma_opcional(&nuevas, None).unwrap(),
+            EstadoFirma::PresenteSinClave { firma_hex: firma_hex.clone() }
+        );
+        assert_eq!(
+            verificar_firma_opcional(&nuevas, Some(&|_msg, sig| sig[0] == 0xab)).unwrap(),
+            EstadoFirma::Verificada
+        );
+        assert!(verificar_firma_opcional(&nuevas, Some(&|_msg, _sig| false)).is_err());
+
         let _ = std::fs::remove_dir_all(base);
     }
 

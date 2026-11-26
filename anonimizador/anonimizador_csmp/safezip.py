@@ -61,18 +61,38 @@ def validate(data):
         _check(archive)
 
 
+CHUNK_SIZE = 64 * 1024
+
+
 def members(data):
     """Devuelve [(ruta interna, bytes)] validando límites. Ignora carpetas."""
     result = []
+    total = 0
     with _open(data) as archive:
         infos = _check(archive)
         for info in infos:
             if info.is_dir():
                 continue
+            chunks = []
+            member_size = 0
             try:
-                raw = archive.read(info)
+                with archive.open(info) as stream:
+                    while True:
+                        chunk = stream.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        member_size += len(chunk)
+                        total += len(chunk)
+                        if (
+                            member_size > MAX_MEMBER
+                            or total > MAX_TOTAL
+                            or member_size / max(1, info.compress_size) > MAX_RATIO
+                        ):
+                            raise UnsafeArchive("La expansión del ZIP excede el límite permitido.")
+                        chunks.append(chunk)
             except (zipfile.BadZipFile, RuntimeError, NotImplementedError, EOFError, zlib.error) as exc:
                 raise UnsafeArchive("ZIP corrupto o con compresión no soportada.") from exc
+            raw = b"".join(chunks)
             if len(raw) != info.file_size:
                 raise UnsafeArchive("ZIP inconsistente.")
             result.append((safe_name(info.filename), raw))

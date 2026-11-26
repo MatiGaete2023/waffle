@@ -151,16 +151,22 @@ pub fn guardar_outlook(b: &Borrador, cuenta: &str) -> Result<ReciboOutlook, Erro
         crate::manual::verificar_adjuntos(b).map_err(no)?;
         for (i, (ruta, _)) in b.adjuntos.iter().enumerate() {
             let origen = std::path::Path::new(ruta);
-            let copia = tmp.join(format!("adjunto{i}")).join(origen.file_name().unwrap_or_default());
-            std::fs::create_dir_all(copia.parent().unwrap()).map_err(|e| no(e.to_string()))?;
+            let nombre = origen
+                .file_name()
+                .filter(|n| !n.is_empty())
+                .ok_or_else(|| no(format!("Ruta de adjunto inválida: {ruta}")))?;
+            let carpeta_adj = tmp.join(format!("adjunto{i}"));
+            std::fs::create_dir_all(&carpeta_adj).map_err(|e| no(e.to_string()))?;
+            let copia = carpeta_adj.join(nombre);
             std::fs::copy(origen, &copia).map_err(|e| no(format!("No se pudo copiar el adjunto {ruta}: {e}")))?;
             adjuntos.push(copia.display().to_string());
         }
         let json = tmp.join("borrador.json");
-        std::fs::write(&json, serde_json::to_vec(&datos(b, cuenta, &adjuntos)).unwrap_or_default()).map_err(|e| no(e.to_string()))?;
+        let payload = serde_json::to_vec(&datos(b, cuenta, &adjuntos)).map_err(|e| no(e.to_string()))?;
+        std::fs::write(&json, payload).map_err(|e| no(e.to_string()))?;
         let utf16: Vec<u8> = SCRIPT.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
         let enc = base64::engine::general_purpose::STANDARD.encode(utf16);
-        let salida = crate::util::output_timeout(std::process::Command::new("powershell")
+        let salida = crate::util::output_timeout(std::process::Command::new(crate::util::powershell_exe())
             .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &enc])
             .env("FLOW_BORRADOR", &json)
             .creation_flags(0x0800_0000), TIMEOUT_COM)

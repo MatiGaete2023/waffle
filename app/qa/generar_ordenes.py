@@ -16,7 +16,7 @@ from nurus.personal.ordenes_busqueda import avisos_orden  # noqa: E402
 
 CORTE = date(2026, 11, 20)
 BASE = {'ESTADO O B': 'Activa', 'RESULTADO': '', 'FECHA TRAMITE': '10/11/2026', 'FEC NACIMIENTO': '10/05/2012',
-        'ESTADO ENVIO': 'Realizada', 'TIPO LITIGANTE': 'Niño', 'CURADOR': '(13624088-9)Persona Ficticia', 'PROX AUDS': ''}
+        'ESTADO ENVIO': 'Realizada', 'TIPO LITIGANTE': 'Niño', 'CURADOR': '(99999999-0)Persona Ficticia', 'PROX AUDS': ''}
 
 
 def caso(nombre, **cambios):

@@ -18,8 +18,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum TabDescargador {
+    #[default]
+    Alcance,
+    Ejecucion,
+    Resultados,
+}
+
 #[derive(Default)]
 pub struct Descargador {
+    tab: TabDescargador,
     edicion: Edicion,
     catalogo: Option<Catalogo>,
     seleccion: Seleccion,
@@ -443,11 +452,7 @@ impl Flujo {
                 if self.por_hoja {
                     ui.label(format!("{} hojas / {} paquetes previstos", lote.pestanas.len(), lote.pestanas.len()));
                 }
-                let boton = ui.add_enabled(
-                    puede,
-                    egui::Button::new(RichText::new("Consultar y crear paquete").color(egui::Color32::WHITE).strong())
-                        .fill(p.accent),
-                );
+                let boton = ui.add_enabled_ui(puede, |ui| theme::primary(ui, p, "Consultar y crear paquete")).inner;
                 if boton.clicked() {
                     if let (Some(conexion), Some(plan)) = (conexion.clone(), plan.cloned()) {
                         let alcance = LoteBitacoras {
@@ -551,7 +556,7 @@ impl Flujo {
             });
         }
         if let Some(e) = &self.error {
-            ui.label(RichText::new(e).color(p.amber));
+            ui.label(RichText::new(e).color(p.red));
         }
     }
 }
@@ -907,7 +912,7 @@ impl Contexto {
             });
         }
         if let Some(e) = &self.error {
-            ui.label(RichText::new(e).color(p.amber));
+            ui.label(RichText::new(e).color(p.red));
         }
     }
 }
@@ -1173,7 +1178,7 @@ impl Ejecucion {
             ui.label(RichText::new(aviso).color(p.amber));
         }
         if let Some(e) = &self.error {
-            ui.label(RichText::new(e).color(p.amber));
+            ui.label(RichText::new(e).color(p.red));
         }
         if let Some(fin) = &self.fin {
             ui.horizontal_wrapped(|ui| {
@@ -1237,74 +1242,92 @@ impl Conexion {
         }
     }
 
-    fn mostrar(&mut self, ui: &mut Ui, p: &Pal, edicion: Edicion) {
-        egui::CollapsingHeader::new("Conexión con Chrome").show(ui, |ui| {
-            let Some(puente) = self.puente.clone() else {
-                if ui.button("Abrir conexión local").clicked() {
-                    match Puente::abrir() {
-                        Ok(puente) => {
-                            self.puente = Some(Arc::new(puente));
-                            self.error = None;
-                        }
-                        Err(e) => self.error = Some(e),
-                    }
-                }
-                if let Some(e) = &self.error {
-                    ui.label(RichText::new(e).color(p.amber));
-                }
-                return;
-            };
-            let conectado = puente.conectado();
-            ui.ctx().request_repaint_after(Duration::from_millis(500));
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Copiar código").clicked() {
-                    ui.ctx().copy_text(puente.codigo_conexion());
-                }
-                if ui.button("Cerrar conexión").clicked() {
-                    self.cerrar();
-                }
-                if conectado {
-                    ui.label(RichText::new("Chrome conectado").color(p.green));
-                } else {
-                    ui.label("Pega el código en la extensión Integral o Lite de Flow Python.");
-                }
-            });
-            if self.puente.is_none() {
-                return;
-            }
-            ui.add_enabled_ui(conectado && self.carga.is_none(), |ui| {
+    fn mostrar(&mut self, ui: &mut Ui, p: &Pal, edicion: Edicion, catalogo_remoto: bool) {
+        let conectado_actual = self.puente.as_ref().is_some_and(|b| b.conectado());
+        egui::CollapsingHeader::new("Conexión con Chrome")
+            .default_open(!conectado_actual)
+            .show(ui, |ui| {
+                let paso1 = self.puente.is_some();
+                let paso2 = conectado_actual;
+                let paso3 = catalogo_remoto;
                 ui.horizontal_wrapped(|ui| {
-                    let pantallas: &[Pantalla] = match edicion {
-                        Edicion::Integral => &Pantalla::INTEGRAL,
-                        Edicion::Lite => &Pantalla::LITE,
-                    };
-                    ComboBox::from_id_salt("pantalla de Chrome")
-                        .selected_text(self.pantalla.etiqueta())
-                        .show_ui(ui, |ui| {
-                            for p in pantallas {
-                                ui.selectable_value(&mut self.pantalla, *p, p.etiqueta());
-                            }
-                        });
-                    if ui.button("Cargar opciones de Chrome").clicked() {
-                        let (envio, recepcion) = mpsc::channel();
-                        let pantalla = self.pantalla;
-                        let ctx = ui.ctx().clone();
-                        std::thread::spawn(move || {
-                            let _ = envio.send(puente.catalogo(edicion, pantalla));
-                            ctx.request_repaint();
-                        });
-                        self.error = None;
-                        self.carga = Some(recepcion);
+                    for (ok, texto) in [
+                        (paso1, "1. Abrir conexión"),
+                        (paso2, "2. Pegar código en Chrome"),
+                        (paso3, "3. Cargar opciones"),
+                    ] {
+                        let color = if ok { p.green } else { p.muted };
+                        let marca = if ok { "✓" } else { "○" };
+                        ui.label(RichText::new(format!("{marca} {texto}")).size(12.0).color(color));
                     }
                 });
+                ui.add_space(4.0);
+                let Some(puente) = self.puente.clone() else {
+                    if ui.button("Abrir conexión local").clicked() {
+                        match Puente::abrir() {
+                            Ok(puente) => {
+                                self.puente = Some(Arc::new(puente));
+                                self.error = None;
+                            }
+                            Err(e) => self.error = Some(e),
+                        }
+                    }
+                    if let Some(e) = &self.error {
+                        ui.label(RichText::new(e).color(p.red));
+                    }
+                    return;
+                };
+                let conectado = puente.conectado();
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Copiar código").clicked() {
+                        ui.ctx().copy_text(puente.codigo_conexion());
+                    }
+                    if ui.button("Cerrar conexión").clicked() {
+                        self.cerrar();
+                    }
+                    if conectado {
+                        ui.label(RichText::new("Chrome conectado").color(p.green));
+                    } else {
+                        ui.label("Pega el código en la extensión Integral o Lite de Flow Python.");
+                    }
+                });
+                if self.puente.is_none() {
+                    return;
+                }
+                ui.add_enabled_ui(conectado && self.carga.is_none(), |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let pantallas: &[Pantalla] = match edicion {
+                            Edicion::Integral => &Pantalla::INTEGRAL,
+                            Edicion::Lite => &Pantalla::LITE,
+                        };
+                        ComboBox::from_id_salt("pantalla de Chrome")
+                            .selected_text(self.pantalla.etiqueta())
+                            .show_ui(ui, |ui| {
+                                for p in pantallas {
+                                    ui.selectable_value(&mut self.pantalla, *p, p.etiqueta());
+                                }
+                            });
+                        if ui.button("Cargar opciones de Chrome").clicked() {
+                            let (envio, recepcion) = mpsc::channel();
+                            let pantalla = self.pantalla;
+                            let ctx = ui.ctx().clone();
+                            std::thread::spawn(move || {
+                                let _ = envio.send(puente.catalogo(edicion, pantalla));
+                                ctx.request_repaint();
+                            });
+                            self.error = None;
+                            self.carga = Some(recepcion);
+                        }
+                    });
+                });
+                if self.carga.is_some() {
+                    ui.label("Cargando catálogo…");
+                }
+                if let Some(e) = &self.error {
+                    ui.label(RichText::new(e).color(p.red));
+                }
             });
-            if self.carga.is_some() {
-                ui.label("Cargando catálogo…");
-            }
-            if let Some(e) = &self.error {
-                ui.label(RichText::new(e).color(p.amber));
-            }
-        });
     }
 }
 
@@ -1400,6 +1423,32 @@ impl Descargador {
         self.ejecucion.contexto.abrir_en_trabajo.take().or_else(|| self.ejecucion.flujo.abrir_en_trabajo.take())
     }
 
+    /// Estado resumido de la conexión con Chrome para la barra de estado global.
+    pub fn estado_barra(&self) -> (bool, &'static str) {
+        let conectado = self.conexion.puente.as_ref().is_some_and(|b| b.conectado());
+        let etiqueta = match (conectado, self.edicion) {
+            (true, Edicion::Integral) => "Chrome Integral",
+            (true, Edicion::Lite) => "Chrome Lite",
+            (false, Edicion::Integral) => "Chrome Integral · desconectado",
+            (false, Edicion::Lite) => "Chrome Lite · desconectado",
+        };
+        (conectado, etiqueta)
+    }
+
+    pub fn activo_barra(&self) -> Option<&'static str> {
+        if self.ejecucion.flujo.activa() {
+            Some("Creando paquete CSMP…")
+        } else if self.ejecucion.activa() {
+            Some("Descargando lote…")
+        } else if self.ejecucion.contexto.activa() {
+            Some("Leyendo bitácoras…")
+        } else if self.conjunta.recepcion.is_some() {
+            Some("Descarga conjunta en curso…")
+        } else {
+            None
+        }
+    }
+
     pub fn mostrar(&mut self, ui: &mut Ui, p: &Pal) {
         self.ejecucion.recibir();
         self.conjunta.recibir();
@@ -1416,119 +1465,143 @@ impl Descargador {
         let ejecutando = self.ejecucion.activa() || self.ejecucion.contexto.activa() || self.ejecucion.flujo.activa() || self.conjunta.recepcion.is_some();
         if self.estaba_ejecutando && !ejecutando { self.resultados.invalidar_indice(); }
         self.estaba_ejecutando = ejecutando;
+        self.resultados.solo_originales = self.edicion == Edicion::Lite;
+        let terminada = self.ejecucion.terminada();
+        self.resultados.ofrecer(ui.ctx(), terminada);
+
         theme::titulo(
             ui,
             p,
             "Descargador",
             "Perfiles de consulta desde Chrome o un catálogo JSON",
         );
-        theme::seccion(ui, p, "1. Alcance y filtros");
-        theme::card(p).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.add_enabled_ui(!ejecutando, |ui| self.mostrar_perfiles(ui, p));
+        ui.horizontal_wrapped(|ui| {
+            theme::segmented_tab(ui, &mut self.tab, TabDescargador::Alcance, "1. Conexión y Alcance", p);
+            theme::segmented_tab(ui, &mut self.tab, TabDescargador::Ejecucion, "2. Ejecución y Paquete", p);
+            theme::segmented_tab(ui, &mut self.tab, TabDescargador::Resultados, "3. Historial y Resultados", p);
         });
+        ui.add_space(8.0);
+
         let conectado = self.edicion == Edicion::Integral && self.conexion.puente.as_ref().is_some_and(|p| p.conectado());
         let seguimiento = self.catalogo.as_ref().is_some_and(|c| c.pantalla == Pantalla::Seguimiento) && self.catalogo_remoto;
-        if let Some(catalogo) = &self.catalogo {
-            if catalogo.pantalla != Pantalla::Carga || self.edicion == Edicion::Integral {
-                ui.add_space(8.0);
+
+        match self.tab {
+            TabDescargador::Alcance => {
+                theme::seccion(ui, p, "1. Alcance y filtros");
                 theme::card(p).show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    egui::CollapsingHeader::new("Planificar lote")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            ui.add_enabled_ui(!ejecutando, |ui| {
-                                if mostrar_lote(
-                                    ui,
-                                    p,
-                                    catalogo,
-                                    self.edicion,
-                                    &mut self.lote,
-                                    (&mut self.lote_desde, &mut self.lote_hasta),
-                                    &mut self.todas_las_fechas,
-                                    &mut self.plan,
-                                ) {
-                                    self.plan_pendiente = None;
-                                }
-                                let hoy = chrono::Local::now().date_naive();
-                                let favoritos = self.favoritos.get_or_insert_with(|| {
-                                    Preferencias::cargar(&Preferencias::ruta()).favoritos.into_keys().collect()
-                                });
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.add(egui::TextEdit::singleline(&mut self.favorito_nombre).hint_text("Nombre del favorito").desired_width(180.0));
-                                    if ui.button("Guardar favorito").on_hover_text("Guarda el alcance; las fechas se recalculan al aplicarlo").clicked() {
-                                        let ruta = Preferencias::ruta();
-                                        let mut prefs = Preferencias::cargar(&ruta);
-                                        let resultado = plan_desde_campos(catalogo, self.edicion, &mut self.lote, &self.lote_desde, &self.lote_hasta, self.todas_las_fechas)
-                                            .and_then(|_| prefs.guardar_favorito(&self.favorito_nombre, catalogo.pantalla, &self.lote, self.ejecucion.conservar_filtros, hoy))
-                                            .and_then(|()| prefs.guardar(&ruta));
-                                        self.favorito_mensaje = Some(resultado.map(|()| "Perfil guardado; recalcula el período al aplicarlo.".into()));
-                                        *favoritos = prefs.favoritos.into_keys().collect();
-                                    }
-                                    if !favoritos.is_empty() {
-                                        ComboBox::from_id_salt("favoritos")
-                                            .selected_text(if self.favorito_elegido.is_empty() { "Elegir favorito" } else { self.favorito_elegido.as_str() })
-                                            .show_ui(ui, |ui| {
-                                                for f in favoritos.iter() {
-                                                    ui.selectable_value(&mut self.favorito_elegido, f.clone(), f);
-                                                }
-                                            });
-                                        if ui.button("Aplicar").clicked() {
-                                            match Preferencias::cargar(&Preferencias::ruta()).aplicar_favorito(&self.favorito_elegido, catalogo, hoy) {
-                                                Ok((lote, retirados)) => {
-                                                    if let Some((a, b)) = lote.fechas {
-                                                        self.lote_desde = a.format("%d/%m/%Y").to_string();
-                                                        self.lote_hasta = b.format("%d/%m/%Y").to_string();
-                                                    } else {
-                                                        self.lote_desde.clear();
-                                                        self.lote_hasta.clear();
+                    ui.add_enabled_ui(!ejecutando, |ui| self.mostrar_perfiles(ui, p));
+                });
+                if let Some(catalogo) = &self.catalogo {
+                    if catalogo.pantalla != Pantalla::Carga || self.edicion == Edicion::Integral {
+                        ui.add_space(8.0);
+                        theme::card(p).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            egui::CollapsingHeader::new("Planificar lote")
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    ui.add_enabled_ui(!ejecutando, |ui| {
+                                        if mostrar_lote(
+                                            ui,
+                                            p,
+                                            catalogo,
+                                            self.edicion,
+                                            &mut self.lote,
+                                            (&mut self.lote_desde, &mut self.lote_hasta),
+                                            &mut self.todas_las_fechas,
+                                            &mut self.plan,
+                                        ) {
+                                            self.plan_pendiente = None;
+                                        }
+                                        let hoy = chrono::Local::now().date_naive();
+                                        let favoritos = self.favoritos.get_or_insert_with(|| {
+                                            Preferencias::cargar(&Preferencias::ruta()).favoritos.into_keys().collect()
+                                        });
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.add(egui::TextEdit::singleline(&mut self.favorito_nombre).hint_text("Nombre del favorito").desired_width(180.0));
+                                            if ui.button("Guardar favorito").on_hover_text("Guarda el alcance; las fechas se recalculan al aplicarlo").clicked() {
+                                                let ruta = Preferencias::ruta();
+                                                let mut prefs = Preferencias::cargar(&ruta);
+                                                let resultado = plan_desde_campos(catalogo, self.edicion, &mut self.lote, &self.lote_desde, &self.lote_hasta, self.todas_las_fechas)
+                                                    .and_then(|_| prefs.guardar_favorito(&self.favorito_nombre, catalogo.pantalla, &self.lote, self.ejecucion.conservar_filtros, hoy))
+                                                    .and_then(|()| prefs.guardar(&ruta));
+                                                self.favorito_mensaje = Some(resultado.map(|()| "Perfil guardado; recalcula el período al aplicarlo.".into()));
+                                                *favoritos = prefs.favoritos.into_keys().collect();
+                                            }
+                                            if !favoritos.is_empty() {
+                                                ComboBox::from_id_salt("favoritos")
+                                                    .selected_text(if self.favorito_elegido.is_empty() { "Elegir favorito" } else { self.favorito_elegido.as_str() })
+                                                    .show_ui(ui, |ui| {
+                                                        for f in favoritos.iter() {
+                                                            ui.selectable_value(&mut self.favorito_elegido, f.clone(), f);
+                                                        }
+                                                    });
+                                                if ui.button("Aplicar").clicked() {
+                                                    match Preferencias::cargar(&Preferencias::ruta()).aplicar_favorito(&self.favorito_elegido, catalogo, hoy) {
+                                                        Ok((lote, retirados)) => {
+                                                            if let Some((a, b)) = lote.fechas {
+                                                                self.lote_desde = a.format("%d/%m/%Y").to_string();
+                                                                self.lote_hasta = b.format("%d/%m/%Y").to_string();
+                                                            } else {
+                                                                self.lote_desde.clear();
+                                                                self.lote_hasta.clear();
+                                                            }
+                                                            self.lote = lote;
+                                                            // Un favorito sin fechas no sustituye la confirmación explícita.
+                                                            self.todas_las_fechas = false;
+                                                            self.plan_pendiente = None;
+                                                            self.plan = None;
+                                                            let mut texto = String::from("Favorito aplicado; revisa el alcance y las fechas.");
+                                                            if !retirados.is_empty() {
+                                                                texto.push_str(&format!(" Opciones retiradas: {}", retirados.join(", ")));
+                                                            }
+                                                            self.favorito_mensaje = Some(Ok(texto));
+                                                        }
+                                                        Err(e) => self.favorito_mensaje = Some(Err(e)),
                                                     }
-                                                    self.lote = lote;
-                                                    // Un favorito sin fechas no sustituye la confirmación explícita.
-                                                    self.todas_las_fechas = false;
-                                                    self.plan_pendiente = None;
-                                                    self.plan = None;
-                                                    let mut texto = String::from("Favorito aplicado; revisa el alcance y las fechas.");
-                                                    if !retirados.is_empty() {
-                                                        texto.push_str(&format!(" Opciones retiradas: {}", retirados.join(", ")));
-                                                    }
-                                                    self.favorito_mensaje = Some(Ok(texto));
                                                 }
-                                                Err(e) => self.favorito_mensaje = Some(Err(e)),
+                                            }
+                                        });
+                                        match &self.favorito_mensaje {
+                                            Some(Ok(t)) => { ui.label(RichText::new(t).color(p.green)); }
+                                            Some(Err(e)) => { ui.label(RichText::new(e).color(p.red)); }
+                                            None => {}
+                                        }
+                                        if ui
+                                            .button("Recuperar pendientes de un lote…")
+                                            .on_hover_text("Elige la carpeta de un lote incompleto: sus consultas faltantes se descargan desde la página 1 en un lote nuevo")
+                                            .clicked()
+                                        {
+                                            if let Some(carpeta) = rfd::FileDialog::new().set_title("Carpeta del lote incompleto").pick_folder() {
+                                                let edicion = self.edicion;
+                                                match lote::pendientes(&carpeta).and_then(|p| catalogo.planificar_pendientes(edicion, &p)) {
+                                                    Ok(plan) => {
+                                                        if let Some((a, b)) = plan.fechas {
+                                                            self.lote_desde = a.format("%d/%m/%Y").to_string();
+                                                            self.lote_hasta = b.format("%d/%m/%Y").to_string();
+                                                        } else {
+                                                            self.lote_desde.clear();
+                                                            self.lote_hasta.clear();
+                                                        }
+                                                        self.todas_las_fechas = false;
+                                                        self.plan = None;
+                                                        self.plan_pendiente = Some(plan);
+                                                    }
+                                                    Err(e) => { self.plan_pendiente = None; self.plan = Some(Err(e)); }
+                                                }
                                             }
                                         }
-                                    }
+                                    });
                                 });
-                                match &self.favorito_mensaje {
-                                    Some(Ok(t)) => { ui.label(RichText::new(t).color(p.green)); }
-                                    Some(Err(e)) => { ui.label(RichText::new(e).color(p.amber)); }
-                                    None => {}
-                                }
-                                if ui
-                                    .button("Recuperar pendientes de un lote…")
-                                    .on_hover_text("Elige la carpeta de un lote incompleto: sus consultas faltantes se descargan desde la página 1 en un lote nuevo")
-                                    .clicked()
-                                {
-                                    if let Some(carpeta) = rfd::FileDialog::new().set_title("Carpeta del lote incompleto").pick_folder() {
-                                        let edicion = self.edicion;
-                                        match lote::pendientes(&carpeta).and_then(|p| catalogo.planificar_pendientes(edicion, &p)) {
-                                            Ok(plan) => {
-                                                if let Some((a, b)) = plan.fechas {
-                                                    self.lote_desde = a.format("%d/%m/%Y").to_string();
-                                                    self.lote_hasta = b.format("%d/%m/%Y").to_string();
-                                                } else {
-                                                    self.lote_desde.clear();
-                                                    self.lote_hasta.clear();
-                                                }
-                                                self.todas_las_fechas = false;
-                                                self.plan = None;
-                                                self.plan_pendiente = Some(plan);
-                                            }
-                                            Err(e) => { self.plan_pendiente = None; self.plan = Some(Err(e)); }
-                                        }
-                                    }
-                                }
-                            });
+                        });
+                    }
+                }
+            }
+            TabDescargador::Ejecucion => {
+                if let Some(catalogo) = &self.catalogo {
+                    if catalogo.pantalla != Pantalla::Carga || self.edicion == Edicion::Integral {
+                        theme::card(p).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
                             let actual = plan_desde_campos(catalogo, self.edicion, &mut self.lote, &self.lote_desde, &self.lote_hasta, self.todas_las_fechas);
                             let plan_visible = actual.as_ref().ok();
                             if let Err(e) = &actual {
@@ -1605,39 +1678,49 @@ impl Descargador {
                                 opciones_paquete,
                             );
                         });
+                        ui.add_space(8.0);
+                    }
+                } else {
+                    theme::card(p).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new("Carga un catálogo desde Chrome o un JSON en «1. Conexión y Alcance» para ejecutar lotes o crear paquetes.").color(p.muted));
+                    });
+                    ui.add_space(8.0);
+                }
+                theme::card(p).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    theme::seccion(ui, p, "Descarga conjunta · todas las fechas");
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add_enabled(!ejecutando && conectado && seguimiento && !self.lote.tribunales.is_empty(), egui::Button::new("Descarga conjunta CSMP")).clicked() {
+                            if self.lote.pestanas.len() != 1 || !matches!(self.lote.pestanas[0].as_str(), "Espera" | "Cumplimiento") {
+                                self.conjunta.mensajes.push("Selecciona Espera o Cumplimiento para la descarga conjunta.".into());
+                            } else if !matches!(rango_visible(Pantalla::Seguimiento, &self.lote_desde, &self.lote_hasta, self.todas_las_fechas), Ok(None)) {
+                                self.conjunta.mensajes.push("La descarga conjunta CSMP usa todas las fechas. Marca esa opción expresamente o utiliza Consultar y crear paquete para un rango de ingresos.".into());
+                            } else if let Some(puente) = self.conexion.puente.clone() {
+                                self.conjunta.lanzar(ui.ctx(), puente, PathBuf::from(&self.ejecucion.destino), self.lote.tribunales.clone(), self.lote.modalidades.clone(), self.lote.pestanas[0].clone(), chrono::Local::now().date_naive(), 60, None, self.ejecucion.pausa);
+                            }
+                        }
+                        if ui.add_enabled(!ejecutando && conectado, egui::Button::new("Retomar flujo…")).clicked() {
+                            if let (Some(carpeta), Some(puente)) = (rfd::FileDialog::new().set_title("Elegir carpeta de descarga conjunta").pick_folder(), self.conexion.puente.clone()) {
+                                if let Err(error) = self.conjunta.retomar(ui.ctx(), puente, carpeta, self.ejecucion.pausa) { self.conjunta.mensajes.push(error); }
+                            }
+                        }
+                        if let Some(cancelar) = &self.conjunta.cancelar {
+                            if ui.button("Cancelar descarga conjunta").clicked() { cancelar.store(true, Ordering::Relaxed); }
+                        }
+                    });
+                    for mensaje in self.conjunta.mensajes.iter().rev().take(5).rev() { ui.label(mensaje); }
+                });
+            }
+            TabDescargador::Resultados => {
+                theme::seccion(ui, p, "3. Paquete y resultados");
+                theme::card(p).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    self.resultados.mostrar(ui, p);
                 });
             }
         }
-        theme::seccion(ui, p, "Descarga conjunta · todas las fechas");
-        ui.horizontal_wrapped(|ui| {
-            if ui.add_enabled(!ejecutando && conectado && seguimiento && !self.lote.tribunales.is_empty(), egui::Button::new("Descarga conjunta CSMP")).clicked() {
-                if self.lote.pestanas.len() != 1 || !matches!(self.lote.pestanas[0].as_str(), "Espera" | "Cumplimiento") {
-                    self.conjunta.mensajes.push("Selecciona Espera o Cumplimiento para la descarga conjunta.".into());
-                } else if !matches!(rango_visible(Pantalla::Seguimiento, &self.lote_desde, &self.lote_hasta, self.todas_las_fechas), Ok(None)) {
-                    self.conjunta.mensajes.push("La descarga conjunta CSMP usa todas las fechas. Marca esa opción expresamente o utiliza Consultar y crear paquete para un rango de ingresos.".into());
-                } else if let Some(puente) = self.conexion.puente.clone() {
-                    self.conjunta.lanzar(ui.ctx(), puente, PathBuf::from(&self.ejecucion.destino), self.lote.tribunales.clone(), self.lote.modalidades.clone(), self.lote.pestanas[0].clone(), chrono::Local::now().date_naive(), 60, None, self.ejecucion.pausa);
-                }
-            }
-            if ui.add_enabled(!ejecutando && conectado, egui::Button::new("Retomar flujo…")).clicked() {
-                if let (Some(carpeta), Some(puente)) = (rfd::FileDialog::new().set_title("Elegir carpeta de descarga conjunta").pick_folder(), self.conexion.puente.clone()) {
-                    if let Err(error) = self.conjunta.retomar(ui.ctx(), puente, carpeta, self.ejecucion.pausa) { self.conjunta.mensajes.push(error); }
-                }
-            }
-            if let Some(cancelar) = &self.conjunta.cancelar {
-                if ui.button("Cancelar descarga conjunta").clicked() { cancelar.store(true, Ordering::Relaxed); }
-            }
-        });
-        for mensaje in self.conjunta.mensajes.iter().rev().take(5).rev() { ui.label(mensaje); }
-        theme::seccion(ui, p, "3. Paquete y resultados");
         self.estaba_ejecutando |= self.ejecucion.activa() || self.ejecucion.contexto.activa() || self.ejecucion.flujo.activa() || self.conjunta.recepcion.is_some();
-        let terminada = self.ejecucion.terminada();
-        self.resultados.ofrecer(ui.ctx(), terminada);
-        ui.add_space(8.0);
-        theme::card(p).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            self.resultados.mostrar(ui, p);
-        });
     }
 
     fn mostrar_perfiles(&mut self, ui: &mut Ui, p: &Pal) {
@@ -1663,7 +1746,7 @@ impl Descargador {
                     ui.label(RichText::new(texto).color(p.green));
                 }
                 Some(Err(e)) => {
-                    ui.label(RichText::new(e).color(p.amber));
+                    ui.label(RichText::new(e).color(p.red));
                 }
                 None => {}
             }
@@ -1679,7 +1762,7 @@ impl Descargador {
                 self.plan = None;
                 self.plan_pendiente = None;
             }
-            self.conexion.mostrar(ui, p, self.edicion);
+            self.conexion.mostrar(ui, p, self.edicion, self.catalogo_remoto);
             if let Some(catalogo) = &self.catalogo {
                 ui.add_space(10.0);
                 theme::seccion(ui, p, catalogo.pantalla.etiqueta());
@@ -1773,7 +1856,7 @@ impl Descargador {
                 ui.label(RichText::new(&perfil.etiqueta).color(p.green));
             }
             if let Some(e) = &self.error {
-                ui.label(RichText::new(e).color(p.amber));
+                ui.label(RichText::new(e).color(p.red));
             }
         }
     }
@@ -1898,8 +1981,7 @@ fn mostrar_lote(
     }
     let mut descartar_pendientes = cambio;
     if !matches!(catalogo.pantalla, Pantalla::CalendarioInformes | Pantalla::CalendarioMedidas) {
-        ui.label("Alcance de ingresos del lote");
-        ui.label(RichText::new("Alcance de ingresos (Descargador)").strong());
+        ui.label(RichText::new("Alcance de ingresos del lote").strong());
         let edito = ui.horizontal_wrapped(|ui| fecha(ui, "Desde", desde) | fecha(ui, "Hasta", hasta)).inner;
         if edito { *todas = false; }
         descartar_pendientes |= edito;
@@ -1930,7 +2012,7 @@ fn mostrar_lote(
                 });
         }
         Some(Err(e)) => {
-            ui.label(RichText::new(e).color(p.amber));
+            ui.label(RichText::new(e).color(p.red));
         }
         None => {}
     }
@@ -1953,10 +2035,24 @@ fn marcas<'a>(
     lista: impl Iterator<Item = (&'a str, &'a str)>,
     elegidas: &mut Vec<String>,
 ) -> bool {
+    let items: Vec<(&'a str, &'a str)> = lista.collect();
     ui.horizontal_wrapped(|ui| {
-        ui.label(titulo);
+        ui.label(RichText::new(titulo).strong());
         let mut cambio = false;
-        for (clave, etiqueta) in lista {
+        if items.len() > 1 {
+            if ui.push_id((titulo, "todos"), |ui| ui.small_button("Todos")).inner.clicked() {
+                let todas: Vec<String> = items.iter().map(|(k, _)| (*k).to_owned()).collect();
+                if *elegidas != todas {
+                    *elegidas = todas;
+                    cambio = true;
+                }
+            }
+            if ui.push_id((titulo, "ninguno"), |ui| ui.small_button("Ninguno")).inner.clicked() && !elegidas.is_empty() {
+                elegidas.clear();
+                cambio = true;
+            }
+        }
+        for (clave, etiqueta) in items {
             let elegida = elegidas.iter().position(|s| s == clave);
             let mut marcada = elegida.is_some();
             if ui.checkbox(&mut marcada, etiqueta).changed() {
@@ -2020,6 +2116,8 @@ mod pruebas_interfaz {
         let pal = theme::pal(false);
         let mut h = Harness::builder().with_size(egui::Vec2::new(1200.0, 800.0))
             .build_ui_state(move |ui, vista: &mut Descargador| vista.mostrar(ui, &pal), Descargador::default());
+        h.run();
+        h.get_by_label("2. Ejecución y Paquete").click();
         h.run();
         assert!(h.get_by_label("Descarga conjunta CSMP").is_disabled());
         assert!(h.get_by_label("Retomar flujo…").is_disabled());

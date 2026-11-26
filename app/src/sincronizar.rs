@@ -49,6 +49,7 @@ struct Cambio {
     excel: BTreeMap<String, String>,
     decisiones: Option<Option<serde_json::Value>>,
     raw_entrante: Option<String>,
+    entrante_data: Option<serde_json::Value>,
 }
 
 /// Elecciones de la persona ante un conflicto: (fila, campo) → valor.
@@ -285,8 +286,7 @@ pub fn recordar_exportacion(w: &mut Trabajo, hoja: &str) {
     }
 }
 
-fn identidad(headers: &[String], fila: &[Cell], claves: &[&str], modo: crate::motor::Mode) -> Vec<String> {
-    let mapa = lectura::map_columns(headers, modo);
+fn identidad(mapa: &crate::motor::Cols, fila: &[Cell], claves: &[&str]) -> Vec<String> {
     claves
         .iter()
         .map(|k| mapa.get(k).and_then(|&i| fila.get(i)).map(|c| historical_match(&c.display())).unwrap_or_default())
@@ -299,7 +299,7 @@ fn asociar(w: &Trabajo, headers: &[String], filas: &[Vec<Cell>]) -> Result<Vec<u
     if !["rit", "nombre", "tribunal"].iter().all(|k| claves.contains(k)) {
         return Err(rechazo("Faltan campos de identidad; no se aplicaron cambios."));
     }
-    let modo = w.mode();
+    let mapa = lectura::map_columns(headers, w.mode());
     let col_id = pos(headers, "NURUS_ID_REGISTRO");
     let por_id: HashMap<&str, usize> = w.registros.iter().enumerate().filter(|(_, r)| !r.id_excel.is_empty()).map(|(i, r)| (r.id_excel.as_str(), i)).collect();
     let mut por_identidad: HashMap<Vec<String>, Vec<usize>> = HashMap::new();
@@ -310,7 +310,7 @@ fn asociar(w: &Trabajo, headers: &[String], filas: &[Vec<Cell>]) -> Result<Vec<u
     let mut resultado = Vec::with_capacity(filas.len());
     let mut vistas = HashSet::new();
     for fila in filas {
-        let en_excel = identidad(headers, fila, &claves, modo);
+        let en_excel = identidad(&mapa, fila, &claves);
         let i = match col_id {
             Some(c) => {
                 let id = fila.get(c).map(|v| v.display().trim().to_string()).unwrap_or_default();
@@ -370,6 +370,8 @@ fn combinar(
 pub fn actualizar(w: &mut Trabajo, cfg: &Config, headers: &[String], filas: &[Vec<Cell>], resoluciones: &Resoluciones) -> Result<Resumen, Error> {
     let asociadas = asociar(w, headers, filas)?;
     let cols = columnas(headers);
+    let col_decisiones = pos(headers, "NURUS_DECISIONES");
+    let mapa = lectura::map_columns(headers, w.mode());
     let mut conflictos = Vec::new();
     // (fila de Trabajo, valores a aplicar, revisión que ve Excel)
     let mut cambios: Vec<Cambio> = Vec::new();
@@ -405,12 +407,14 @@ pub fn actualizar(w: &mut Trabajo, cfg: &Config, headers: &[String], filas: &[Ve
         // Se compara el estado completo codificado (decisions, overrides, word_overrides, excluded, proposal, resolution_cell).
         let mut decisiones = None;
         let mut raw_entrante = None;
-        if let Some(c) = pos(headers, "NURUS_DECISIONES") {
+        let mut entrante_data = None;
+        if let Some(c) = col_decisiones {
             let technical_raw = fila.get(c).map(|v| v.display().trim().to_string()).unwrap_or_default();
             raw_entrante = Some(technical_raw.clone());
             let technical_data = decodificar_decisiones(&technical_raw)?;
             let baseline_data = r.sync_decisiones.as_deref().and_then(|s| decodificar_decisiones(s).ok().flatten());
             validar_anulaciones(w, &technical_data)?;
+            entrante_data = technical_data.clone();
             if technical_data.is_some() && !equivalente(&technical_data, &baseline_data) {
                 let local_raw = codificar_decisiones(r);
                 let local_data = decodificar_decisiones(&local_raw)?;
@@ -437,7 +441,7 @@ pub fn actualizar(w: &mut Trabajo, cfg: &Config, headers: &[String], filas: &[Ve
                 decisiones = Some(data_to_restore);
             }
         }
-        cambios.push(Cambio { fila: i, fusion, excel, decisiones, raw_entrante });
+        cambios.push(Cambio { fila: i, fusion, excel, decisiones, raw_entrante, entrante_data });
     }
     if !conflictos.is_empty() {
         return Err(Error::Conflictos(conflictos));
@@ -482,18 +486,18 @@ pub fn actualizar(w: &mut Trabajo, cfg: &Config, headers: &[String], filas: &[Ve
                 r.resolucion = "review".to_string();
             }
         }
-        r.sync_correo = c.raw_entrante.as_deref().and_then(|raw| {
-            decodificar_decisiones(raw).ok().flatten().and_then(|d| {
-                d.get("decisions")
-                    .and_then(|dec| dec.get("mail"))
-                    .map(|m| serde_json::to_string(m).unwrap_or_default())
-            })
-        }).or_else(|| Some(serde_json::to_string(&r.gestiones_correo).unwrap_or_default()));
-        r.sync_anulaciones = c.raw_entrante.as_deref().and_then(|raw| {
-            decodificar_decisiones(raw).ok().flatten().and_then(|d| {
-                d.get("overrides").map(|o| serde_json::to_string(o).unwrap_or_default())
-            })
-        }).or_else(|| Some(serde_json::to_string(&r.anulaciones).unwrap_or_default()));
+        r.sync_correo = c
+            .entrante_data
+            .as_ref()
+            .and_then(|d| d.get("decisions").and_then(|dec| dec.get("mail")))
+            .map(|m| serde_json::to_string(m).unwrap_or_default())
+            .or_else(|| Some(serde_json::to_string(&r.gestiones_correo).unwrap_or_default()));
+        r.sync_anulaciones = c
+            .entrante_data
+            .as_ref()
+            .and_then(|d| d.get("overrides"))
+            .map(|o| serde_json::to_string(o).unwrap_or_default())
+            .or_else(|| Some(serde_json::to_string(&r.anulaciones).unwrap_or_default()));
         if let Some(raw) = c.raw_entrante {
             r.sync_decisiones = Some(raw);
         }
@@ -508,10 +512,13 @@ pub fn actualizar(w: &mut Trabajo, cfg: &Config, headers: &[String], filas: &[Ve
         ) {
             resumen.filas_cambiadas += 1;
         }
-        r.sync_base = Some(c.excel.clone());
-        r.sync_local = Some(c.excel);
+        let local = revision_local(r)
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.unwrap_or_else(|| c.excel.get(k).cloned().unwrap_or_default())))
+            .collect();
+        r.sync_local = Some(local);
+        r.sync_base = Some(c.excel);
         // Columnas de origen que cambiaron en la copia (sin las de identidad, que `asociar` ya validó).
-        let mapa = lectura::map_columns(headers, w.mode());
         let w_ref: &Trabajo = w;
         let editadas: Vec<(usize, usize)> = w_ref
             .cols

@@ -1,6 +1,6 @@
 # Estado de Flow Rust
 
-Actualizado: 26 de noviembre de 2026. Las **Tandas 1 y 2** (`E-P0-C1`, `E-P0-B1`, `E-P1-A1`, `E-P1-A2`, `E-P1-B2`, `E-P1-C2`), `E-Q11`, **E-P2-OPT** y el **Plan Waffle** (política de perfil Tomé para otros tribunales válidos con revisión manual para vacíos/marcadores/ambiguos en `flow-python` `be9d9ae`, `app/` y `flow-motor`, preservación de identidad y aviso de matriz faltante, regeneración de `rust/casos`, y validación diferenciada de fechas en `lote.rs` y `bitacoras.rs`) están **`HECHO`** con CI Linux y Windows en verde y regeneración de oráculos corrida (run `45894872026`, commit `60cdfce`). Es la única fuente del estado: se edita en el mismo commit que cierra cada encargo.
+Actualizado: 26 de noviembre de 2026. Las **Tandas 1 y 2** (`E-P0-C1`, `E-P0-B1`, `E-P1-A1`, `E-P1-A2`, `E-P1-B2`, `E-P1-C2`), `E-Q11`, **E-P2-OPT**, el **Plan Waffle** y la **Auditoría Integral + Modernización UI Opción A + Consolidado Lite solo columnas originales** (correcciones de seguridad/PII `PII-1..3`/`SEC-1..8`/`SEC-12..13`, estabilidad/concurrencia en `puente.rs`/extensión/núcleo, optimizaciones `OnceLock`/`IndexMap`/XLS, rediseño `egui 0.31+` con barra de estado global y 3 sub-pestañas en Descargador, y `exportar_libro_solo_originales` para modo Lite) están implementados y verificados en local (270/270 pruebas Rust y 6 verificadores en verde; pendiente CI remota de este commit). Es la única fuente del estado: se edita en el mismo commit que cierra cada encargo.
 
 - Aplicación: `app/` (`flow_rust.exe`). Referencia funcional: rama `flow-python` en `MatiGaete2023/waffle` (fijada en `be9d9aee717d`).
 - Rama única: `estudio/paridad-python-rust-20261119`.
@@ -50,7 +50,7 @@ Actualizado: 26 de noviembre de 2026. Las **Tandas 1 y 2** (`E-P0-C1`, `E-P0-B1`
 - **F21 Histórico de Protección — Sí**, con suspensión por fallas.
 - **F22 Exportaciones de lote y flujos — Sí (`HECHO`, run `45894872026`).**
   - Paquete `CSMP_CAPTURE` publicado en pareja con `.diagnostico_cobertura.json` anónimo, validación canónica anti-traversal y carga única de historias (E-P0-C1, E-P1-B2).
-  - Excel del lote (`EXCEL_BITACORAS` 3/3), libro consolidado en memoria y «Para CSMP» (`LIBROS` 14/14), CSV, ICS, ZIP y comparador (`PRODUCTOS` 13/13).
+  - Excel del lote (`EXCEL_BITACORAS` 3/3), libro consolidado en memoria y «Para CSMP» (`LIBROS` 14/14), libro consolidado **Lite solo con columnas originales** (`exportar_libro_solo_originales`, sin columnas `SITFA_*` del asistente), CSV (con cabeceras sanitizadas), ICS, ZIP y comparador (`PRODUCTOS` 13/13).
   - «Consultar y crear paquete» en una acción con reanudación (E-Q9, 12 casos), «Un paquete por hoja» (E-Q10, E-P0-C1) y descarga conjunta CSMP con «Retomar pendientes» (E-Q11, 8 casos).
   - «Resultados del lote» con conjuntos `flujo.json`, reunión de bitácoras de otras carpetas (E-S2, 22 casos), historial local, vista conjunta (E-S3) e índice cacheado en memoria (E-P1-C2).
 - **F27 Intercambio entre herramientas — Sí, opción B (D-9).** «Abrir en Trabajo» tras crear el paquete.

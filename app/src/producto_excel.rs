@@ -160,7 +160,7 @@ fn fuentes(w: &Trabajo, hoja: &str) -> Fuentes {
 
 fn vencimientos(w: &Trabajo) -> Vec<Vec<String>> {
     let mut filas = vec![["Vencimiento", "Tribunal", "Lote", "Archivo", "Fila", "Estado de fecha"].iter().map(|s| s.to_string()).collect::<Vec<_>>()];
-    let mut datos: Vec<(chrono::NaiveDate, String, String, String)> = Vec::new();
+    let mut datos: Vec<(chrono::NaiveDate, String, &'static str, String, String, String)> = Vec::new();
     let archivo = pos(&w.headers, "SITFA_ARCHIVO");
     for r in &w.registros {
         let clave = ["vencimiento", "egreso_proy"].into_iter().find(|k| w.cols.contains_key(*k));
@@ -171,19 +171,19 @@ fn vencimientos(w: &Trabajo) -> Vec<Vec<String>> {
             None if crudo.is_empty() => continue,
             None => (chrono::NaiveDate::MAX, crudo),
         };
-        let valida = d != chrono::NaiveDate::MAX;
+        let estado = if d != chrono::NaiveDate::MAX { "Fecha válida" } else { "No interpretable" };
         datos.push((
             d,
-            texto + if valida { "|Fecha válida" } else { "|No interpretable" },
+            texto,
+            estado,
             w.value(r, "tribunal"),
-            archivo.and_then(|c| r.values.get(c)).map(Cell::display).unwrap_or_default() + "|" + &r.fila_excel.to_string(),
+            archivo.and_then(|c| r.values.get(c)).map(Cell::display).unwrap_or_default(),
+            r.fila_excel.to_string(),
         ));
     }
     datos.sort();
-    for (_, texto, tribunal, origen) in datos {
-        let (venc, estado) = texto.split_once('|').unwrap_or((&texto, ""));
-        let (archivo, fila) = origen.split_once('|').unwrap_or((&origen, ""));
-        filas.push(vec![venc.into(), tribunal, String::new(), archivo.into(), fila.into(), estado.into()]);
+    for (_, venc, estado, tribunal, archivo, fila) in datos {
+        filas.push(vec![venc, tribunal, String::new(), archivo, fila, estado.into()]);
     }
     filas
 }
@@ -244,6 +244,11 @@ pub fn encabezados(w: &Trabajo) -> Vec<String> {
 /// Filas de la hoja de datos, alineadas con `encabezados`.
 pub fn filas(w: &Trabajo) -> Vec<Vec<Cell>> {
     let h = encabezados(w);
+    let mut indice: std::collections::HashMap<String, usize> = std::collections::HashMap::with_capacity(h.len());
+    for (i, titulo) in h.iter().enumerate() {
+        indice.entry(normalizar(titulo)).or_insert(i);
+    }
+    let origen_pos: Vec<Option<usize>> = w.headers.iter().map(|t| indice.get(&normalizar(t)).copied()).collect();
     let etapa_revisada = w.registros.iter().any(revisada);
     let hoja = w.mode().label().to_uppercase();
     let ids = identificadores(w, &hoja);
@@ -252,14 +257,14 @@ pub fn filas(w: &Trabajo) -> Vec<Vec<Cell>> {
         .zip(&ids)
         .map(|(r, id)| {
             let mut fila: Vec<Cell> = vec![Cell::Empty; h.len()];
-            for (t, v) in w.headers.iter().zip(&r.values) {
-                if let Some(i) = pos(&h, t) {
+            for (pos_dest, v) in origen_pos.iter().zip(&r.values) {
+                if let Some(i) = *pos_dest {
                     fila[i] = v.clone();
                 }
             }
             let aprobada = revisada(r) && !r.excluido;
             let mut poner = |titulo: &str, v: String| {
-                if let Some(i) = pos(&h, titulo) {
+                if let Some(&i) = indice.get(&normalizar(titulo)) {
                     fila[i] = Cell::Text(v);
                 }
             };
@@ -303,7 +308,8 @@ pub fn hoja_datos(nombre: &str, h: &[String], datos: &[Vec<Cell>], excluidas: &[
         for (c, v) in fila.iter().enumerate() {
             let c = c as u16;
             if *excluido {
-                ws.write_string_with_format(n, c, v.display(), &f.exclusion).map_err(err)?;
+                let texto: String = v.display().chars().take(32767).collect();
+                ws.write_string_with_format(n, c, &texto, &f.exclusion).map_err(err)?;
                 continue;
             }
             match v {
@@ -316,8 +322,15 @@ pub fn hoja_datos(nombre: &str, h: &[String], datos: &[Vec<Cell>], excluidas: &[
                     ws.write_boolean(n, c, *b).map_err(err)?;
                 }
                 Cell::Date(d) => {
-                    let fecha = ExcelDateTime::from_ymd(chrono::Datelike::year(d) as u16, chrono::Datelike::month(d) as u8, chrono::Datelike::day(d) as u8).map_err(err)?;
-                    ws.write_datetime_with_format(n, c, &fecha, &f.fecha).map_err(err)?;
+                    let anio = chrono::Datelike::year(d);
+                    let fecha = (anio >= 1900)
+                        .then(|| ExcelDateTime::from_ymd(anio as u16, chrono::Datelike::month(d) as u8, chrono::Datelike::day(d) as u8).ok())
+                        .flatten();
+                    if let Some(fecha) = fecha {
+                        ws.write_datetime_with_format(n, c, &fecha, &f.fecha).map_err(err)?;
+                    } else {
+                        escribir_texto(&mut ws, n, c, &v.display())?;
+                    }
                 }
             }
         }

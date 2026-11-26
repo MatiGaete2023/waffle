@@ -215,9 +215,9 @@ fn escribir_captura_diagnosticada(
         .compression_method(zip::CompressionMethod::Deflated)
         .last_modified_time(fecha)
         .unix_permissions(0o600);
-    for (nombre, bruto) in &contenido {
+    for (nombre, bruto) in contenido {
         zip.start_file(nombre, opciones).map_err(|e| e.to_string())?;
-        zip.write_all(bruto).map_err(|e| e.to_string())?;
+        zip.write_all(&bruto).map_err(|e| e.to_string())?;
     }
     let bytes = zip.finish().map_err(|e| e.to_string())?.into_inner();
     validar_zip_paquete(&bytes, 80 * 1024 * 1024)?;
@@ -441,6 +441,7 @@ pub(super) fn mapeo(cabecera: &[String]) -> Result<BTreeMap<&'static str, usize>
 fn cabecera_y_filas(libro: &xls::Libro) -> Result<(Vec<String>, Filas), String> {
     use super::sitfa::registros::{columnas as columnas_registro, registro};
     let mut cabecera: Option<Vec<String>> = None;
+    let mut cols_reg = None;
     let mut filas = Vec::new();
     for (i, fila) in libro.grilla().iter().enumerate() {
         let numero = i + 1;
@@ -456,12 +457,14 @@ fn cabecera_y_filas(libro: &xls::Libro) -> Result<(Vec<String>, Filas), String> 
             if cabecera.as_ref().is_some_and(|c| c != &actual) {
                 return Err("La cabecera cambia dentro del Excel.".into());
             }
+            if cols_reg.is_none() {
+                cols_reg = Some(columnas_registro(&actual)?.ok_or("Cabecera no reconocida.")?);
+            }
             cabecera = Some(actual);
             continue;
         }
-        let Some(c) = cabecera.as_ref() else { continue };
-        let cols = columnas_registro(c)?.ok_or("Cabecera no reconocida.")?;
-        if registro(fila, &cols).is_some() {
+        let (Some(c), Some(cols)) = (cabecera.as_ref(), cols_reg.as_ref()) else { continue };
+        if registro(fila, cols).is_some() {
             if fila.len() > c.len() && fila[c.len()..].iter().any(|v| !v.is_empty()) {
                 return Err("Hay datos fuera de la cabecera reconocida.".into());
             }
@@ -734,7 +737,41 @@ fn fila(pares: &[(&str, String)]) -> Map<String, Value> {
 
 type Fila = Map<String, Value>;
 pub(super) type Clave = [String; 3];
-type PorIngreso = Vec<(Clave, Value)>;
+
+#[derive(Default)]
+struct PorIngreso {
+    elementos: Vec<(Clave, Value)>,
+    indices: HashMap<Clave, usize>,
+}
+
+impl PorIngreso {
+    fn new() -> Self {
+        Self::default()
+    }
+    fn get(&self, k: &Clave) -> Option<&Value> {
+        self.indices.get(k).map(|&i| &self.elementos[i].1)
+    }
+    fn insert(&mut self, k: Clave, valor: Value) {
+        if let Some(&i) = self.indices.get(&k) {
+            self.elementos[i].1 = valor;
+        } else {
+            let idx = self.elementos.len();
+            self.indices.insert(k.clone(), idx);
+            self.elementos.push((k, valor));
+        }
+    }
+    fn len(&self) -> usize {
+        self.elementos.len()
+    }
+}
+
+impl IntoIterator for PorIngreso {
+    type Item = (Clave, Value);
+    type IntoIter = std::vec::IntoIter<(Clave, Value)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.elementos.into_iter()
+    }
+}
 
 /// `{k: '' for k in COMMON}` con los valores dados.
 fn comun(pares: &[(&str, String)]) -> Fila {
@@ -948,10 +985,7 @@ pub(super) fn clave_de(v: &Value) -> Clave {
 }
 
 fn poner(v: &mut PorIngreso, k: Clave, valor: Value) {
-    match v.iter_mut().find(|(c, _)| *c == k) {
-        Some(p) => p.1 = valor,
-        None => v.push((k, valor)),
-    }
+    v.insert(k, valor);
 }
 
 /// `diary_paths`: rutas resueltas sin repetir, en orden.
@@ -1137,7 +1171,7 @@ pub(super) fn importar_lote_completo(manifiesto: &Path) -> Result<LoteImportado,
         return Err("Falta el control de lecturas del lote.".into());
     };
     let carpeta = manifiesto.parent().ok_or("Control de bitácoras sin carpeta.")?;
-    let (mut consultas, mut calendarios) = (Vec::new(), Vec::new());
+    let (mut consultas, mut calendarios) = (PorIngreso::new(), PorIngreso::new());
     let mut libro: Vec<Vec<Value>> = Vec::new();
     for r in registros {
         if !r.is_object() || r.get("params").is_some_and(|p| !p.is_object()) {
@@ -1179,7 +1213,7 @@ pub(super) fn importar_lote_completo(manifiesto: &Path) -> Result<LoteImportado,
                 "entries": [], "stage_code": "", "captured_at": "", "captures": 0, "html_sha256": "", "warnings": [],
                 "row_metadata": [],
             }));
-            let viejo = consultas.iter().find(|(c, _)| *c == id).map(|(_, v): &(Clave, Value)| v.clone());
+            let viejo = consultas.get(&id).cloned();
             poner(&mut consultas, id, fusionar(viejo, q)?);
         }
     }
@@ -1253,7 +1287,7 @@ pub(super) fn importar_lotes(rutas: &[PathBuf], identidades: Option<&BTreeSet<Cl
     if rutas.is_empty() {
         return Err("Añade un control bitacoras.json con sus HTML originales.".into());
     }
-    let (mut consultas, mut calendarios): (PorIngreso, PorIngreso) = (Vec::new(), Vec::new());
+    let (mut consultas, mut calendarios) = (PorIngreso::new(), PorIngreso::new());
     let mut excluidas = 0;
     let (mut fuentes, mut extras): (Vec<Value>, Vec<HojaExtra>) = (Vec::new(), Vec::new());
     for ruta in &rutas {
@@ -1270,9 +1304,9 @@ pub(super) fn importar_lotes(rutas: &[PathBuf], identidades: Option<&BTreeSet<Cl
                 continue;
             }
             let ok = |c: &Value| c["coverage"] != "FALLIDA";
-            let reemplaza = match calendarios.iter().find(|(c, _)| *c == k) {
+            let reemplaza = match calendarios.get(&k) {
                 None => true,
-                Some((_, viejo)) => (ok(&cal) && !ok(viejo))
+                Some(viejo) => (ok(&cal) && !ok(viejo))
                     || (ok(&cal) == ok(viejo) && texto(&cal["captured_at"]) >= texto(&viejo["captured_at"])),
             };
             if reemplaza {
@@ -1284,7 +1318,7 @@ pub(super) fn importar_lotes(rutas: &[PathBuf], identidades: Option<&BTreeSet<Cl
                 excluidas += 1;
                 continue;
             }
-            let viejo = consultas.iter().find(|(c, _)| *c == k).map(|(_, v)| v.clone());
+            let viejo = consultas.get(&k).cloned();
             poner(&mut consultas, k, fusionar(viejo, q)?);
         }
     }

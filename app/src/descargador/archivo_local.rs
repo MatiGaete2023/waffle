@@ -177,8 +177,12 @@ pub fn ruta_fase(raiz: &Path, nombre: &Value) -> Result<PathBuf, String> {
 pub fn fases_conjunto(carpeta: &Path, parcial: bool) -> Result<Vec<PathBuf>, String> {
     let raiz = std::fs::canonicalize(carpeta).map_err(|e| format!("No se pudo abrir el lote: {e}"))?;
     let ruta = raiz.join("flujo.json");
-    let datos = std::fs::read(&ruta).map_err(|_| "Falta flujo.json.".to_string())?;
-    if datos.len() > 4 * 1024 * 1024 {
+    const MAX_FLUJO: usize = 4 * 1024 * 1024;
+    let mut archivo = std::fs::File::open(&ruta).map_err(|_| "Falta flujo.json.".to_string())?;
+    let mut datos = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(&mut archivo, (MAX_FLUJO as u64) + 1), &mut datos)
+        .map_err(|_| "Falta flujo.json.".to_string())?;
+    if datos.len() > MAX_FLUJO {
         return Err("El resumen excede el límite de lectura.".into());
     }
     let flujo: Value = serde_json::from_slice(&datos).map_err(|_| "Resumen JSON inválido.".to_string())?;

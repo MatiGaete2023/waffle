@@ -297,9 +297,18 @@ fn es_de_meta4(seleccion: &Value) -> bool {
 
 /// Fecha del último día con lecturas en los lotes de bitácoras (`fecha_lectura`): propone el corte.
 pub fn fecha_lectura(carpetas: &[PathBuf]) -> Option<NaiveDate> {
+    const MAX_MANIFIESTO: usize = 32 * 1024 * 1024;
     buscar_manifiestos(carpetas)
         .iter()
-        .filter_map(|p| serde_json::from_slice::<Value>(&std::fs::read(p).ok()?).ok())
+        .filter_map(|p| {
+            let mut f = std::fs::File::open(p).ok()?;
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::Read::take(&mut f, (MAX_MANIFIESTO as u64) + 1), &mut buf).ok()?;
+            if buf.len() > MAX_MANIFIESTO {
+                return None;
+            }
+            serde_json::from_slice::<Value>(&buf).ok()
+        })
         .flat_map(|d| {
             let mut v = d["registros"].as_array().cloned().unwrap_or_default();
             v.extend(d["anteriores_no_reenumeradas"].as_array().cloned().unwrap_or_default());

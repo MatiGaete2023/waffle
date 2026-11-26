@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use super::{lote, paquete, Alcance, Catalogo, Edicion, Pantalla, Perfil, PlanLote, SeleccionLote};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use calamine::{Data, Reader};
 use super::excel::{self, Hoja};
 use super::xls::Celda;
 
@@ -234,25 +233,12 @@ pub fn ejecutar_fase(
 /// Forma el libro conjunto y agrega la cobertura de firmas no consultadas.
 pub fn ensamblar(lotes: &[paquete::Lote], tribunales: &[String], hoy: NaiveDate, dias: u32, destino: &Path) -> Result<PathBuf, String> {
     let ahora = chrono::Local::now().fixed_offset();
-    let base = super::resultados::libro_consolidado(lotes, &ahora)?;
-    let mut libro = calamine::open_workbook_auto_from_rs(std::io::Cursor::new(base)).map_err(|e| e.to_string())?;
-    let mut hojas: Vec<Hoja> = libro.worksheets().into_iter().map(|(nombre, rango)| {
-        let filas = rango.rows().map(|fila| fila.iter().map(|valor| match valor {
-            Data::Empty | Data::Error(_) => Celda::Vacia,
-            Data::String(s) | Data::DateTimeIso(s) | Data::DurationIso(s) => Celda::Texto(s.clone()),
-            Data::Float(x) => Celda::Real(*x),
-            Data::Int(x) => Celda::Entero(*x),
-            Data::Bool(x) => Celda::Logico(*x),
-            Data::DateTime(x) => {
-                let serial = x.as_f64();
-                if (1.0..2_958_466.0).contains(&serial) {
-                    let base = NaiveDate::from_ymd_opt(1899, 12, 30).unwrap().and_hms_opt(0, 0, 0).unwrap();
-                    Celda::Fecha(base + chrono::Duration::days(serial.floor() as i64) + chrono::Duration::seconds(((serial - serial.floor()) * 86_400.0).round() as i64))
-                } else { Celda::Real(serial) }
-            },
-        }).collect()).collect();
-        Hoja::simple(&nombre, filas)
-    }).collect();
+    let (mut hojas, _) = super::resultados::hojas_consolidadas(lotes, true)?;
+    for hoja in &mut hojas {
+        hoja.congelar = true;
+        hoja.filtro = excel::Filtro::Dimensiones;
+        hoja.solo_formato = false;
+    }
     completar_rut_informes(&mut hojas)?;
     // Conservar valores de la lectura de paridad, pero recuperar la presentación de encabezados.
     for hoja in &mut hojas {
@@ -369,7 +355,7 @@ pub fn ejecutar(
     })();
     if resultado.is_err() {
         estado["estado"] = json!("INCOMPLETO");
-        guardar_estado(&raiz.join("flujo.json"), &estado)?;
+        let _ = guardar_estado(&raiz.join("flujo.json"), &estado);
         emitir(lote::Evento::Carpeta(raiz));
     }
     resultado
@@ -378,6 +364,7 @@ pub fn ejecutar(
 #[cfg(test)]
 mod pruebas {
     use super::*;
+    use calamine::{Data, Reader};
 
     /// Dos pantallas ficticias con planillas compatibles con CSMP.
     struct SitfaConjunto {

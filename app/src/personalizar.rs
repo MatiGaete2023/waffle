@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Variables que admiten el asunto y el cuerpo de un correo (`config.VARIABLES`).
 pub const VARIABLES: [&str; 6] = ["TRIBUNAL", "ALCANCE_MODALIDADES", "PERIODO", "FECHA", "PROGRAMA", "TABLA_REGISTROS"];
@@ -19,7 +20,8 @@ pub const CATEGORIAS: [&str; 8] =
 
 /// `config.emails`: direcciones separadas por `;`, `,` o salto de línea, sin repetidas y todas válidas.
 pub fn correos(texto: &str) -> Result<Vec<String>, String> {
-    let valida = Regex::new(r"^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$").unwrap();
+    static VALIDA: OnceLock<Regex> = OnceLock::new();
+    let valida = VALIDA.get_or_init(|| Regex::new(r"^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$").unwrap());
     let mut v: Vec<String> = Vec::new();
     for parte in texto.split([';', ',', '\n']) {
         let parte = parte.trim();
@@ -210,9 +212,21 @@ pub fn alias_de<'a>(cfg: &'a Config, contacto: &str) -> Vec<&'a str> {
 }
 
 fn clave_nueva(cfg: &Config) -> String {
-    let semilla = format!("{}|{}|{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(), cfg.plantillas.len());
-    let hex = format!("{:x}", Sha256::digest(semilla.as_bytes()));
-    format!("particular_{}", &hex[..10])
+    let mut intento = 0u64;
+    loop {
+        let semilla = format!(
+            "{}|{}|{}|{intento}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+            cfg.plantillas.len()
+        );
+        let hex = format!("{:x}", Sha256::digest(semilla.as_bytes()));
+        let clave = format!("particular_{}", &hex[..10]);
+        if !cfg.plantillas.contains_key(&clave) {
+            return clave;
+        }
+        intento = intento.wrapping_add(1);
+    }
 }
 
 /// `duplicate_template`: copia editable de una plantilla, con el comportamiento de la original.
@@ -363,8 +377,9 @@ pub fn importar_matrices(zip_ruta: &Path, directorio: &Path) -> Result<Importaci
     let tipos = [("PC_IE", r"\bPC IE\b"), ("PC_INFO", r"\bPC INFO\b"), ("NOMENCL", r"\bNOMENCL(?:ATURA)?\b")].map(|(k, p)| (k, Regex::new(p).unwrap()));
     let mut pendientes: Vec<((&str, &str), Vec<u8>)> = Vec::new();
     let mut resultado = Importacion::default();
+    const MAX_MATRIZ: u64 = 20_000_000;
     for i in 0..zip.len() {
-        let mut f = zip.by_index(i).map_err(|e| e.to_string())?;
+        let f = zip.by_index(i).map_err(|e| e.to_string())?;
         let nombre = f.name().to_string();
         if f.is_dir() || !nombre.to_lowercase().ends_with(".docx") {
             continue;
@@ -376,11 +391,14 @@ pub fn importar_matrices(zip_ruta: &Path, directorio: &Path) -> Result<Importaci
             resultado.sin_clasificar.push(nombre);
             continue;
         };
-        if f.size() > 20_000_000 {
+        if f.size() > MAX_MATRIZ {
             return Err(format!("Matriz demasiado grande: {nombre}"));
         }
         let mut contenido = Vec::new();
-        f.read_to_end(&mut contenido).map_err(|e| e.to_string())?;
+        f.take(MAX_MATRIZ + 1).read_to_end(&mut contenido).map_err(|e| e.to_string())?;
+        if contenido.len() as u64 > MAX_MATRIZ {
+            return Err(format!("Matriz demasiado grande: {nombre}"));
+        }
         let ok = zip::ZipArchive::new(std::io::Cursor::new(&contenido)).ok().is_some_and(|mut d| d.by_name("word/document.xml").is_ok());
         if !ok {
             return Err(format!("La matriz no es un documento Word válido: {nombre}"));

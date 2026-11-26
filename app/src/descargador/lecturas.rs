@@ -27,6 +27,14 @@ const CABECERA: [&str; 10] =
 static CHARSET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)<meta\b[^>]*\bcharset\s*=\s*["']?\s*([a-zA-Z0-9_-]+)"#).unwrap());
 static CIERRE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)</html\s*>").unwrap());
 
+static SEL_TABLE: LazyLock<Selector> = LazyLock::new(|| Selector::parse("table").expect("selector constante"));
+static SEL_TR: LazyLock<Selector> = LazyLock::new(|| Selector::parse("tr").expect("selector constante"));
+static SEL_INPUT: LazyLock<Selector> = LazyLock::new(|| Selector::parse("input").expect("selector constante"));
+static SEL_IMG_ID: LazyLock<Selector> = LazyLock::new(|| Selector::parse("img[id]").expect("selector constante"));
+static SEL_IMG: LazyLock<Selector> = LazyLock::new(|| Selector::parse("img").expect("selector constante"));
+static SEL_PLAZO_EL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("td,th,span,label,b,strong").expect("selector constante"));
+static PLAZO_MES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s*mes").unwrap());
+
 fn sel(s: &str) -> Selector {
     Selector::parse(s).expect("selector constante")
 }
@@ -84,7 +92,7 @@ fn documento(datos: &[u8]) -> Result<Html, String> {
         return Err("La respuesta HTML está incompleta.".into());
     }
     let doc = Html::parse_document(&texto);
-    if doc.select(&sel("input")).any(|e| e.value().attr("type").is_some_and(|t| t.eq_ignore_ascii_case("password"))) {
+    if doc.select(&SEL_INPUT).any(|e| e.value().attr("type").is_some_and(|t| t.eq_ignore_ascii_case("password"))) {
         return Err("La respuesta es una página de acceso; revisa la sesión de SITFA.".into());
     }
     Ok(doc)
@@ -108,7 +116,7 @@ fn input(form: ElementRef<'_>, nombre: &str) -> Result<String, String> {
 
 fn filas(tabla: ElementRef<'_>) -> Vec<ElementRef<'_>> {
     tabla
-        .select(&sel("tr"))
+        .select(&SEL_TR)
         .filter(|r| r.ancestors().filter_map(ElementRef::wrap).find(|e| e.value().name() == "table").map(|e| e.id()) == Some(tabla.id()))
         .collect()
 }
@@ -222,7 +230,7 @@ fn leer_bitacora_impl(
             return Err("Fila de bitácora incompleta.".into());
         }
         let valores = cells.iter().map(|e| texto(*e)).collect::<Vec<_>>();
-        let encontrados = cells[8].select(&sel("img[id]")).map(|e| e.value().attr("id").unwrap().to_string()).collect::<BTreeSet<_>>();
+        let encontrados = cells[8].select(&SEL_IMG_ID).map(|e| e.value().attr("id").unwrap().to_string()).collect::<BTreeSet<_>>();
         if encontrados.len() != 1 {
             return Err("No se puede vincular la fila con su observación.".into());
         }
@@ -374,7 +382,7 @@ fn valor_vecino(el: ElementRef<'_>) -> String {
             scraper::Node::Element(_) => {
                 let Some(siguiente) = ElementRef::wrap(nodo) else { return String::new() };
                 let nombre = siguiente.value().name();
-                if nombre == "table" || siguiente.select(&sel("table")).next().is_some() || celda(el.value().name()) != celda(nombre) {
+                if nombre == "table" || siguiente.select(&SEL_TABLE).next().is_some() || celda(el.value().name()) != celda(nombre) {
                     return String::new();
                 }
                 let valor = texto(siguiente);
@@ -392,7 +400,7 @@ fn valor_vecino(el: ElementRef<'_>) -> String {
 /// `escritos_html.py::_texto_titular`).
 fn campos_titular(doc: &Html, egreso: &[String], programas: &[String]) -> Vec<(String, String)> {
     let mut excluidas = std::collections::HashSet::new();
-    for tabla in doc.select(&sel("table")) {
+    for tabla in doc.select(&SEL_TABLE) {
         for fila in filas(tabla) {
             let cabecera: Vec<String> = celdas(fila).iter().map(|e| normalizar(&texto(*e))).collect();
             if egreso.iter().all(|e| cabecera.contains(e)) && programas.iter().any(|p| cabecera.contains(p)) {
@@ -451,7 +459,7 @@ fn documento_escritos(datos: &[u8]) -> Result<Html, String> {
         return Err("ESCRITOS_RESPUESTA_INCOMPLETA".into());
     }
     let doc = Html::parse_document(&texto);
-    if doc.select(&sel("input")).any(|e| e.value().attr("type").is_some_and(|t| t.eq_ignore_ascii_case("password"))) {
+    if doc.select(&SEL_INPUT).any(|e| e.value().attr("type").is_some_and(|t| t.eq_ignore_ascii_case("password"))) {
         return Err("ESCRITOS_SESION".into());
     }
     Ok(doc)
@@ -464,7 +472,7 @@ pub fn leer_escritos_ventana(datos: &[u8], fuente: &str, capturada: &str) -> Res
     let doc = documento_escritos(datos)?;
     let pedidos: Vec<String> = ESCRITOS.iter().map(|h| normalizar(h)).collect();
     let mut tablas = vec![];
-    for tabla in doc.select(&sel("table")) {
+    for tabla in doc.select(&SEL_TABLE) {
         let filas = filas(tabla);
         let Some(primera) = filas.first() else { continue };
         let cabecera: Vec<String> = celdas(*primera).iter().map(|e| normalizar(&texto(*e))).collect();
@@ -510,7 +518,7 @@ const ESCRITOS: [&str; 4] = ["Doc.", "Tipo Escrito", "Solicitante", "Estado"];
 fn leer_escritos(doc: &Html) -> Result<Option<Value>, &'static str> {
     let pedidos: Vec<String> = ESCRITOS.iter().map(|h| normalizar(h)).collect();
     let mut tablas = vec![];
-    for tabla in doc.select(&sel("table")) {
+    for tabla in doc.select(&SEL_TABLE) {
         let filas = filas(tabla);
         let Some(primera) = filas.first() else { continue };
         let originales: Vec<String> = celdas(*primera).iter().map(|e| texto(*e)).collect();
@@ -575,7 +583,7 @@ pub fn leer_historico(
     let egreso: Vec<String> = HISTORICO_EGRESO.iter().map(|h| normalizar(h)).collect();
     let programas: Vec<String> = HISTORICO_PROGRAMA.iter().map(|h| normalizar(h)).collect();
     let mut tablas = vec![];
-    for tabla in doc.select(&sel("table")) {
+    for tabla in doc.select(&SEL_TABLE) {
         let filas = filas(tabla);
         for (i, fila) in filas.iter().enumerate() {
             let originales: Vec<String> = celdas(*fila).iter().map(|e| texto(*e)).collect();
@@ -642,7 +650,7 @@ pub fn leer_historia(datos: &[u8], fuente: &str, capturada: &str) -> Result<Valu
     let doc = documento(datos)?;
     let mut candidatas = vec![];
     let mut parecidas = false;
-    for tabla in doc.select(&sel("table")) {
+    for tabla in doc.select(&SEL_TABLE) {
         let filas = filas(tabla);
         if let Some(primera) = filas.first() {
             if encabezado(*primera, &HISTORIA) {
@@ -676,7 +684,7 @@ pub fn leer_historia(datos: &[u8], fuente: &str, capturada: &str) -> Result<Valu
         if fecha.is_empty() {
             advertencias.push(json!({"codigo":"HISTORIA_FECHA_ILEGIBLE","fila":posicion,"folio":valores[0]}));
         }
-        resultado.push(json!({"fila":posicion,"folio":valores[0],"etapa":valores[4],"tramite":valores[5],"descripcion":valores[6],"referencia":valores[7],"fecha_texto":valores[8],"fecha_iso":fecha,"anexo":c[3].select(&sel("img")).next().is_some()}));
+        resultado.push(json!({"fila":posicion,"folio":valores[0],"etapa":valores[4],"tramite":valores[5],"descripcion":valores[6],"referencia":valores[7],"fecha_texto":valores[8],"fecha_iso":fecha,"anexo":c[3].select(&SEL_IMG).next().is_some()}));
     }
     let paginacion = doc.select(&sel(".pagination,.paginacion,.paginador,.pager")).next().is_some()
         || doc.select(&sel("input[name]")).any(|e| {
@@ -766,7 +774,7 @@ pub fn leer_calendario(datos: &[u8], args: &[String], fuente: &str, capturada: &
     }
     let doc = Html::parse_document(&texto_html);
     // Más estricto que `read_calendar` (que compara `type="password"` literal): cualquier mayúscula también es acceso.
-    if doc.select(&sel("input")).any(|e| e.value().attr("type").is_some_and(|t| t.eq_ignore_ascii_case("password"))) {
+    if doc.select(&SEL_INPUT).any(|e| e.value().attr("type").is_some_and(|t| t.eq_ignore_ascii_case("password"))) {
         return Err("La respuesta parece la página de ingreso de SITFA; revisa la sesión.".into());
     }
     let forms = doc.select(&sel("form[name='InformesPpalForm']")).collect::<Vec<_>>();
@@ -780,7 +788,7 @@ pub fn leer_calendario(datos: &[u8], args: &[String], fuente: &str, capturada: &
         return Err("La respuesta no corresponde al ingreso solicitado.".into());
     }
     let mut candidatas = vec![];
-    for tabla in doc.select(&sel("table")) {
+    for tabla in doc.select(&SEL_TABLE) {
         let filas = filas(tabla);
         if filas.first().is_some_and(|f| encabezado(*f, &["Fecha Proyección", "Fecha Informe", "Estado"])) {
             candidatas.push(filas);
@@ -809,11 +817,10 @@ pub fn leer_calendario(datos: &[u8], args: &[String], fuente: &str, capturada: &
         proyecciones.push(json!({"fila":i+1,"fecha_proyeccion":fecha_calendario(&c[0],false,"Fecha Proyección")?,"fecha_informe":informe,"estado":estado}));
     }
     let plazo = |etiqueta: &str| -> Option<u32> {
-        let patron = Regex::new(r"(\d+)\s*mes").unwrap();
-        for e in doc.select(&sel("td,th,span,label,b,strong")) {
+        for e in doc.select(&SEL_PLAZO_EL) {
             let t = normalizar(&texto(e));
             if t.starts_with(etiqueta) {
-                if let Some(c) = patron.captures(&t) {
+                if let Some(c) = PLAZO_MES.captures(&t) {
                     return c[1].parse().ok();
                 }
             }

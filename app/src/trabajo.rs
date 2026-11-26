@@ -226,8 +226,14 @@ impl Trabajo {
         let (paquete, sheets, sheet, header_row, mode, modos_posibles) = if captura_trabajo::es_zip(&path) {
             let (paquete, hojas) = captura_trabajo::abrir(&bytes)?;
             let modos = paquete.modos.clone();
-            let modo = pedida.filter(|m| modos.contains(m)).unwrap_or(modos[0]);
-            let sheet = modos.iter().position(|&m| m == modo).unwrap();
+            let modo = pedida
+                .filter(|m| modos.contains(m))
+                .or_else(|| modos.first().copied())
+                .ok_or_else(|| "El paquete no contiene etapas válidas.".to_string())?;
+            let sheet = modos
+                .iter()
+                .position(|&m| m == modo)
+                .ok_or_else(|| "No se encontró la etapa seleccionada en el paquete.".to_string())?;
             (Some(paquete), hojas, sheet, 0, modo, modos)
         } else {
             let sheets = lectura::read_sheets(&bytes)?;
@@ -253,7 +259,12 @@ impl Trabajo {
             corte: Some(corte),
             ..Default::default()
         };
-        w.headers = lectura::headers_of(&w.sheets[w.sheet].rows[w.header_row]);
+        w.headers = w
+            .sheets
+            .get(w.sheet)
+            .and_then(|s| s.rows.get(w.header_row))
+            .map(|r| lectura::headers_of(r))
+            .ok_or_else(|| "No se encontró la fila de encabezados en la hoja.".to_string())?;
         w.analizar(cfg);
         w.restaurar(cfg);
         Ok(w)
@@ -264,10 +275,13 @@ impl Trabajo {
         if sheet == self.sheet {
             return;
         }
+        let Some(row) = self.sheets.get(sheet).and_then(|s| s.rows.get(self.header_row)) else {
+            return;
+        };
         self.sheet = sheet;
         self.mode = Some(modo);
         self.corte = Some(corte);
-        self.headers = lectura::headers_of(&self.sheets[sheet].rows[self.header_row]);
+        self.headers = lectura::headers_of(row);
         self.registros.clear();
         self.analizar(cfg);
         self.restaurar(cfg);
@@ -277,7 +291,7 @@ impl Trabajo {
     pub fn analizar(&mut self, cfg: &Config) {
         let t0 = std::time::Instant::now();
         let mode = self.mode.unwrap_or(Mode::Espera);
-        let corte = self.corte.unwrap_or_else(|| chrono::Local::now().date_naive());
+        let corte = self.corte.unwrap_or_else(crate::util::hoy);
         self.cols = lectura::map_columns(&self.headers, mode);
         self.avisos.clear();
         if let Some(paquete) = &mut self.paquete {
@@ -315,9 +329,9 @@ impl Trabajo {
             }
         }
         let viejos: HashMap<usize, Registro> = std::mem::take(&mut self.registros).into_iter().map(|r| (r.fila_excel, r)).collect();
-        let sheet = &self.sheets[self.sheet];
+        let Some(sheet) = self.sheets.get(self.sheet) else { return; };
         let mapped: Vec<usize> = self.cols.values().copied().collect();
-        let columnas_por_fila = self.paquete.as_ref().map(|p| &p.columnas_por_fila[self.sheet]);
+        let columnas_por_fila = self.paquete.as_ref().and_then(|p| p.columnas_por_fila.get(self.sheet));
         let mut filas_idx = Vec::new();
         for (i, row) in sheet.rows.iter().enumerate().skip(self.header_row + 1) {
             if columnas_por_fila.is_none() && row.iter().all(|c| c.is_empty()) {
@@ -332,9 +346,12 @@ impl Trabajo {
         let filas_datos: Vec<(Vec<Cell>, Cols)> = filas_idx
             .iter()
             .map(|i| {
-                let cols_base = columnas_por_fila.map_or(&self.cols, |cols| &cols[*i - self.header_row - 1]);
+                let cols_base = columnas_por_fila
+                    .and_then(|cols| i.checked_sub(self.header_row + 1).and_then(|idx| cols.get(idx)))
+                    .unwrap_or(&self.cols);
                 let anul = viejos.get(&(i + 1)).map(|v| &v.anulaciones);
-                Self::aplicar_overrides_a_fila(cols_base, &self.cols, &sheet.rows[*i], anul)
+                let row = sheet.rows.get(*i).map(Vec::as_slice).unwrap_or(&[]);
+                Self::aplicar_overrides_a_fila(cols_base, &self.cols, row, anul)
             })
             .collect();
         let filas: Vec<Fila> = filas_datos.iter().map(|(values, cols)| Fila { values, cols }).collect();
@@ -468,12 +485,21 @@ impl Trabajo {
     /// Descarta las ediciones y marcas (por elección del usuario) y vuelve a analizar.
     pub fn reiniciar(&mut self, cfg: &Config) {
         self.consignaciones.clear();
+        self.historial.clear();
         for r in &mut self.registros {
             r.editada = None;
             r.revisada = false;
             r.seleccionada = false;
+            r.res.clear();
+            r.resolucion = "auto".into();
+            r.gestiones_correo.clear();
+            r.campos.clear();
             r.anulaciones.clear();
             r.sync_anulaciones = None;
+            r.sync_base = None;
+            r.sync_local = None;
+            r.sync_decisiones = None;
+            r.sync_correo = None;
         }
         self.analizar(cfg);
     }
@@ -536,7 +562,7 @@ impl Trabajo {
             return Ok(Vec::new());
         }
         let mode = self.mode();
-        let corte = self.corte.unwrap_or_else(|| chrono::Local::now().date_naive());
+        let corte = self.corte.unwrap_or_else(crate::util::hoy);
         let cols_por_fila = self.paquete.as_ref().and_then(|p| p.columnas_por_fila.get(self.sheet));
         let datos = |con_nueva: bool| -> Vec<(Vec<Cell>, Cols)> {
             self.registros
@@ -736,8 +762,10 @@ impl Trabajo {
                 || !r.gestiones_correo.is_empty()
                 || !r.anulaciones.is_empty()
                 || r.sync_base.is_some()
+                || r.sync_correo.is_some()
                 || r.sync_anulaciones.is_some()
                 || r.sync_decisiones.is_some()
+                || !r.id_excel.is_empty()
                 || (!r.resolucion.is_empty() && r.resolucion != "auto")
             {
                 s.decisiones.insert(

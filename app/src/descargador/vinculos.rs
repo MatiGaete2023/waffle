@@ -50,11 +50,16 @@ fn literal(s: &str) -> Option<String> {
 
 /// Solo llamadas directas con argumentos literales. Descarta comentarios, cadenas, plantillas y regex.
 pub fn llamadas(texto: &str, nombre: &str) -> Vec<Vec<String>> {
-    if !matches!(nombre, "ShowObservaciones" | "ShowHistoria" | "ShowInformesProgramados") {
-        return vec![];
-    }
+    static RE_OBS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"ShowObservaciones\s*\(").unwrap());
+    static RE_HIST: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"ShowHistoria\s*\(").unwrap());
+    static RE_CAL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"ShowInformesProgramados\s*\(").unwrap());
+    let patron = match nombre {
+        "ShowObservaciones" => &*RE_OBS,
+        "ShowHistoria" => &*RE_HIST,
+        "ShowInformesProgramados" => &*RE_CAL,
+        _ => return vec![],
+    };
     let codigo = LEXICO.replace_all(texto, |c: &regex::Captures<'_>| " ".repeat(c[0].len()));
-    let patron = Regex::new(&format!(r"{}\s*\(", nombre)).unwrap();
     let mut resultado = vec![];
     for m in patron.find_iter(&codigo) {
         if texto[..m.start()].chars().next_back().is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '.')) {
@@ -156,9 +161,12 @@ impl Vinculo {
     }
 }
 
-fn sel(s: &str) -> Selector {
-    Selector::parse(s).expect("selector constante")
-}
+static SEL_TABLA_ESPERA: LazyLock<Selector> = LazyLock::new(|| Selector::parse("form[name='InformesPpalForm'] table[id='tablaEspera']").expect("selector constante"));
+static SEL_TABLA_CUMPLIMIENTO: LazyLock<Selector> = LazyLock::new(|| Selector::parse("form[name='InformesPpalForm'] table[id='tablaCumplimiento']").expect("selector constante"));
+static SEL_TABLA_INFORME: LazyLock<Selector> = LazyLock::new(|| Selector::parse("form[name='InformesPpalForm'] table[id='tablaInforme']").expect("selector constante"));
+static SEL_TABLA_EGRESADOS: LazyLock<Selector> = LazyLock::new(|| Selector::parse("form[name='InformesPpalForm'] table[id='tablaEgresados']").expect("selector constante"));
+static SEL_TR: LazyLock<Selector> = LazyLock::new(|| Selector::parse("tr").expect("selector constante"));
+static SEL_ACCIONES: LazyLock<Selector> = LazyLock::new(|| Selector::parse("[onclick],[href]").expect("selector constante"));
 fn numerico(s: &str) -> bool {
     !s.is_empty() && s.len() <= 20 && s.bytes().all(|b| b.is_ascii_digit())
 }
@@ -173,11 +181,11 @@ pub fn extraer_filas(datos: &[u8], seleccion: &Seleccion) -> Result<Vec<Vinculo>
     if seleccion.screen != "seguimiento" {
         return Err("La lectura por ingreso solo corresponde a Seguimiento.".into());
     }
-    let tabla_id = match seleccion.tab.as_str() {
-        "Espera" => "tablaEspera",
-        "Cumplimiento" => "tablaCumplimiento",
-        "Informes" => "tablaInforme",
-        "Egresados" => "tablaEgresados",
+    let sel_tabla = match seleccion.tab.as_str() {
+        "Espera" => &*SEL_TABLA_ESPERA,
+        "Cumplimiento" => &*SEL_TABLA_CUMPLIMIENTO,
+        "Informes" => &*SEL_TABLA_INFORME,
+        "Egresados" => &*SEL_TABLA_EGRESADOS,
         _ => return Err("Pestaña no permitida.".into()),
     };
     // El listado ya pasó `validar_respuesta`: se decodifica igual que allí (sin el tope de 8 MiB ni la lista corta de
@@ -186,12 +194,12 @@ pub fn extraer_filas(datos: &[u8], seleccion: &Seleccion) -> Result<Vec<Vinculo>
         return Err("Respuesta HTML vacía o demasiado grande.".into());
     }
     let doc = Html::parse_document(&super::sitfa::decodificar(datos));
-    let tablas = doc.select(&sel(&format!("form[name='InformesPpalForm'] table[id='{tabla_id}']"))).collect::<Vec<_>>();
+    let tablas = doc.select(sel_tabla).collect::<Vec<_>>();
     if tablas.len() != 1 {
         return Err("No se identifica una tabla única de registros.".into());
     }
     let (mut cabecera, mut resultado) = (None, vec![]);
-    for (pos, fila) in tablas[0].select(&sel("tr")).enumerate() {
+    for (pos, fila) in tablas[0].select(&SEL_TR).enumerate() {
         if fila.ancestors().filter_map(ElementRef::wrap).find(|e| e.value().name() == "table").map(|e| e.id()) != Some(tablas[0].id()) {
             continue;
         }
@@ -244,7 +252,7 @@ pub fn extraer_filas(datos: &[u8], seleccion: &Seleccion) -> Result<Vec<Vinculo>
             continue;
         }
         let comandos = fila
-            .select(&sel("[onclick],[href]"))
+            .select(&SEL_ACCIONES)
             .flat_map(|e| [e.value().attr("onclick").unwrap_or(""), e.value().attr("href").unwrap_or("")])
             .collect::<Vec<_>>()
             .join(" ");

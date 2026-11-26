@@ -52,7 +52,7 @@ fn read_calamine(bytes: &[u8]) -> Result<Vec<Sheet>, String> {
     if bytes.starts_with(b"PK\x03\x04") { validar_zip_excel(bytes)?; }
     let mut total = 0usize;
     let mut total_filas = 0usize;
-    let mut wb = calamine::open_workbook_auto_from_rs(Cursor::new(bytes.to_vec())).map_err(|e| format!("No se pudo abrir el libro: {e}"))?;
+    let mut wb = calamine::open_workbook_auto_from_rs(Cursor::new(bytes)).map_err(|e| format!("No se pudo abrir el libro: {e}"))?;
     let mut out = Vec::new();
     for name in wb.sheet_names().to_owned() {
         let range = wb.worksheet_range(&name).map_err(|e| format!("No se pudo leer una hoja del Excel: {e}"))?;
@@ -115,9 +115,9 @@ fn unescape(s: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&apos;", "'");
-    let s = re(&NUM, r"&#(x?[0-9a-fA-F]+);").replace_all(&s, |c: &regex::Captures| {
+    let s = re(&NUM, r"&#([xX]?[0-9a-fA-F]+);").replace_all(&s, |c: &regex::Captures| {
         let v = &c[1];
-        let n = if let Some(h) = v.strip_prefix('x') { u32::from_str_radix(h, 16).ok() } else { v.parse().ok() };
+        let n = if let Some(h) = v.strip_prefix('x').or_else(|| v.strip_prefix('X')) { u32::from_str_radix(h, 16).ok() } else { v.parse().ok() };
         n.and_then(char::from_u32).map(|c| c.to_string()).unwrap_or_default()
     });
     s.replace("&amp;", "&").replace('\u{a0}', " ")
@@ -223,9 +223,15 @@ pub fn read_xml2003(xml: &str) -> Result<Vec<Sheet>, String> {
 pub fn read_csv(s: &str) -> Sheet {
     let first = s.lines().next().unwrap_or("");
     let sep = [';', '\t', ','].into_iter().max_by_key(|c| first.matches(*c).count()).unwrap_or(';');
-    let rows = s
-        .lines()
-        .map(|l| l.split(sep).map(|v| text_cell(v.trim().trim_matches('"').to_string())).collect())
+    let mut rdr = csv::ReaderBuilder::new()
+        .delimiter(sep as u8)
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(s.as_bytes());
+    let rows = rdr
+        .records()
+        .filter_map(Result::ok)
+        .map(|rec| rec.iter().map(|v| text_cell(v.trim().to_string())).collect())
         .collect();
     Sheet { name: "CSV".into(), rows }
 }

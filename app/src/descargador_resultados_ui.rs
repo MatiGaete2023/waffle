@@ -57,6 +57,7 @@ enum Mensaje {
 pub struct Resultados {
     pub carpeta: String,
     pub parcial: bool,
+    pub solo_originales: bool,
     pub cargado: Option<Carga>,
     pub estado: Option<Result<String, String>>,
     pub carpetas_paquete: Vec<PathBuf>,
@@ -185,9 +186,12 @@ fn leer(carpeta: &Path, parcial: bool) -> Result<Carga, String> {
     })
 }
 
-fn producto(lote: &Lote, cual: Producto) -> Result<String, String> {
+fn producto(lote: &Lote, cual: Producto, solo_originales: bool) -> Result<String, String> {
     let ahora = ahora();
     Ok(match cual {
+        Producto::Consolidado if solo_originales => {
+            resultados::exportar_libro_solo_originales(std::slice::from_ref(lote), None, &ahora)?.display().to_string()
+        }
         Producto::Consolidado => resultados::exportar_libro(std::slice::from_ref(lote), None, false, &ahora)?.display().to_string(),
         Producto::Csmp => resultados::exportar_libro(std::slice::from_ref(lote), None, true, &ahora)?.display().to_string(),
         Producto::Csv => lista(&resultados::exportar_csv(lote, &ahora)?),
@@ -270,9 +274,9 @@ impl Resultados {
 
     fn producir(&mut self, ctx: &egui::Context, cual: Producto) {
         let Some(fase) = self.cargado.as_ref().and_then(|c| c.fases.get(self.fase_activa)) else { return };
-        let (carpeta, parcial) = (fase.carpeta.clone(), fase.parcial);
+        let (carpeta, parcial, solo_originales) = (fase.carpeta.clone(), fase.parcial, self.solo_originales);
         self.estado = Some(Ok("Comprobando archivos y procesando resultados localmente…".into()));
-        self.en_hilo(ctx, move || Mensaje::Producto(paquete::cargar_lote_con(&carpeta, parcial).and_then(|l| producto(&l, cual))));
+        self.en_hilo(ctx, move || Mensaje::Producto(paquete::cargar_lote_con(&carpeta, parcial).and_then(|l| producto(&l, cual, solo_originales))));
     }
 
     fn con_otro(&mut self, ctx: &egui::Context, titulo: &str, accion: fn(Lote, &Path) -> Result<String, String>) {
@@ -389,29 +393,42 @@ impl Resultados {
         if ui.button("Actualizar").clicked() { self.indice = None; }
         self.actualizar_indice(&ruta_preferencias);
         let carpeta_indice = self.ruta();
-        let (referencias, tipo, flujo, disponibles) = self.indice.as_ref().map(|i|
-            (i.referencias.clone(), i.tipo, i.flujo.clone(), i.disponibles.clone())).unwrap_or_default();
-        for referencia in referencias {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(format!("{} · {} · {} · {}", referencia.tipo, referencia.estado, referencia.conteo, referencia.carpeta.display()));
-                if ui.add_enabled(!self.ocupado && referencia.estado != "NO_DISPONIBLE" && referencia.estado != "ERROR_CONTROL", egui::Button::new("Abrir referencia")).clicked() {
-                    if referencia.tipo == "Bitácoras" {
-                        let ruta = referencia.carpeta.join("bitacoras.json");
-                        if !self.bitacoras_paquete.contains(&ruta) { self.bitacoras_paquete.push(ruta); }
-                        self.estado = Some(Ok("Control de bitácoras añadido al paquete.".into()));
-                    } else {
-                        self.carpeta = referencia.carpeta.display().to_string();
-                        self.cargar(ui.ctx());
+        let tipo = self.indice.as_ref().and_then(|i| i.tipo);
+        let mut accion_ref: Option<(u8, PathBuf)> = None;
+        if let Some(indice) = &self.indice {
+            for referencia in &indice.referencias {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("{} · {} · {} · {}", referencia.tipo, referencia.estado, referencia.conteo, referencia.carpeta.display()));
+                    if ui.add_enabled(!self.ocupado && referencia.estado != "NO_DISPONIBLE" && referencia.estado != "ERROR_CONTROL", egui::Button::new("Abrir referencia")).clicked() {
+                        if referencia.tipo == "Bitácoras" {
+                            accion_ref = Some((0, referencia.carpeta.join("bitacoras.json")));
+                        } else {
+                            accion_ref = Some((1, referencia.carpeta.clone()));
+                        }
                     }
-                }
-                if ui.button("Quitar del historial").clicked() {
-                    let mut preferencias = Preferencias::cargar(&ruta_preferencias);
-                    self.indice = None;
-                    preferencias.historial_lotes.retain(|p| Path::new(p) != referencia.carpeta);
-                    preferencias.historial_bitacoras.retain(|p| Path::new(p).parent() != Some(referencia.carpeta.as_path()));
-                    if let Err(error) = preferencias.guardar(&ruta_preferencias) { self.estado = Some(Err(error)); }
-                }
-            });
+                    if ui.button("Quitar del historial").clicked() {
+                        accion_ref = Some((2, referencia.carpeta.clone()));
+                    }
+                });
+            }
+        }
+        match accion_ref {
+            Some((0, ruta)) => {
+                if !self.bitacoras_paquete.contains(&ruta) { self.bitacoras_paquete.push(ruta); }
+                self.estado = Some(Ok("Control de bitácoras añadido al paquete.".into()));
+            }
+            Some((1, carpeta)) => {
+                self.carpeta = carpeta.display().to_string();
+                self.cargar(ui.ctx());
+            }
+            Some((2, carpeta)) => {
+                let mut preferencias = Preferencias::cargar(&ruta_preferencias);
+                self.indice = None;
+                preferencias.historial_lotes.retain(|p| Path::new(p) != carpeta);
+                preferencias.historial_bitacoras.retain(|p| Path::new(p).parent() != Some(carpeta.as_path()));
+                if let Err(error) = preferencias.guardar(&ruta_preferencias) { self.estado = Some(Err(error)); }
+            }
+            _ => {}
         }
         ui.horizontal_wrapped(|ui| {
             ui.label("Carpeta del lote o conjunto");
@@ -475,10 +492,10 @@ impl Resultados {
         if carpeta_indice != self.ruta() { self.conjunta = false; self.indice = None; }
         if self.conjunta {
             let carpeta = self.ruta();
+            let flujo = self.indice.as_ref().and_then(|i| i.flujo.clone());
             let mut abierta = self.conjunta;
             egui::Window::new("Resultados · descarga conjunta CSMP").open(&mut abierta).show(ui.ctx(), |ui| {
-                let datos = flujo.clone();
-                if let Some(datos) = datos {
+                if let Some(datos) = flujo {
                     ui.label(datos["estado"].as_str().unwrap_or("DESCONOCIDO"));
                     ui.label(format!("{} completo · corte {} · informes del mes actual y siguiente", datos["seleccion"]["modo"].as_str().unwrap_or(""), datos["seleccion"]["corte"].as_str().unwrap_or("")));
                     ui.label("La consulta de resoluciones firmadas se retiró de la descarga conjunta. No se acredita ausencia de movimientos.");
@@ -513,7 +530,12 @@ impl Resultados {
         let ctx = ui.ctx().clone();
         ui.add_enabled_ui(listo, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Consolidar XLSX").clicked() {
+                let tooltip_consolidado = if self.solo_originales {
+                    "Solo columnas originales de los archivos fuente"
+                } else {
+                    "Libro Excel consolidado de las consultas del lote"
+                };
+                if ui.button("Consolidar XLSX").on_hover_text(tooltip_consolidado).clicked() {
                     self.producir(&ctx, Producto::Consolidado);
                 }
                 if ui.button("Libro CSMP (Excel)").clicked() {
@@ -526,6 +548,9 @@ impl Resultados {
                     self.con_otro(&ctx, "Lote anterior del mismo alcance", |l, o| comparar(&l, o));
                 }
             });
+            if self.solo_originales {
+                ui.label(RichText::new("Modo Lite: «Consolidar XLSX» conserva solo las columnas originales de los archivos fuente.").size(12.0).color(p.muted));
+            }
             ui.horizontal_wrapped(|ui| {
                 if ui.button("CSV").clicked() {
                     self.producir(&ctx, Producto::Csv);
@@ -554,7 +579,7 @@ impl Resultados {
                     ui.label(RichText::new(t).color(p.green));
                 }
                 Some(Err(e)) => {
-                    ui.label(RichText::new(e).color(p.amber));
+                    ui.label(RichText::new(e).color(p.red));
                 }
                 None => {
                     ui.label(RichText::new(SIN_LOTE).color(p.muted));
@@ -567,23 +592,35 @@ impl Resultados {
             if ui.add_enabled(!self.ocupado, egui::Button::new("Añadir carpeta…")).clicked() { self.anadir_carpeta_paquete(); }
             if ui.add_enabled(!self.ocupado, egui::Button::new("Añadir bitácoras…")).clicked() { self.anadir_bitacoras_paquete(); }
         });
-        for (i, carpeta) in self.carpetas_paquete.clone().iter().enumerate() {
+        let mut quitar_carpeta = None;
+        for (i, carpeta) in self.carpetas_paquete.iter().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(format!("{} · {}", carpeta.file_name().unwrap_or_default().to_string_lossy(), carpeta.display()));
                 if ui.push_id(("quitar_carpeta", carpeta), |ui| ui.add_enabled(!self.ocupado, egui::Button::new("Quitar"))).inner.clicked() {
-                    self.carpetas_paquete.remove(i);
+                    quitar_carpeta = Some(i);
                 }
             });
         }
-        for (i, diario) in self.bitacoras_paquete.clone().iter().enumerate() {
+        if let Some(i) = quitar_carpeta {
+            self.carpetas_paquete.remove(i);
+        }
+        let mut quitar_bitacora = None;
+        let mut faltan = false;
+        for (i, diario) in self.bitacoras_paquete.iter().enumerate() {
+            let disponible = self.indice.as_ref().is_some_and(|idx| idx.disponibles.contains(diario));
+            if !disponible {
+                faltan = true;
+            }
             ui.horizontal(|ui| {
-                ui.label(format!("{} · {}", if disponibles.contains(diario) { "Bitácoras" } else { "NO_DISPONIBLE" }, diario.display()));
+                ui.label(format!("{} · {}", if disponible { "Bitácoras" } else { "NO_DISPONIBLE" }, diario.display()));
                 if ui.push_id(("quitar_bitacora", diario), |ui| ui.add_enabled(!self.ocupado, egui::Button::new("Quitar"))).inner.clicked() {
-                    self.bitacoras_paquete.remove(i);
+                    quitar_bitacora = Some(i);
                 }
             });
         }
-        let faltan = self.bitacoras_paquete.iter().any(|path| !disponibles.contains(path));
+        if let Some(i) = quitar_bitacora {
+            self.bitacoras_paquete.remove(i);
+        }
         if ui.add_enabled(!self.ocupado && !self.carpetas_paquete.is_empty() && !faltan, egui::Button::new("Crear paquete" )).clicked() {
             if let Some(destino) = rfd::FileDialog::new().set_title("Guardar paquete del Asistente").set_file_name("Captura_CSMP.zip").save_file() {
                 self.crear_paquete(&ctx, destino);

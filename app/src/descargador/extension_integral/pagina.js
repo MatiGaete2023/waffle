@@ -271,7 +271,7 @@ async function sitfaTask(command, payload) {
       const timer=setTimeout(()=>reject(new Error("pantalla")),5000);
       requestAnimationFrame(()=>requestAnimationFrame(()=>{clearTimeout(timer);resolve();}));
     });
-    document.getElementById("sitfaDescargaLocal").style.visibility="hidden";
+    const cover=document.getElementById("sitfaDescargaLocal");if(cover)cover.style.visibility="hidden";
     return {ok:true};
   }
   if (command==="navigate") {
@@ -329,7 +329,7 @@ async function sitfaTask(command, payload) {
     }
     return {pantalla:screen,tribunales:options("COD_Tribunal_sel"), modalidades:options("TIP_Consulta"), informes:reports,medidas:measures,
       pestanas:Object.keys(tabMap).filter(k=>document.getElementById(tabMap[k])),
-      seleccion:{tribunal:field("COD_Tribunal_sel").value, modalidad:field("TIP_Consulta").value,
+      seleccion:{tribunal:field("COD_Tribunal_sel")?.value||"", modalidad:field("TIP_Consulta")?.value||"",
         pestaña:before,informe:reportBefore,desde:field("FEC_Inicio")?.value,hasta:field("FEC_Fin")?.value}};
   }
   if (command === "lock") {
@@ -381,7 +381,9 @@ async function sitfaTask(command, payload) {
       };
       const difference=(day(s.end)-day(s.start))/86400000;
       if(difference<0||difference>30)throw new Error("filtro");
-      field("FEC_Desde").value=s.start;field("FEC_Hasta").value=s.end;
+      const desde=field("FEC_Desde"),hasta=field("FEC_Hasta");
+      if(!desde||!hasta)throw new Error("estructura");
+      desde.value=s.start;hasta.value=s.end;
       const button=form.querySelector('input[type="submit"][name="irAccion"][value="Aud.Carga Func.-"]');
       if(!button)throw new Error("estructura");
       const pairs=Array.from(new FormData(form,button).entries());
@@ -439,9 +441,9 @@ async function sitfaTask(command, payload) {
       if(rejected) throw new Error("filtro");
     }
     finally {window.alert=oldAlert;}
-    if (screen==="seguimiento") field("COD_Lengueta").value=tabMap[s.tab];
-    if (screen==="litigantes") field("TIP_Consulta").value="2";
-    if (!screen.startsWith("calendario_")) field("FLG_Consulta").value=payload.dates ? "1" : "0";
+    if (screen==="seguimiento") {const f=field("COD_Lengueta");if(!f)throw new Error("estructura");f.value=tabMap[s.tab];}
+    if (screen==="litigantes") {const f=field("TIP_Consulta");if(!f)throw new Error("estructura");f.value="2";}
+    if (!screen.startsWith("calendario_")) {const f=field("FLG_Consulta");if(!f)throw new Error("estructura");f.value=payload.dates ? "1" : "0";}
     const button=form.querySelector('input[type="submit"][name="irAccion"][value="'+actions[screen]+'"]');
     if (!button || new URL(form.action,location.href).href!==endpoint || form.method.toLowerCase()!=="post")
       throw new Error("estructura");
@@ -463,7 +465,7 @@ async function sitfaTask(command, payload) {
         const q=text[i];let value="";
         if(q==="'"||q==='"') {
           i++;
-          while(i<text.length&&text[i]!==q){if(text[i]==="\\")i++;value+=text[i++];}
+          while(i<text.length&&text[i]!==q){if(text[i]==="\\"&&i+1<text.length)i++;value+=text[i++];}
           if(text[i]!==q)break;i++;
         } else {
           const d=/^\d{1,20}/.exec(text.slice(i));if(!d)break;value=d[0];i+=value.length;
@@ -487,12 +489,12 @@ async function sitfaTask(command, payload) {
   }).join("");
   // Índice de la página validada por cada consulta; se descarta antes del siguiente search/unlock.
   const indexarPagina=(doc,pairs)=>{
-    const observaciones=new Map(),historias=new Map(),personas=new Map();
+    const observaciones=new Map(),historias=new Map(),personas=new Map(),calendarios=new Map();
     const sumar=(map,key)=>map.set(key,(map.get(key)||0)+1);
     const selected=new Map(pairs);
     const tableIds={tdEspera:"tablaEspera",tdCumplimiento:"tablaCumplimiento",tdInforme:"tablaInforme",tdEgreso:"tablaEgresados"};
     const table=doc.getElementById(tableIds[selected.get("COD_Lengueta")]);
-    if(!table)return {observaciones,historias,personas};
+    if(!table)return {observaciones,historias,personas,calendarios};
     const limpio=valor=>valor.replace(/[.-]/g, "").toUpperCase().replace(/^0+/, "");
     const completo=/^(?:[0-9]{1,9}|[0-9]{1,3}(?:\.[0-9]{3}){1,2})-[0-9kK]$/;
     for(const el of table.querySelectorAll("[onclick],[href]"))for(const attr of ["onclick","href"]) {
@@ -502,6 +504,9 @@ async function sitfaTask(command, payload) {
           const m=/^(?:(\d{1,20})|'(\d{1,20})'|"(\d{1,20})")$/.exec(s.trim());return m?(m[1]||m[2]||m[3]):null;
         });
         if(args.length===6&&args.every(v=>v!==null))sumar(observaciones,JSON.stringify(args));
+      }
+      for(const call of literalCalls(raw,"ShowInformesProgramados")) {
+        if(call.length===12)sumar(calendarios,JSON.stringify(call));
       }
       const text=raw.replace(/^javascript:/i,''),code=realCode(text);
       for(const match of code.matchAll(/(?<![\w$.])ShowHistoria\s*\(/g)) {
@@ -524,7 +529,7 @@ async function sitfaTask(command, payload) {
         if(ruts.size===1){const pedido=ruts.values().next().value;if([pedido,pedido.slice(0,-1)].includes(limpio(argumento)))sumar(personas,pedido);}
       }
     }
-    return {observaciones,historias,personas};
+    return {observaciones,historias,personas,calendarios};
   };
   const asignarPagina=(bytes,pairs)=>{
     let html;
@@ -545,10 +550,7 @@ async function sitfaTask(command, payload) {
     const tableIds={tdEspera:"tablaEspera",tdCumplimiento:"tablaCumplimiento",tdInforme:"tablaInforme",tdEgreso:"tablaEgresados"};
     const table=run.diaryDocument.getElementById(tableIds[selected.get("COD_Lengueta")]);
     if(!table)throw new Error("estructura");
-    let matches=0;
-    for(const el of table.querySelectorAll("[onclick],[href]"))for(const attr of ["onclick","href"])
-      for(const call of literalCalls(el.getAttribute(attr)||"","ShowInformesProgramados"))
-        if(call.length===12&&call.every((v,i)=>v===args[i]))matches++;
+    const matches=run.diaryIndex?.calendarios.get(JSON.stringify(args))||0;
     if(matches!==1)throw new Error("CALENDAR_LINK");
     const tip=selected.get("TIP_Consulta");
     if(!/^[1-4]$/.test(tip||""))throw new Error("estructura");
@@ -699,10 +701,11 @@ async function sitfaTask(command, payload) {
     const decoded=html.replace(/&#(?:x([0-9a-f]+)|(\d+));?/gi,(_,hex,dec)=>String.fromCodePoint(parseInt(hex||dec,hex?16:10)))
       .replace(/&amp;/gi,'&').replace(/&quot;/gi,'"').replace(/&apos;/gi,"'");
     const views=[html,decoded];
-    for(const value of [...views]){try{views.push(decodeURIComponent(value));}catch(_){}}
     for(const token of encryptedValues) {
-      const variants=[token];try{variants.push(decodeURIComponent(token));}catch(_){}
-      if(views.some(view=>variants.some(value=>view.includes(value))))throw new Error("HISTORY_REFLECTED");
+      const variants=new Set([token]);
+      try{variants.add(encodeURIComponent(token));}catch(_){}
+      try{const dec=decodeURIComponent(token);variants.add(dec);variants.add(encodeURIComponent(dec));}catch(_){}
+      if(views.some(view=>[...variants].some(value=>value&&view.includes(value))))throw new Error("HISTORY_REFLECTED");
     }
   }
   const chunks=[];

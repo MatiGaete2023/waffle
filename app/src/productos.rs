@@ -374,9 +374,8 @@ pub fn preparar_borradores(w: &Trabajo, cfg: &Config, o: &OpcionesCorreo) -> Vec
 pub fn borrador_plantilla(w: Option<&Trabajo>, cfg: &Config, kind: &str, filas: &[usize]) -> Option<Borrador> {
     let tpl = cfg.plantillas.get(kind).filter(|t| !t.archivada)?;
     let fecha = crate::util::hoy().format("%d/%m/%Y").to_string();
-    let (trib, trib_nombre) = match (w, filas.first()) {
-        (Some(w), Some(i)) => {
-            let r = &w.registros[*i];
+    let (trib, trib_nombre) = match (w, filas.first().and_then(|&i| w.and_then(|w| w.registros.get(i)))) {
+        (Some(w), Some(r)) => {
             let k = w.tribunal_clave(r);
             let n = cfg.tribunal_nombre(&k, &w.value(r, "tribunal"));
             (k, n)
@@ -390,7 +389,7 @@ pub fn borrador_plantilla(w: Option<&Trabajo>, cfg: &Config, kind: &str, filas: 
     vars.insert("ALCANCE_MODALIDADES", "todas las modalidades".to_string());
     vars.insert("PROGRAMA", String::new());
     let nomina = w.filter(|_| !filas.is_empty()).map(|w| {
-        let refs: Vec<&Registro> = filas.iter().map(|i| &w.registros[*i]).collect();
+        let refs: Vec<&Registro> = filas.iter().filter_map(|&i| w.registros.get(i)).collect();
         nomina_para(w, "medidas", &refs)
     });
     Some(Borrador {
@@ -837,7 +836,8 @@ fn paquete_plantilla(trib: &str, tipo: &str) -> Option<Vec<u8>> {
 }
 
 fn texto_xml(p: &str) -> String {
-    let rt = regex::Regex::new(r"(?s)<w:t(?:\s[^>]*)?>(.*?)</w:t>").unwrap();
+    static RT: OnceLock<Regex> = OnceLock::new();
+    let rt = RT.get_or_init(|| Regex::new(r"(?s)<w:t(?:\s[^>]*)?>(.*?)</w:t>").unwrap());
     rt.captures_iter(p)
         .map(|t| t[1].to_string())
         .collect::<String>()
@@ -850,9 +850,12 @@ fn texto_xml(p: &str) -> String {
 
 /// Aplica `cambiar` al texto de cada párrafo; el que cambia se reescribe en un solo tramo con su formato original.
 fn transformar_parrafos(xml: &str, cambiar: &dyn Fn(&str) -> String) -> String {
-    let rp = regex::Regex::new(r"(?s)<w:p[ >].*?</w:p>").unwrap();
-    let rppr = regex::Regex::new(r"(?s)<w:pPr>.*?</w:pPr>").unwrap();
-    let rrpr = regex::Regex::new(r"(?s)<w:rPr>.*?</w:rPr>").unwrap();
+    static RP: OnceLock<Regex> = OnceLock::new();
+    static RPPR: OnceLock<Regex> = OnceLock::new();
+    static RRPR: OnceLock<Regex> = OnceLock::new();
+    let rp = RP.get_or_init(|| Regex::new(r"(?s)<w:p[ >].*?</w:p>").unwrap());
+    let rppr = RPPR.get_or_init(|| Regex::new(r"(?s)<w:pPr>.*?</w:pPr>").unwrap());
+    let rrpr = RRPR.get_or_init(|| Regex::new(r"(?s)<w:rPr>.*?</w:rPr>").unwrap());
     rp.replace_all(xml, |c: &regex::Captures| {
         let p = &c[0];
         let texto = texto_xml(p);
@@ -872,10 +875,13 @@ fn redactar(texto: &str, vars: &BTreeMap<String, String>) -> String {
     let mut t = llenar(texto, vars);
     let activo = |k: &str| vars.get(k).is_some_and(|v| !v.is_empty());
     if activo("_PLURAL") {
+        let nombre = vars.get("NOMBRE").map(String::as_str).unwrap_or("");
+        let rut = vars.get("RUT").map(String::as_str).unwrap_or("");
+        let personas = vars.get("PERSONAS").map(String::as_str).unwrap_or("");
         for marca in ["cédula de identidad N°", "cédula de identidad N.º"] {
-            let par = format!("{}, {marca} {}", vars["NOMBRE"], vars["RUT"]);
+            let par = format!("{nombre}, {marca} {rut}");
             if t.contains(&par) {
-                t = t.replace(&par, &vars["PERSONAS"].replace("cédula de identidad N°", marca));
+                t = t.replace(&par, &personas.replace("cédula de identidad N°", marca));
             }
         }
         let mut cambios = vec![
@@ -903,13 +909,15 @@ fn redactar(texto: &str, vars: &BTreeMap<String, String>) -> String {
 
 /// `document.xml` del proyecto: variables, plural, detalle de personas con varios programas y sin cursivas.
 fn documento_xml(xml: &str, p: &Proyecto) -> String {
+    static RP: OnceLock<Regex> = OnceLock::new();
     let mut doc = transformar_parrafos(xml, &|t| redactar(t, &p.vars));
     if p.vars.get("_PLURAL").is_some_and(|v| !v.is_empty()) && p.vars.get("_VARIOS_PROGRAMAS").is_some_and(|v| !v.is_empty()) {
+        let detalle_personas = p.vars.get("DETALLE_PERSONAS").map(String::as_str).unwrap_or("");
         let detalle = format!(
             "<w:p><w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>",
-            xml_esc(&format!("Personas comprendidas: {}.", p.vars["DETALLE_PERSONAS"]))
+            xml_esc(&format!("Personas comprendidas: {detalle_personas}."))
         );
-        let rp = regex::Regex::new(r"(?s)<w:p[ >].*?</w:p>").unwrap();
+        let rp = RP.get_or_init(|| Regex::new(r"(?s)<w:p[ >].*?</w:p>").unwrap());
         let ancla = rp.find_iter(&doc).find(|m| texto_xml(m.as_str()).trim_start().starts_with("RIT")).map(|m| m.start());
         match ancla.or_else(|| doc.rfind("<w:sectPr")).or_else(|| doc.rfind("</w:body>")) {
             Some(pos) => doc.insert_str(pos, &detalle),
@@ -956,13 +964,14 @@ pub fn tiene_matriz(tribunal_clave: &str, tipo: &str) -> bool {
 
 /// Párrafos del proyecto ya completados, desde la misma plantilla que usará el Word.
 pub fn texto_proyecto(p: &Proyecto) -> Vec<String> {
+    static RP: OnceLock<Regex> = OnceLock::new();
     if let Some(xml) = paquete_plantilla(&p.tribunal_clave, &p.tipo).and_then(|d| {
         let mut z = zip::ZipArchive::new(std::io::Cursor::new(d)).ok()?;
         let mut s = String::new();
         std::io::Read::read_to_string(&mut z.by_name("word/document.xml").ok()?, &mut s).ok()?;
         Some(s)
     }) {
-        let rp = regex::Regex::new(r"(?s)<w:p[ >].*?</w:p>").unwrap();
+        let rp = RP.get_or_init(|| Regex::new(r"(?s)<w:p[ >].*?</w:p>").unwrap());
         return rp.find_iter(&documento_xml(&xml, p)).map(|m| texto_xml(m.as_str())).collect();
     }
     plantilla(&p.tribunal_clave, &p.tipo).iter().map(|t| redactar(t, &p.vars)).collect()
@@ -1028,16 +1037,20 @@ fn docx_generico(p: &Proyecto) -> Result<Vec<u8>, String> {
 }
 
 fn extraer_cuerpo_body(doc_xml: &str) -> Result<String, String> {
-    let rb = regex::Regex::new(r"(?s)<w:body(?:\s[^>]*)?>(.*)</w:body>").unwrap();
+    static RB: OnceLock<Regex> = OnceLock::new();
+    static RS: OnceLock<Regex> = OnceLock::new();
+    let rb = RB.get_or_init(|| Regex::new(r"(?s)<w:body(?:\s[^>]*)?>(.*)</w:body>").unwrap());
     let caps = rb.captures(doc_xml).ok_or_else(|| "La plantilla Word no tiene cuerpo <w:body>.".to_string())?;
-    let rs = regex::Regex::new(r"(?s)<w:sectPr(?:\s[^>]*)?(?:/>|>.*?</w:sectPr>)\s*$").unwrap();
+    let rs = RS.get_or_init(|| Regex::new(r"(?s)<w:sectPr(?:\s[^>]*)?(?:/>|>.*?</w:sectPr>)\s*$").unwrap());
     Ok(rs.replace(&caps[1], "").into_owned())
 }
 
 fn reemplazar_cuerpo_body(doc_xml: &str, nuevo_cuerpo: &str) -> Result<String, String> {
-    let rb = regex::Regex::new(r"(?s)(<w:body(?:\s[^>]*)?>)(.*)(</w:body>)").unwrap();
+    static RB: OnceLock<Regex> = OnceLock::new();
+    static RS: OnceLock<Regex> = OnceLock::new();
+    let rb = RB.get_or_init(|| Regex::new(r"(?s)(<w:body(?:\s[^>]*)?>)(.*)(</w:body>)").unwrap());
     let caps = rb.captures(doc_xml).ok_or_else(|| "La plantilla Word no tiene cuerpo <w:body>.".to_string())?;
-    let rs = regex::Regex::new(r"(?s)<w:sectPr(?:\s[^>]*)?(?:/>|>.*?</w:sectPr>)\s*$").unwrap();
+    let rs = RS.get_or_init(|| Regex::new(r"(?s)<w:sectPr(?:\s[^>]*)?(?:/>|>.*?</w:sectPr>)\s*$").unwrap());
     let sect_pr = rs.find(&caps[2]).map(|m| m.as_str()).unwrap_or("");
     let reemplazo = format!("{}{}{}{}", &caps[1], nuevo_cuerpo, sect_pr, &caps[3]);
     Ok(format!("{}{}{}", &doc_xml[..caps.get(0).unwrap().start()], reemplazo, &doc_xml[caps.get(0).unwrap().end()..]))
@@ -1587,13 +1600,16 @@ impl DocumentoCombinado {
     }
 
     fn formato_nivel_cero(num_xml: &str, num_id: u32) -> Option<String> {
+        static RE_AID: OnceLock<Regex> = OnceLock::new();
+        static RE_LVL0: OnceLock<Regex> = OnceLock::new();
+        static RE_FMT: OnceLock<Regex> = OnceLock::new();
         let num_bloque = Self::buscar_num_en_xml(num_xml, num_id)?;
-        let re_aid = Regex::new(r#"<w:abstractNumId\b[^>]*\bw:val="(\d+)""#).ok()?;
+        let re_aid = RE_AID.get_or_init(|| Regex::new(r#"<w:abstractNumId\b[^>]*\bw:val="(\d+)""#).unwrap());
         let aid = re_aid.captures(&num_bloque)?[1].parse::<u32>().ok()?;
         let anum_bloque = Self::buscar_abstract_num_en_xml(num_xml, aid)?;
-        let re_lvl0 = Regex::new(r#"(?s)<w:lvl\b[^>]*\bw:ilvl="0"[^>]*>(.*?)</w:lvl>"#).ok()?;
+        let re_lvl0 = RE_LVL0.get_or_init(|| Regex::new(r#"(?s)<w:lvl\b[^>]*\bw:ilvl="0"[^>]*>(.*?)</w:lvl>"#).unwrap());
         let lvl_body = &re_lvl0.captures(&anum_bloque)?[1];
-        let re_fmt = Regex::new(r#"<w:numFmt\b[^>]*\bw:val="([^"]+)""#).ok()?;
+        let re_fmt = RE_FMT.get_or_init(|| Regex::new(r#"<w:numFmt\b[^>]*\bw:val="([^"]+)""#).unwrap());
         Some(re_fmt.captures(lvl_body)?[1].to_string())
     }
 
@@ -1605,12 +1621,16 @@ impl DocumentoCombinado {
         num_map: &mut BTreeMap<u32, u32>,
         anum_map: &mut BTreeMap<u32, u32>,
     ) {
+        static RE_AID: OnceLock<Regex> = OnceLock::new();
+        static RE_SET_AID: OnceLock<Regex> = OnceLock::new();
+        static RE_NSID: OnceLock<Regex> = OnceLock::new();
+        static RE_SET_NID: OnceLock<Regex> = OnceLock::new();
         if old_num_id == 0 || num_map.contains_key(&old_num_id) {
             return;
         }
         let Some(src_xml) = src_num_xml else { return };
         let Some(src_num_bloque) = Self::buscar_num_en_xml(src_xml, old_num_id) else { return };
-        let re_aid = Regex::new(r#"(<w:abstractNumId\b[^>]*\bw:val=")(\d+)(")"#).unwrap();
+        let re_aid = RE_AID.get_or_init(|| Regex::new(r#"(<w:abstractNumId\b[^>]*\bw:val=")(\d+)(")"#).unwrap());
         let Some(cap_aid) = re_aid.captures(&src_num_bloque) else { return };
         let old_anum_id: u32 = cap_aid[2].parse().unwrap_or(0);
 
@@ -1622,10 +1642,15 @@ impl DocumentoCombinado {
             };
             let new_anum_id = self.next_anum_id;
             self.next_anum_id += 1;
-            let re_set_aid = Regex::new(r#"(\bw:abstractNumId=")\d+(")"#).unwrap();
+            let re_set_aid = RE_SET_AID.get_or_init(|| Regex::new(r#"(\bw:abstractNumId=")\d+(")"#).unwrap());
             src_anum_bloque = re_set_aid.replace(&src_anum_bloque, format!("${{1}}{new_anum_id}${{2}}")).into_owned();
-            let nsid_hex = format!("{:08X}", 0x1000_0001u32.wrapping_add(new_anum_id * 7919 + proj_idx as u32 * 131));
-            let re_nsid = Regex::new(r#"(<w:nsid\b[^>]*\bw:val=")[^"]*(")"#).unwrap();
+            let nsid_hex = format!(
+                "{:08X}",
+                0x1000_0001u32
+                    .wrapping_add(new_anum_id.wrapping_mul(7919))
+                    .wrapping_add((proj_idx as u32).wrapping_mul(131))
+            );
+            let re_nsid = RE_NSID.get_or_init(|| Regex::new(r#"(<w:nsid\b[^>]*\bw:val=")[^"]*(")"#).unwrap());
             if re_nsid.is_match(&src_anum_bloque) {
                 src_anum_bloque = re_nsid.replace(&src_anum_bloque, format!("${{1}}{nsid_hex}${{2}}")).into_owned();
             }
@@ -1636,7 +1661,7 @@ impl DocumentoCombinado {
 
         let new_num_id = self.next_num_id;
         self.next_num_id += 1;
-        let re_set_nid = Regex::new(r#"(\bw:numId=")\d+(")"#).unwrap();
+        let re_set_nid = RE_SET_NID.get_or_init(|| Regex::new(r#"(\bw:numId=")\d+(")"#).unwrap());
         let mut nuevo_num = re_set_nid.replace(&src_num_bloque, format!("${{1}}{new_num_id}${{2}}")).into_owned();
         nuevo_num = re_aid.replace(&nuevo_num, format!("${{1}}{mapped_anum_id}${{3}}")).into_owned();
         self.insertar_num(&nuevo_num);
@@ -1721,9 +1746,10 @@ impl DocumentoCombinado {
             return out;
         };
 
+        static RE_SET_NID: OnceLock<Regex> = OnceLock::new();
         let restarted_id = self.next_num_id;
         self.next_num_id += 1;
-        let re_set_nid = Regex::new(r#"(\bw:numId=")\d+(")"#).unwrap();
+        let re_set_nid = RE_SET_NID.get_or_init(|| Regex::new(r#"(\bw:numId=")\d+(")"#).unwrap());
         let mut nuevo_num = re_set_nid.replace(&orig_num_bloque, format!("${{1}}{restarted_id}${{2}}")).into_owned();
         if !nuevo_num.contains("w:startOverride") {
             if let Some(pos) = nuevo_num.rfind("</w:num>") {
@@ -1926,17 +1952,21 @@ fn indice_tribunal_xml(grupo: &[&Proyecto]) -> String {
 fn docx_por_tribunal(grupo: &[&Proyecto], dir_propia: Option<&Path>) -> Result<Vec<u8>, String> {
     const SALTO_PAGINA: &str = "<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>";
     let mut paquetes: Vec<(Vec<u8>, String)> = Vec::with_capacity(grupo.len());
-    let mut todos_con_plantilla = true;
-    for p in grupo {
+    let mut alguno_con_plantilla = false;
+    let mut base_idx: Option<usize> = None;
+    for (idx, p) in grupo.iter().enumerate() {
         if let Some(paquete) = paquete_plantilla_en(&p.tribunal_clave, &p.tipo, dir_propia) {
+            alguno_con_plantilla = true;
+            if base_idx.is_none() {
+                base_idx = Some(idx);
+            }
             let cuerpo = leer_cuerpo_proyecto_paquete(&paquete, p)?;
             paquetes.push((paquete, cuerpo));
         } else {
-            todos_con_plantilla = false;
             paquetes.push((docx_generico(p)?, cuerpo_generico(p)));
         }
     }
-    if !todos_con_plantilla && paquetes.iter().all(|(_, _)| !grupo.iter().any(|p| paquete_plantilla_en(&p.tribunal_clave, &p.tipo, dir_propia).is_some())) {
+    if !alguno_con_plantilla {
         let mut combinado = indice_tribunal_xml(grupo);
         for (_, cuerpo) in &paquetes {
             combinado.push_str(SALTO_PAGINA);
@@ -1944,13 +1974,16 @@ fn docx_por_tribunal(grupo: &[&Proyecto], dir_propia: Option<&Path>) -> Result<V
         }
         return docx_desde_cuerpo_generico(&quitar_cursivas_xml(&combinado));
     }
-    let mut combinado_doc = DocumentoCombinado::desde_base(&paquetes[0].0)?;
+    let base_idx = base_idx.unwrap_or(0);
+    let mut combinado_doc = DocumentoCombinado::desde_base(&paquetes[base_idx].0)?;
     let mut cuerpo_final = indice_tribunal_xml(grupo);
-    cuerpo_final.push_str(SALTO_PAGINA);
-    cuerpo_final.push_str(&paquetes[0].1);
-    for (idx, (paq, cuerpo)) in paquetes.iter().enumerate().skip(1) {
+    for (idx, (paq, cuerpo)) in paquetes.iter().enumerate() {
         cuerpo_final.push_str(SALTO_PAGINA);
-        cuerpo_final.push_str(&combinado_doc.unir_proyecto(paq, cuerpo, idx)?);
+        if idx == base_idx {
+            cuerpo_final.push_str(cuerpo);
+        } else {
+            cuerpo_final.push_str(&combinado_doc.unir_proyecto(paq, cuerpo, idx)?);
+        }
     }
     combinado_doc.empaquetar(&cuerpo_final)
 }
@@ -2027,7 +2060,16 @@ pub fn reporte_proyectos(proyectos: &[Proyecto], dir: &Path, periodo: &str) -> R
     let rows = proyectos
         .iter()
         .filter(|p| p.incluir)
-        .map(|p| vec![p.tribunal.clone(), p.rit.clone(), p.tipo.clone(), p.vars["NOMBRE"].clone(), p.vars["PROGRAMA"].clone(), periodo.to_string()])
+        .map(|p| {
+            vec![
+                p.tribunal.clone(),
+                p.rit.clone(),
+                p.tipo.clone(),
+                p.vars.get("NOMBRE").cloned().unwrap_or_default(),
+                p.vars.get("PROGRAMA").cloned().unwrap_or_default(),
+                periodo.to_string(),
+            ]
+        })
         .collect();
     let path = nueva_ruta(dir, "Reporte de proyectos", "xlsx");
     xlsx_libro(&[("Proyectos", headers, rows)], &path)?;

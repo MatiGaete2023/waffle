@@ -140,7 +140,7 @@ impl Dialogo {
                     }
                 });
                 if let Some(e) = &self.error {
-                    ui.label(RichText::new(e).color(p.amber));
+                    ui.label(RichText::new(e).color(p.red));
                 }
                 let (desde, hasta) = self.periodo;
                 ui.label(
@@ -284,6 +284,9 @@ impl Dialogo {
                         })
                     });
             });
+        if abierto && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            abierto = false;
+        }
         (abierto, accion, productos)
     }
 }

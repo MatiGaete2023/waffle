@@ -1217,6 +1217,9 @@ fn leer_calendario(s: &mut Sesion<'_>, i: usize, pausar: bool) -> Result<bool, D
             .map_err(|_| "La fecha de la lectura del calendario no es válida.".to_string())?;
         let argumentos: Vec<String> = serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
         let leido = lecturas::leer_calendario(&datos, &argumentos, "", "")?;
+        if clave.len() < 24 || !clave.is_ascii() {
+            return Err("Clave de registro inválida para el calendario.".into());
+        }
         let nombre = format!("calendario-{}-{}.html", &clave[..24], &huella[..16]);
         let ruta = s.carpeta.join(&nombre);
         if ruta.exists() {

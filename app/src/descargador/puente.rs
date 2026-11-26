@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -26,12 +26,13 @@ const COMANDOS: [&str; 10] = [
 ];
 /// Lecturas de contexto (E-Q3): solo con la extensión Integral verificada en este puente (`verificar(Integral)`).
 const LECTURAS_INTEGRAL: [&str; 4] = ["diary_open", "history_open", "calendar_open", "historico_open"];
-const MOTIVOS_EVIDENCIA: [&str; 9] = [
-    "estructura", "sesion", "cambio", "pantalla", "tiempo", "pagina", "acceso", "permiso", "pestaña",
+const MOTIVOS_EVIDENCIA: [&str; 11] = [
+    "estructura", "sesion", "cambio", "pantalla", "tiempo", "pagina", "acceso", "permiso", "pestaña", "ventana", "captura",
 ];
 // El lector de la extensión admite 80 MiB binarios; base64 ocupa hasta 107 MiB.
 const CONTROL_MAXIMO: usize = 256 * 1024;
 const DATOS_MAXIMO: usize = 112 * 1024 * 1024;
+const MEMORIA_CUERPOS_MAXIMO: usize = 160 * 1024 * 1024;
 const CABECERAS_MAXIMO: usize = 16 * 1024;
 const PLAZO_CABECERAS: Duration = Duration::from_secs(5);
 const PLAZO_CUERPO: Duration = Duration::from_secs(30);
@@ -65,20 +66,61 @@ struct Despacho {
     configurado: usize,
     fallas: usize,
     degradado: bool,
-    en_vuelo: HashMap<String, bool>,
+    en_vuelo: HashMap<String, (bool, Instant, Duration)>,
 }
 
 impl Despacho {
     fn limite(&self) -> usize {
         if self.degradado { 1 } else { self.configurado.clamp(1, MAX_EN_VUELO) }
     }
+    fn purgar_vencidas(&mut self) {
+        let ahora = Instant::now();
+        self.en_vuelo.retain(|_, (_, inicio, plazo)| {
+            ahora.saturating_duration_since(*inicio) <= *plazo + Duration::from_secs(90)
+        });
+    }
     fn admite(&self, comando: &str) -> bool {
-        self.en_vuelo.is_empty() || (lectura_paralela(comando) && self.en_vuelo.values().all(|v| *v) && self.en_vuelo.len() < self.limite())
+        self.en_vuelo.is_empty() || (lectura_paralela(comando) && self.en_vuelo.values().all(|(p, _, _)| *p) && self.en_vuelo.len() < self.limite())
     }
     fn resultado(&mut self, sano: bool) {
         if sano { self.fallas = 0; } else {
             self.fallas = self.fallas.saturating_add(1);
             if self.fallas >= 2 { self.degradado = true; }
+        }
+    }
+}
+
+struct ReservaMemoria<'a> {
+    contador: &'a AtomicUsize,
+    reservado: usize,
+}
+
+impl<'a> ReservaMemoria<'a> {
+    fn nueva(contador: &'a AtomicUsize) -> Self {
+        Self { contador, reservado: 0 }
+    }
+    fn reservar(&mut self, adicional: usize) -> Result<(), ErrorHttp> {
+        let mut actual = self.contador.load(Ordering::Relaxed);
+        loop {
+            let nuevo = actual.checked_add(adicional).ok_or(ErrorHttp::Grande)?;
+            if nuevo > MEMORIA_CUERPOS_MAXIMO {
+                return Err(ErrorHttp::Grande);
+            }
+            match self.contador.compare_exchange_weak(actual, nuevo, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => {
+                    self.reservado += adicional;
+                    return Ok(());
+                }
+                Err(v) => actual = v,
+            }
+        }
+    }
+}
+
+impl Drop for ReservaMemoria<'_> {
+    fn drop(&mut self) {
+        if self.reservado > 0 {
+            self.contador.fetch_sub(self.reservado, Ordering::AcqRel);
         }
     }
 }
@@ -149,7 +191,17 @@ fn cabeceras_http<R: BufRead>(r: &mut R) -> Result<(String, String, HashMap<Stri
     Ok((partes[0].into(), partes[1].into(), headers))
 }
 
+#[cfg(test)]
 fn leer_cuerpo<R: BufRead>(r: &mut R, h: &HashMap<String, String>, max: usize) -> Result<Vec<u8>, ErrorHttp> {
+    leer_cuerpo_con_reserva(r, h, max, None)
+}
+
+fn leer_cuerpo_con_reserva<R: BufRead>(
+    r: &mut R,
+    h: &HashMap<String, String>,
+    max: usize,
+    mut reserva: Option<&mut ReservaMemoria<'_>>,
+) -> Result<Vec<u8>, ErrorHttp> {
     let largo = h.get("content-length");
     if let Some(te) = h.get("transfer-encoding") {
         if largo.is_some() || !te.eq_ignore_ascii_case("chunked") { return Err(ErrorHttp::Invalido); }
@@ -170,6 +222,7 @@ fn leer_cuerpo<R: BufRead>(r: &mut R, h: &HashMap<String, String>, max: usize) -
                 }
             }
             if n > max.saturating_sub(cuerpo.len()) { return Err(ErrorHttp::Grande); }
+            if let Some(res) = reserva.as_deref_mut() { res.reservar(n)?; }
             let inicio = cuerpo.len();
             // No reservar el tamaño declarado antes de recibir bytes.
             let recibidos = (&mut *r).take(n as u64).read_to_end(&mut cuerpo)?;
@@ -184,6 +237,7 @@ fn leer_cuerpo<R: BufRead>(r: &mut R, h: &HashMap<String, String>, max: usize) -
     let n = n.parse::<usize>().map_err(|_| ErrorHttp::Grande)?;
     if n == 0 { return Err(ErrorHttp::Invalido); }
     if n > max { return Err(ErrorHttp::Grande); }
+    if let Some(res) = reserva.as_deref_mut() { res.reservar(n)?; }
     let mut cuerpo = Vec::new();
     if (&mut *r).take(n as u64).read_to_end(&mut cuerpo)? != n { return Err(ErrorHttp::Invalido); }
     Ok(cuerpo)
@@ -200,8 +254,10 @@ fn respuesta_http(socket: &mut TcpStream, estado: u16, datos: Option<Value>, ori
             socket.write_all(b"Access-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, X-Sitfa-Code, X-Sitfa-Extension, X-Sitfa-Task\r\nAccess-Control-Allow-Private-Network: true\r\n")?;
         }
         socket.write_all(b"\r\n")?;
-        socket.write_all(cuerpo.as_bytes())
+        socket.write_all(cuerpo.as_bytes())?;
+        socket.flush()
     })();
+    let _ = socket.shutdown(std::net::Shutdown::Write);
 }
 
 fn aceptar(estado: &Estado, mut socket: TcpStream) {
@@ -220,9 +276,11 @@ struct Tarea {
     id: String,
     comando: String,
     payload: Value,
+    plazo: Duration,
 }
 
 struct Estado {
+    puerto: u16,
     codigo: String,
     origen: Mutex<Option<String>>,
     tareas: Mutex<VecDeque<Tarea>>,
@@ -230,6 +288,7 @@ struct Estado {
     pendientes: Mutex<HashMap<String, Pendiente>>,
     despacho: Mutex<Despacho>,
     visto: Mutex<Option<Instant>>,
+    memoria_cuerpos: AtomicUsize,
     cerrado: AtomicBool,
     /// La última verificación de la extensión fue Integral: habilita `LECTURAS_INTEGRAL`.
     integral: AtomicBool,
@@ -312,8 +371,18 @@ fn autorizada(estado: &Estado, peticion: &Peticion) -> Result<String, &'static s
 }
 
 fn atender(estado: &Estado, mut peticion: Peticion) {
+    let host_valido = cabecera(&peticion, "Host").is_some_and(|h| {
+        h.eq_ignore_ascii_case(&format!("127.0.0.1:{}", estado.puerto))
+            || h.eq_ignore_ascii_case(&format!("localhost:{}", estado.puerto))
+    });
+    if !host_valido {
+        return responder(peticion, 403, json!({"error": "INVALID_HOST"}));
+    }
     if peticion.metodo == "OPTIONS" {
         let Some(origen) = origen_cors(&peticion) else { return responder(peticion, 403, json!({})); };
+        if tomar(&estado.origen).as_ref().is_some_and(|fijado| *fijado != origen) {
+            return responder(peticion, 403, json!({"error": "EXTENSION_CHANGED"}));
+        }
         respuesta_http(&mut peticion.entrada.get_mut().socket, 204, None, Some(&origen), true);
         return;
     }
@@ -331,9 +400,10 @@ fn atender(estado: &Estado, mut peticion: Peticion) {
                 let pendientes = tomar(&estado.pendientes);
                 if !pendientes.contains_key(&tarea.id) { cola.pop_front(); continue; }
                 let mut d = tomar(&estado.despacho);
+                d.purgar_vencidas();
                 if !d.admite(&tarea.comando) || (!estado.integral.load(Ordering::SeqCst) && !d.en_vuelo.is_empty()) { break; }
                 let Some(tarea) = cola.pop_front() else { break; };
-                d.en_vuelo.insert(tarea.id.clone(), lectura_paralela(&tarea.comando));
+                d.en_vuelo.insert(tarea.id.clone(), (lectura_paralela(&tarea.comando), Instant::now(), tarea.plazo));
                 let paralelo = if estado.integral.load(Ordering::SeqCst) { d.limite() } else { 1 };
                 drop(d); drop(pendientes); drop(cola);
                 return responder(peticion, 200, json!({"id":tarea.id,"command":tarea.comando,"payload":tarea.payload,"parallel":paralelo}));
@@ -373,7 +443,8 @@ fn atender(estado: &Estado, mut peticion: Peticion) {
         let _ = peticion.entrada.get_mut().socket.set_write_timeout(Some(PLAZO_ESCRITURA));
         let _ = peticion.entrada.get_mut().socket.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
     }
-    let cuerpo = match leer_cuerpo(&mut peticion.entrada, &peticion.cabeceras, maximo) {
+    let mut reserva = ReservaMemoria::nueva(&estado.memoria_cuerpos);
+    let cuerpo = match leer_cuerpo_con_reserva(&mut peticion.entrada, &peticion.cabeceras, maximo, Some(&mut reserva)) {
         Ok(c) => c,
         Err(e) => { let (status, datos) = e.respuesta(); return responder(peticion, status, datos); }
     };
@@ -384,6 +455,8 @@ fn atender(estado: &Estado, mut peticion: Peticion) {
         *fijado = Some(origen);
         *tomar(&estado.visto) = Some(Instant::now());
         drop(fijado);
+        tomar(&estado.despacho).en_vuelo.clear();
+        estado.hay_tarea.notify_all();
         return responder(peticion, 200, json!({"ok":true,"parallel":1}));
     }
     if tomar(&estado.origen).is_none() { return responder(peticion, 409, json!({"error":"NOT_CONNECTED"})); }
@@ -391,8 +464,11 @@ fn atender(estado: &Estado, mut peticion: Peticion) {
     if tarea_declarada.as_deref().is_some_and(|t| t != id) { return responder(peticion, 400, json!({"error":"INVALID_MESSAGE"})); }
     let mut pendientes = tomar(&estado.pendientes);
     if pendientes.get(id).is_some_and(|p| cuerpo.len() > presupuesto(&p.comando)) {
-        let (status, datos) = ErrorHttp::Grande.respuesta();
+        pendientes.remove(id);
+        tomar(&estado.despacho).en_vuelo.remove(id);
         drop(pendientes);
+        estado.hay_tarea.notify_all();
+        let (status, datos) = ErrorHttp::Grande.respuesta();
         return responder(peticion, status, datos);
     }
     let mut d = tomar(&estado.despacho);
@@ -438,6 +514,7 @@ impl Puente {
         servidor.set_nonblocking(true).map_err(|e| e.to_string())?;
         let puerto = servidor.local_addr().map_err(|e| e.to_string())?.port();
         let estado = Arc::new(Estado {
+            puerto,
             codigo: aleatorio::<16>()?,
             origen: Mutex::new(None),
             tareas: Mutex::new(VecDeque::new()),
@@ -445,6 +522,7 @@ impl Puente {
             pendientes: Mutex::new(HashMap::new()),
             despacho: Mutex::new(Despacho::default()),
             visto: Mutex::new(None),
+            memoria_cuerpos: AtomicUsize::new(0),
             cerrado: AtomicBool::new(false),
             integral: AtomicBool::new(false),
             rapido_ext: AtomicBool::new(false),
@@ -457,7 +535,7 @@ impl Puente {
                 while !estado.cerrado.load(Ordering::SeqCst) {
                     match servidor.accept() {
                         Ok((socket, _)) => aceptar(&estado, socket),
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(20)),
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(50)),
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
                     }
@@ -560,6 +638,7 @@ impl Puente {
             id: id.clone(),
             comando: comando.into(),
             payload,
+            plazo,
         });
         self.estado.hay_tarea.notify_all();
         let respuesta = recepcion.recv_timeout(plazo);
@@ -612,13 +691,23 @@ mod tests {
         socket
             .set_read_timeout(Some(Duration::from_secs(8)))
             .unwrap();
-        let datos = cuerpo.to_string();
-        write!(
-            socket,
-            "{method} {ruta} HTTP/1.1\r\nHost: localhost\r\nOrigin: {origen}\r\nX-Sitfa-Code: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{datos}",
-            puente.estado.codigo,
-            datos.len(),
-        ).unwrap();
+        let datos = if method == "POST" { cuerpo.to_string() } else { String::new() };
+        if method == "POST" {
+            write!(
+                socket,
+                "{method} {ruta} HTTP/1.1\r\nHost: localhost:{}\r\nOrigin: {origen}\r\nX-Sitfa-Code: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{datos}",
+                puente.puerto(),
+                puente.estado.codigo,
+                datos.len(),
+            ).unwrap();
+        } else {
+            write!(
+                socket,
+                "{method} {ruta} HTTP/1.1\r\nHost: localhost:{}\r\nOrigin: {origen}\r\nX-Sitfa-Code: {}\r\nConnection: close\r\n\r\n",
+                puente.puerto(),
+                puente.estado.codigo,
+            ).unwrap();
+        }
         let mut respuesta = String::new();
         socket.read_to_string(&mut respuesta).unwrap();
         let (cabecera, cuerpo) = respuesta.split_once("\r\n\r\n").unwrap();
@@ -631,7 +720,7 @@ mod tests {
         let puente = Puente::abrir().unwrap();
         let mut socket = TcpStream::connect((Ipv4Addr::LOCALHOST, puente.puerto())).unwrap();
         socket.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
-        write!(socket, "POST /connect HTTP/1.1\r\nHost: localhost\r\nOrigin: chrome-extension://{}\r\nX-Sitfa-Code: {}\r\nTransfer-Encoding: chunked\r\n\r\n1\r\n{{\r\n1\r\n}}\r\n0\r\n\r\n", "a".repeat(32), puente.estado.codigo).unwrap();
+        write!(socket, "POST /connect HTTP/1.1\r\nHost: localhost:{}\r\nOrigin: chrome-extension://{}\r\nX-Sitfa-Code: {}\r\nTransfer-Encoding: chunked\r\n\r\n1\r\n{{\r\n1\r\n}}\r\n0\r\n\r\n", puente.puerto(), "a".repeat(32), puente.estado.codigo).unwrap();
         let mut salida = String::new(); socket.read_to_string(&mut salida).unwrap();
         assert!(salida.starts_with("HTTP/1.1 200"));
         let h = HashMap::from([("transfer-encoding".to_string(), "chunked".to_string())]);
@@ -666,12 +755,12 @@ mod tests {
         let mut d = Despacho { configurado: 99, ..Default::default() };
         for i in 0..3 {
             assert!(d.admite("diary_open"));
-            d.en_vuelo.insert(i.to_string(), true);
+            d.en_vuelo.insert(i.to_string(), (true, Instant::now(), Duration::from_secs(30)));
         }
         assert!(!d.admite("diary_open")); assert!(!d.admite("search"));
         d.en_vuelo.clear(); d.resultado(false); assert_eq!(d.limite(), 3);
         d.resultado(false); assert_eq!(d.limite(), 1);
-        d.en_vuelo.insert("sintetica".into(), true);
+        d.en_vuelo.insert("sintetica".into(), (true, Instant::now(), Duration::from_secs(30)));
         assert!(!d.admite("history_open"));
         d.resultado(true); assert_eq!(d.limite(), 1);
     }

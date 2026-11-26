@@ -14,9 +14,13 @@ use std::sync::LazyLock;
 pub const MANIFIESTO: &str = "historico.json";
 pub const MAX_BYTES: usize = 8 * 1024 * 1024;
 
-fn sel(s: &str) -> Selector {
-    Selector::parse(s).expect("selector constante")
-}
+static SEL_TITLE: LazyLock<Selector> = LazyLock::new(|| Selector::parse("title").expect("selector constante"));
+static SEL_FRAMES: LazyLock<Selector> = LazyLock::new(|| Selector::parse("iframe, frame").expect("selector constante"));
+static SEL_FORM: LazyLock<Selector> = LazyLock::new(|| Selector::parse("form").expect("selector constante"));
+static SEL_INPUT_SELECT: LazyLock<Selector> = LazyLock::new(|| Selector::parse("input, select").expect("selector constante"));
+static SEL_TABLE: LazyLock<Selector> = LazyLock::new(|| Selector::parse("table").expect("selector constante"));
+static SEL_SECCIONES: LazyLock<Selector> = LazyLock::new(|| Selector::parse("td, th, div, span, b, font, h1, h2, h3, p, caption").expect("selector constante"));
+static SEL_SCRIPT: LazyLock<Selector> = LazyLock::new(|| Selector::parse("script").expect("selector constante"));
 
 fn sha256(datos: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -99,7 +103,13 @@ pub fn cargar(carpeta: &Path, ahora: &str) -> Result<Vec<Value>, String> {
             if let Some(nombre) = entrada["archivo"].as_str().filter(|n| !n.is_empty()) {
                 let ruta = carpeta.join("historico").join(nombre);
                 let enlace = std::fs::symlink_metadata(&ruta).ok()?.file_type().is_symlink();
-                if !NOMBRE.is_match(nombre) || enlace || sha256(&std::fs::read(&ruta).ok()?) != entrada["sha256"].as_str()? {
+                if !NOMBRE.is_match(nombre) || enlace {
+                    return None;
+                }
+                let mut f = std::fs::File::open(&ruta).ok()?;
+                let mut buf = Vec::new();
+                std::io::Read::read_to_end(&mut std::io::Read::take(&mut f, (MAX_BYTES as u64) + 1), &mut buf).ok()?;
+                if buf.len() > MAX_BYTES || sha256(&buf) != entrada["sha256"].as_str()? {
                     return None;
                 }
             } else if matches!(entrada["estado"].as_str(), Some("LEIDA" | "VACIA_COMPROBADA")) {
@@ -247,17 +257,17 @@ fn celdas(fila: ElementRef<'_>) -> Vec<ElementRef<'_>> {
 /// `estructura_ventana`: forma ANÓNIMA de una ventana SITFA cuyo lector no encontró la tabla esperada.
 pub fn estructura_ventana(datos: &[u8]) -> Result<Value, String> {
     let doc = Html::parse_document(&lecturas::decodificar(datos)?);
-    let titulo = rotulo_seguro(&doc.select(&sel("title")).map(texto_completo).collect::<Vec<_>>().join(" "));
+    let titulo = rotulo_seguro(&doc.select(&SEL_TITLE).map(texto_completo).collect::<Vec<_>>().join(" "));
     let marcos: Vec<Value> = doc
-        .select(&sel("iframe, frame"))
+        .select(&SEL_FRAMES)
         .map(|e| json!({"etiqueta": e.value().name(), "ruta": ruta_segura(e.value().attr("src"))}))
         .take(10)
         .collect();
     let formularios: Vec<Value> = doc
-        .select(&sel("form"))
+        .select(&SEL_FORM)
         .map(|f| {
             let metodo = f.value().attr("method").unwrap_or("").to_lowercase();
-            let campos: Vec<&str> = f.select(&sel("input, select")).filter_map(|c| c.value().attr("name")).collect();
+            let campos: Vec<&str> = f.select(&SEL_INPUT_SELECT).filter_map(|c| c.value().attr("name")).collect();
             json!({"accion": ruta_segura(f.value().attr("action")),
                 "metodo": if matches!(metodo.as_str(), "get" | "post" | "") { metodo } else { "otro".into() },
                 "campos": catalogo(campos, &PARAMETROS)})
@@ -265,7 +275,7 @@ pub fn estructura_ventana(datos: &[u8]) -> Result<Value, String> {
         .take(10)
         .collect();
     let tablas: Vec<Value> = doc
-        .select(&sel("table"))
+        .select(&SEL_TABLE)
         .map(|t| {
             let filas = filas_directas(t);
             let mut encabezados: Vec<Vec<&str>> = Vec::new();
@@ -284,13 +294,13 @@ pub fn estructura_ventana(datos: &[u8]) -> Result<Value, String> {
         .take(40)
         .collect();
     let secciones: Vec<&str> = doc
-        .select(&sel("td, th, div, span, b, font, h1, h2, h3, p, caption"))
+        .select(&SEL_SECCIONES)
         .filter_map(|e| rotulo_seguro(&texto_completo(e)))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .take(30)
         .collect();
-    let codigo = doc.select(&sel("script")).map(texto_completo).collect::<Vec<_>>().join(" ");
+    let codigo = doc.select(&SEL_SCRIPT).map(texto_completo).collect::<Vec<_>>().join(" ");
     static FUNCION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"function\s+([A-Za-z_]\w*)").unwrap());
     static RUTA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"/[A-Za-z0-9_/]+\.(?:do|jsp)").unwrap());
     let funciones: Vec<&str> = FUNCION.captures_iter(&codigo).map(|c| c.get(1).unwrap().as_str()).collect();

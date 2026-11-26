@@ -54,11 +54,15 @@ fn consolidado(zip: &[u8]) -> Result<Vec<u8>, String> {
     let entrada = archivo
         .by_name("consolidado/consolidado.xlsx")
         .map_err(|_| motivo_sin_consolidado(zip))?;
+    const LIMITE_CONSOLIDADO: u64 = 200 * 1024 * 1024;
     let mut datos = Vec::new();
     entrada
-        .take(200 * 1024 * 1024)
+        .take(LIMITE_CONSOLIDADO + 1)
         .read_to_end(&mut datos)
         .map_err(|_| "No se pudo leer el libro consolidado del paquete.".to_string())?;
+    if datos.len() as u64 > LIMITE_CONSOLIDADO {
+        return Err("El libro consolidado del paquete supera el límite de lectura.".into());
+    }
     Ok(datos)
 }
 
@@ -283,16 +287,16 @@ fn plan_excel(
     let mut celdas: HashMap<&str, Vec<Value>> = HashMap::new();
     let mut res_sugerida = Vec::new();
     let mut excluidas = Vec::new();
+    let huella = hex(&Sha256::digest(&base.bytes));
     let mut traza = vec![
         json!(["CAMPO", "VALOR"]),
         json!(["ESTADO_DOCUMENTO", if etapa_revisada { "CONSTANCIA_REVISADA" } else { "PROPUESTA_NO_REVISADA" }]),
-        json!(["FUENTE_SHA256", hex(&Sha256::digest(&base.bytes))]),
+        json!(["FUENTE_SHA256", huella]),
         json!(["MODO", w.mode().label().to_uppercase()]),
         json!(["HOJA_PROCESADA", base.hoja]),
         json!([]),
         json!(["HOJA", "FILA", "ESTADO", "MOTIVO", "OBSERVACION", "REGLAS", "HASH_ORIGEN"]),
     ];
-    let huella = hex(&Sha256::digest(&base.bytes));
     for ((r, fila), id) in w.registros.iter().zip(&base.filas).zip(&ids) {
         let aprobada = revisada(r) && !r.excluido;
         let estado = if r.excluido {
@@ -483,7 +487,7 @@ try {
     for ($i = 0; $i -lt $d.tipos_res.Count; $i++) { $celda = Tomar ($listaCells.Item($i + 2, 1)); $celda.Value2 = [string]$d.tipos_res[$i] }
     $names = Tomar $wb.Names
     try { $nm = Tomar ($names.Item('NURUS_RES_TIPOS')); $nm.Delete() } catch {}
-    $nm = Tomar ($names.Add('NURUS_RES_TIPOS', "='NURUS_LISTAS'!`$A`$2:`$A`$4"))
+    $nm = Tomar ($names.Add('NURUS_RES_TIPOS', "='NURUS_LISTAS'!`$A`$2:`$A`$$($d.tipos_res.Count + 1)"))
     $rc = $cols['RES']
     $rango = Tomar ($ws.Range((Tomar ($cells.Item($h + 1, $rc))), (Tomar ($cells.Item($ultimaFila, $rc)))))
     $validacion = Tomar $rango.Validation
@@ -554,7 +558,6 @@ pub fn nombre_salida(w: &Trabajo, base: &Base) -> String {
 
 #[cfg(target_os = "windows")]
 pub fn exportar(w: &Trabajo, dir: &Path) -> Result<PathBuf, String> {
-    crate::sincronizar::validar_longitud_decisiones(w)?;
     let base = base(w)?;
     exportar_con_base(w, dir, &base)
 }
@@ -601,13 +604,20 @@ fn guardar_copia(
     };
     std::fs::write(&origen, &base.bytes).map_err(|e| format!("No se pudo preparar la copia: {e}"))?;
     let plan = instrucciones(&origen, &temporal);
-    if let Err(e) = std::fs::write(&datos, serde_json::to_vec(&plan).unwrap_or_default()) {
+    let json_bytes = match serde_json::to_vec(&plan) {
+        Ok(b) => b,
+        Err(e) => {
+            limpiar();
+            return Err(format!("No se pudo preparar la copia: {e}"));
+        }
+    };
+    if let Err(e) = std::fs::write(&datos, json_bytes) {
         limpiar();
         return Err(format!("No se pudo preparar la copia: {e}"));
     }
     let utf16: Vec<u8> = SCRIPT.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     let enc = base64::engine::general_purpose::STANDARD.encode(utf16);
-    let salida = crate::util::output_timeout(std::process::Command::new("powershell")
+    let salida = crate::util::output_timeout(std::process::Command::new(crate::util::powershell_exe())
         .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &enc])
         .env("FLOW_COPIA", &datos)
         .creation_flags(0x0800_0000), TIMEOUT_COM);
@@ -728,7 +738,7 @@ mod tests {
         let ruta = std::env::temp_dir().join(format!("flow_copia_script_{}.ps1", std::process::id()));
         std::fs::write(&ruta, SCRIPT).unwrap();
         let comprobar = "$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile($env:FLOW_SCRIPT, [ref]$null, [ref]$e); if ($e.Count -gt 0) { $e | ForEach-Object { $_.Message }; exit 1 }; 'SINTAXIS_OK'";
-        let out = std::process::Command::new("powershell")
+        let out = std::process::Command::new(crate::util::powershell_exe())
             .args(["-NoProfile", "-NonInteractive", "-Command", comprobar])
             .env("FLOW_SCRIPT", &ruta)
             .output()

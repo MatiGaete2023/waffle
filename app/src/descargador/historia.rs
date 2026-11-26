@@ -84,9 +84,11 @@ const RUTAS: [&str; 3] =
 const ATRIBUTOS: [&str; 12] = ["id", "class", "name", "value", "href", "onclick", "src", "type", "title", "style", "target", "alt"];
 const PARAMETROS: [&str; 6] = ["id", "clave", "crr_causa", "tipo_popUp", "RUT_Litigante", "RUT_DV"];
 
-fn sel(s: &str) -> Selector {
-    Selector::parse(s).expect("selector constante")
-}
+static SEL_CONTROLES: LazyLock<Selector> = LazyLock::new(|| Selector::parse("a, li, button, span, td, th, input, div").expect("selector constante"));
+static SEL_SCRIPT: LazyLock<Selector> = LazyLock::new(|| Selector::parse("script").expect("selector constante"));
+static SEL_TH_TD: LazyLock<Selector> = LazyLock::new(|| Selector::parse("th, td").expect("selector constante"));
+static SEL_TABLE: LazyLock<Selector> = LazyLock::new(|| Selector::parse("table").expect("selector constante"));
+static SEL_TR: LazyLock<Selector> = LazyLock::new(|| Selector::parse("tr").expect("selector constante"));
 
 fn catalogo<'a>(valores: impl IntoIterator<Item = &'a str>, permitidos: &[&str]) -> Vec<String> {
     let valores: BTreeSet<&str> = valores.into_iter().collect();
@@ -158,7 +160,7 @@ pub fn estructura_pestana(datos: &[u8]) -> Result<Value, String> {
     let doc = Html::parse_document(&lecturas::decodificar(datos)?);
     let texto = |e: ElementRef<'_>| e.text().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
     let controles: Vec<Value> = doc
-        .select(&sel("a, li, button, span, td, th, input, div"))
+        .select(&SEL_CONTROLES)
         .filter(|e| {
             lecturas::normalizar(&texto(*e)) == "escritos"
                 || lecturas::normalizar(e.value().attr("value").unwrap_or("")) == "escritos"
@@ -166,7 +168,7 @@ pub fn estructura_pestana(datos: &[u8]) -> Result<Value, String> {
         .take(10)
         .map(forma_enlace)
         .collect();
-    let codigo = doc.select(&sel("script")).map(|e| e.text().collect::<String>()).collect::<Vec<_>>().join(" ");
+    let codigo = doc.select(&SEL_SCRIPT).map(|e| e.text().collect::<String>()).collect::<Vec<_>>().join(" ");
     static FUNCION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"function\s+([A-Za-z_]\w*)").unwrap());
     static RUTA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"/[A-Za-z0-9_/]+\.(?:do|jsp)").unwrap());
     static PARAMETRO: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[?&]([A-Za-z_]\w{0,40})=").unwrap());
@@ -199,7 +201,7 @@ pub fn pestanas_causa(datos: &[u8]) -> Value {
     let Ok(texto) = lecturas::decodificar(datos) else { return json!({"legible": false}) };
     let doc = Html::parse_document(&texto);
     let celdas = |f: ElementRef<'_>| -> Vec<String> {
-        f.select(&sel("th, td")).map(|c| c.text().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ")).collect()
+        f.select(&SEL_TH_TD).map(|c| c.text().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ")).collect()
     };
     let mut salida = Map::new();
     salida.insert("legible".into(), json!(true));
@@ -209,8 +211,8 @@ pub fn pestanas_causa(datos: &[u8]) -> Value {
         ("diligencias", &["estdil", "tipodediligencia"][..]),
     ] {
         let (mut tablas, mut filas, mut encabezados) = (0u64, 0u64, Vec::<Value>::new());
-        for tabla in doc.select(&sel("table")) {
-            let todas: Vec<ElementRef<'_>> = tabla.select(&sel("tr")).collect();
+        for tabla in doc.select(&SEL_TABLE) {
+            let todas: Vec<ElementRef<'_>> = tabla.select(&SEL_TR).collect();
             let Some(cabecera) = todas.iter().map(|f| celdas(*f)).find(|c| c.len() > 2) else { continue };
             let claves: BTreeSet<String> = cabecera.iter().map(|h| clave_encabezado(h)).collect();
             if !requeridas.iter().all(|r| claves.contains(*r)) {
@@ -379,6 +381,9 @@ impl LectorHistoria {
         }
         let padre = ruta.parent().unwrap_or(Path::new("."));
         for (clave, causa) in datos["causas"].as_object().into_iter().flatten() {
+            if !causa.is_object() {
+                continue;
+            }
             let archivo = causa["archivo"].as_str().unwrap_or("");
             let origen = padre.join(archivo);
             let enlace = std::fs::symlink_metadata(&origen).map(|m| m.file_type().is_symlink()).unwrap_or(true);
@@ -447,12 +452,13 @@ impl LectorHistoria {
                     let mut afectadas = self.causas_por_rit[&rit_clave].clone();
                     afectadas.insert(clave.clone());
                     for otra in &afectadas {
-                        let incierta = self.estado["causas"][otra].as_object_mut().unwrap();
-                        for campo in ["en_ventana", "anteriores", "incompletas", "advertencias", "desde", "hasta"] {
-                            incierta.remove(campo);
+                        if let Some(incierta) = self.estado["causas"].get_mut(otra).and_then(Value::as_object_mut) {
+                            for campo in ["en_ventana", "anteriores", "incompletas", "advertencias", "desde", "hasta"] {
+                                incierta.remove(campo);
+                            }
+                            incierta.insert("estado".into(), json!("IDENTIDAD_INCIERTA"));
+                            incierta.insert("error".into(), json!("HISTORIA_IDENTIDAD_INCIERTA"));
                         }
-                        incierta.insert("estado".into(), json!("IDENTIDAD_INCIERTA"));
-                        incierta.insert("error".into(), json!("HISTORIA_IDENTIDAD_INCIERTA"));
                     }
                     for vinculo in self.estado["vinculos"].as_array_mut().unwrap() {
                         if afectadas.contains(vinculo["clave"].as_str().unwrap_or("")) {
@@ -588,16 +594,17 @@ impl LectorHistoria {
             }
             m
         });
-        let destino = self.estado["causas"][clave].as_object_mut().unwrap();
-        match resultado {
-            Ok(m) => {
-                destino.remove("reutilizada");
-                destino.extend(m);
-            }
-            Err(e) => {
-                if sana { self.control_pausa.observar(Duration::ZERO, false); }
-                destino.insert("estado".into(), json!("FALLIDA"));
-                destino.insert("error".into(), json!(codigo_error(&e, "HISTORIA_LECTURA_ERROR")));
+        if let Some(destino) = self.estado["causas"].get_mut(clave).and_then(Value::as_object_mut) {
+            match resultado {
+                Ok(m) => {
+                    destino.remove("reutilizada");
+                    destino.extend(m);
+                }
+                Err(e) => {
+                    if sana { self.control_pausa.observar(Duration::ZERO, false); }
+                    destino.insert("estado".into(), json!("FALLIDA"));
+                    destino.insert("error".into(), json!(codigo_error(&e, "HISTORIA_LECTURA_ERROR")));
+                }
             }
         }
         if self.prefetched.is_empty() {

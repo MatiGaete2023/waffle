@@ -103,7 +103,7 @@ def scan(paths: list[Path], allowlist: set[str], *, stage: bool = False) -> list
     for path in paths:
         if not stage and not path.is_file():
             continue
-        staged = staged_blob(path) if stage else None
+        staged = None if path.suffix.lower() in ids.BINARY_SUFFIXES else (staged_blob(path) if stage else None)
         for label, content in ids.texts(path, staged):
             for kind, value, masked, start in identities(content):
                 if not accepted(kind, value, allowlist):

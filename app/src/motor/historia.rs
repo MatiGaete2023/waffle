@@ -366,7 +366,10 @@ pub(super) fn marcas_sin_efecto(ctx: &mut Ctx) {
     if tramites(captura, SIN_EFECTO_MN).next().is_some() {
         ctx.marcar(2, "DEJA_SIN_EFECTO_MN", "Deja sin efecto medida interconexión M.N. en la historia");
     }
-    let conocidas: HashSet<String> = CONOCIDAS.iter().chain(&CONOCIDAS_EXTRA).map(|n| clave_texto(n)).collect();
+    static CONOCIDAS_SET: OnceLock<HashSet<String>> = OnceLock::new();
+    let conocidas = CONOCIDAS_SET.get_or_init(|| {
+        CONOCIDAS.iter().chain(&CONOCIDAS_EXTRA).map(|n| clave_texto(n)).collect()
+    });
     let mut nombres: Vec<(String, String)> = Vec::new();
     for t in captura.tramites.as_deref().unwrap_or(&[]) {
         let clave = clave_texto(&t.descripcion);

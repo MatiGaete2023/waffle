@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Variables de un bloque favorito (`manual.BLOCK_FIELDS`).
 pub const CAMPOS_BLOQUE: [&str; 5] = ["NOMBRE", "RIT", "TRIBUNAL", "PROGRAMA", "FECHA"];
@@ -54,7 +55,8 @@ pub fn render_bloque(texto: &str, valores: &BTreeMap<String, String>) -> Result<
 
 /// `word_quality.unresolved_text`: campos `{{X}}` o `[COMPLETAR …]` que siguen sin completarse.
 pub fn pendientes(texto: &str) -> Vec<String> {
-    let marcas = Regex::new(r"(?i)\{\{[^{}]+\}\}|\[\s*COMPLETAR[^\]]*\]").unwrap();
+    static MARCAS: OnceLock<Regex> = OnceLock::new();
+    let marcas = MARCAS.get_or_init(|| Regex::new(r"(?i)\{\{[^{}]+\}\}|\[\s*COMPLETAR[^\]]*\]").unwrap());
     marcas.find_iter(texto).map(|m| m.as_str().to_string()).collect::<BTreeSet<_>>().into_iter().collect()
 }
 
@@ -63,16 +65,21 @@ fn desescapar(s: &str) -> String {
 }
 
 fn escapar(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    crate::util::sanitizar_xml_10(s).replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 fn parrafos_xml(xml: &str) -> Vec<(usize, usize)> {
-    Regex::new(r"(?s)<w:p[ >].*?</w:p>").unwrap().find_iter(xml).map(|m| (m.start(), m.end())).collect()
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?s)<w:p[ >].*?</w:p>").unwrap())
+        .find_iter(xml)
+        .map(|m| (m.start(), m.end()))
+        .collect()
 }
 
 fn nodos_texto(parrafo: &str) -> Vec<(usize, usize, String)> {
     // (inicio y fin del contenido dentro del párrafo, texto sin escapes)
-    let re = Regex::new(r"(?s)<w:t(?: [^>]*)?>(.*?)</w:t>").unwrap();
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"(?s)<w:t(?: [^>]*)?>(.*?)</w:t>").unwrap());
     re.captures_iter(parrafo)
         .map(|c| {
             let g = c.get(1).unwrap();
@@ -82,13 +89,24 @@ fn nodos_texto(parrafo: &str) -> Vec<(usize, usize, String)> {
 }
 
 fn partes_word(paquete: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    const MAX_PARTE: u64 = 20 * 1024 * 1024;
+    const MAX_TOTAL: usize = 50 * 1024 * 1024;
     let mut z = zip::ZipArchive::new(std::io::Cursor::new(paquete)).map_err(|_| "La matriz no es un documento Word válido.".to_string())?;
     let mut v = Vec::new();
+    let mut total = 0usize;
     for i in 0..z.len() {
-        let mut f = z.by_index(i).map_err(|_| "La matriz Word está dañada.".to_string())?;
+        let f = z.by_index(i).map_err(|_| "La matriz Word está dañada.".to_string())?;
+        let nombre = f.name().to_string();
         let mut d = Vec::new();
-        f.read_to_end(&mut d).map_err(|_| "La matriz Word está dañada.".to_string())?;
-        v.push((f.name().to_string(), d));
+        f.take(MAX_PARTE + 1).read_to_end(&mut d).map_err(|_| "La matriz Word está dañada.".to_string())?;
+        if d.len() as u64 > MAX_PARTE {
+            return Err("La matriz Word excede el tamaño máximo permitido.".into());
+        }
+        total = total.saturating_add(d.len());
+        if total > MAX_TOTAL {
+            return Err("La matriz Word excede el tamaño máximo permitido.".into());
+        }
+        v.push((nombre, d));
     }
     if !v.iter().any(|(n, _)| n == "word/document.xml") {
         return Err("La matriz no contiene word/document.xml.".into());
@@ -102,7 +120,8 @@ fn es_parte_word(nombre: &str) -> bool {
 
 /// `template_variables`: los `{{CAMPO}}` de una matriz, también cuando Word los partió en varios fragmentos.
 pub fn variables_matriz(paquete: &[u8]) -> Result<BTreeSet<String>, String> {
-    let campo = Regex::new(r"\{\{([A-Z_]+)\}\}").unwrap();
+    static CAMPO: OnceLock<Regex> = OnceLock::new();
+    let campo = CAMPO.get_or_init(|| Regex::new(r"\{\{([A-Z_]+)\}\}").unwrap());
     let mut r = BTreeSet::new();
     for (nombre, datos) in partes_word(paquete)? {
         if !es_parte_word(&nombre) {
@@ -127,7 +146,8 @@ pub fn textos_parrafos(paquete: &[u8]) -> Result<Vec<String>, String> {
 
 /// `fill_docx`: sustituye los campos entre fragmentos sin rehacer párrafos ni perder estilos.
 fn rellenar_parrafo(parrafo: &str, valores: &BTreeMap<String, String>) -> String {
-    let campo = Regex::new(r"\{\{([A-Z_]+)\}\}").unwrap();
+    static CAMPO: OnceLock<Regex> = OnceLock::new();
+    let campo = CAMPO.get_or_init(|| Regex::new(r"\{\{([A-Z_]+)\}\}").unwrap());
     let mut nodos = nodos_texto(parrafo);
     let completo: String = nodos.iter().map(|n| n.2.as_str()).collect();
     let mut tocados = BTreeSet::new();
@@ -244,12 +264,7 @@ pub fn generar_word(destino: &Path, titulo: &str, cuerpo: &str, matriz: Option<&
     if destino.exists() {
         return Err("El archivo ya existe; elige un destino nuevo.".into());
     }
-    if let Some(d) = destino.parent() {
-        std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
-    }
-    let temporal = destino.with_extension("tmp");
-    std::fs::write(&temporal, &bytes).map_err(|e| e.to_string())?;
-    std::fs::rename(&temporal, destino).map_err(|e| e.to_string())?;
+    crate::util::guardar_atomico(destino, &bytes)?;
     Ok(destino.to_path_buf())
 }
 

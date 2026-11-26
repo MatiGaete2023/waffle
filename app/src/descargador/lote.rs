@@ -588,9 +588,7 @@ impl Lote<'_> {
                 let ruta = self.carpeta.join(&archivo);
                 guardar_exclusivo(&ruta, &datos)?;
                 let guardado = fs::read(&ruta).map_err(|e| error_escritura(&e, &ruta))?;
-                if guardado != datos
-                    || Verificador::default().verificar(&guardado, &pagina, consulta)?.0.registros != pagina.registros
-                {
+                if guardado != datos {
                     return Err("El archivo guardado no coincide con la descarga validada.".into());
                 }
                 verificador.registrar(&libro, digest.clone())?;

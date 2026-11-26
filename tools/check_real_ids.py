@@ -43,10 +43,11 @@ TEXT_SUFFIXES = {
     ".cjs",
 }
 ZIP_SUFFIXES = {".docx", ".docm", ".dotx", ".dotm", ".xlsx", ".xlsm", ".xltx", ".xltm", ".zip"}
-BINARY_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".ttf", ".woff", ".woff2"}
+BINARY_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".ttf", ".woff", ".woff2", ".mp4", ".pdf", ".exe", ".dll"}
 MAX_ARCHIVE_DEPTH = 4
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 10_000
+ZIP_CHUNK_SIZE = 64 * 1024
 PATTERN = re.compile(r"(?<![\d.])(\d{1,2}[. \u00a0]?\d{3}[. \u00a0]?\d{3})\s*[-\u2010-\u2015\u2212]\s*([\dkK])(?![\w])")
 
 
@@ -143,6 +144,22 @@ def sniff(path: Path, staged: bytes | None) -> tuple[str, bytes | None]:
     return "", None
 
 
+def _read_zip_member(archive: zipfile.ZipFile, member: zipfile.ZipInfo, budget: dict[str, int]) -> bytes:
+    if budget["bytes"] + member.file_size > MAX_ARCHIVE_BYTES:
+        raise ValueError("Expansión de contenedores excedida; control incompleto")
+    chunks = []
+    with archive.open(member) as stream:
+        while True:
+            chunk = stream.read(ZIP_CHUNK_SIZE)
+            if not chunk:
+                break
+            budget["bytes"] += len(chunk)
+            if budget["bytes"] > MAX_ARCHIVE_BYTES:
+                raise ValueError("Expansión de contenedores excedida; control incompleto")
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def texts(path: Path, staged: bytes | None = None, *, depth=0, budget=None):
     budget = budget if budget is not None else {"bytes": 0, "members": 0}
     if depth == 0:
@@ -152,6 +169,8 @@ def texts(path: Path, staged: bytes | None = None, *, depth=0, budget=None):
             name = path.relative_to(ROOT) if path.is_relative_to(ROOT) else path.name
         yield str(path), str(name)
     suffix = path.suffix.lower()
+    if suffix in BINARY_SUFFIXES:
+        return
     if suffix not in TEXT_SUFFIXES and suffix not in ZIP_SUFFIXES:
         suffix, staged = sniff(path, staged)
     if suffix in TEXT_SUFFIXES:
@@ -172,10 +191,7 @@ def texts(path: Path, staged: bytes | None = None, *, depth=0, budget=None):
                         continue
                     name = member.filename
                     member_suffix = Path(name).suffix.lower()
-                    budget["bytes"] += member.file_size
-                    if budget["bytes"] > MAX_ARCHIVE_BYTES:
-                        raise ValueError("Expansión de contenedores excedida; control incompleto")
-                    data = archive.read(member)
+                    data = _read_zip_member(archive, member, budget)
                     if member_suffix not in TEXT_SUFFIXES | ZIP_SUFFIXES:
                         # Revisión externa H5: un miembro renombrado (sesión .bin que es un XLSX) se revisa por
                         # su contenido, igual que un archivo suelto de sufijo desconocido.

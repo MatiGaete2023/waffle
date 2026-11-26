@@ -67,7 +67,7 @@ pub fn normalizar(txt: &str) -> String {
 
 /// Clave de comparación: normalizado y con espacios únicos.
 pub fn clave(txt: &str) -> String {
-    normalizar(txt).split_whitespace().collect::<Vec<_>>().join(" ")
+    normalizar(txt)
 }
 
 /// Sin tildes y en mayúscula (para siglas).
@@ -518,6 +518,67 @@ pub fn safe_filename(txt: &str) -> String {
     else { s.to_string() }
 }
 
+/// Guardado atómico: escribe un archivo temporal único, sincroniza a disco y renombra con reintentos en Windows.
+pub fn guardar_atomico(ruta: &std::path::Path, datos: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CONTADOR: AtomicU64 = AtomicU64::new(0);
+    if let Some(p) = ruta.parent() {
+        if !p.as_os_str().is_empty() {
+            std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+        }
+    }
+    let seq = CONTADOR.fetch_add(1, Ordering::Relaxed);
+    let ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let nombre = ruta.file_name().and_then(|s| s.to_str()).unwrap_or("archivo");
+    let tmp = ruta.with_file_name(format!(".{nombre}.{}.{ns}.{seq}.tmp", std::process::id()));
+    let escribir = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(datos)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = escribir {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
+    let mut ultimo_err = None;
+    for intento in 0..5 {
+        match std::fs::rename(&tmp, ruta) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let reintentable = matches!(
+                    e.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
+                ) || matches!(e.raw_os_error(), Some(5 | 32 | 33));
+                ultimo_err = Some(e);
+                if !reintentable || intento == 4 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+    Err(ultimo_err.map(|e| e.to_string()).unwrap_or_else(|| "No se pudo guardar el archivo.".into()))
+}
+
+/// Ruta completa a Windows PowerShell (`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`).
+pub fn powershell_exe() -> std::path::PathBuf {
+    if let Some(root) = std::env::var_os("SystemRoot").filter(|s| !s.is_empty()) {
+        std::path::PathBuf::from(root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe")
+    } else {
+        std::path::PathBuf::from("powershell.exe")
+    }
+}
+
 /// Ejecuta un proceso con salida drenada en paralelo y plazo máximo. Nunca mata procesos Office ajenos.
 #[cfg(target_os = "windows")]
 pub(crate) fn output_timeout(cmd: &mut std::process::Command, plazo: std::time::Duration) -> std::io::Result<std::process::Output> {
@@ -540,12 +601,13 @@ pub(crate) fn output_timeout(cmd: &mut std::process::Command, plazo: std::time::
         match hijo.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < limite => thread::sleep(Duration::from_millis(50)),
-            Ok(None) => { let _ = hijo.kill(); return Err(timeout()); }
-            Err(e) => { let _ = hijo.kill(); return Err(e); }
+            Ok(None) => { let _ = hijo.kill(); let _ = hijo.wait(); return Err(timeout()); }
+            Err(e) => { let _ = hijo.kill(); let _ = hijo.wait(); return Err(e); }
         }
     };
-    let stdout = rx.recv_timeout(limite.saturating_duration_since(Instant::now())).map_err(|_| timeout())??;
-    let stderr = err_rx.recv_timeout(limite.saturating_duration_since(Instant::now())).map_err(|_| timeout())??;
+    let gracia = Duration::from_secs(2);
+    let stdout = rx.recv_timeout(limite.saturating_duration_since(Instant::now()).max(gracia)).map_err(|_| timeout())??;
+    let stderr = err_rx.recv_timeout(limite.saturating_duration_since(Instant::now()).max(gracia)).map_err(|_| timeout())??;
     Ok(Output { status, stdout, stderr })
 }
 
