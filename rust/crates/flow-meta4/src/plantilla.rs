@@ -16,6 +16,105 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 const LIMITE_PLANTILLA: usize = 20 * 1024 * 1024;
 const LIMITE_XML: u64 = 8 * 1024 * 1024;
+const LIMITE_GENERADO: u64 = 80 * 1024 * 1024;
+const LIMITE_TOTAL: u64 = 200 * 1024 * 1024;
+
+fn leer_acotado(lector: impl Read, max: u64) -> Result<Vec<u8>, String> {
+    let mut datos = Vec::new();
+    lector.take(max + 1).read_to_end(&mut datos).map_err(|e| e.to_string())?;
+    if datos.len() as u64 > max { return Err("La parte XLSX excede el tamaño permitido.".into()); }
+    Ok(datos)
+}
+
+// Validar todas las entradas antes de que flow_tabular/calamine abran el XLSX.
+fn validar_zip<R: Read + std::io::Seek>(archivo: &mut ZipArchive<R>, max: u64, total_max: u64) -> Result<(), String> {
+    if archivo.len() > 512 { return Err("El XLSX contiene demasiadas partes.".into()); }
+    let mut total = 0u64;
+    for i in 0..archivo.len() {
+        let entrada = archivo.by_index(i).map_err(|e| e.to_string())?;
+        let nombre = entrada.name().to_string();
+        let bytes = leer_acotado(entrada, max.min(total_max.saturating_sub(total)))?;
+        total += bytes.len() as u64;
+        if nombre.ends_with(".xml") || nombre.ends_with(".rels") {
+            let xml = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
+            validar_xml(xml)?;
+            if nombre.starts_with("xl/worksheets/") && nombre.ends_with(".xml") { validar_dimensiones(xml)?; }
+        }
+    }
+    Ok(())
+}
+
+fn validar_xml(xml: &str) -> Result<(), String> {
+    let mut lector = Reader::from_str(xml);
+    let (mut profundidad, mut raices) = (0usize, 0usize);
+    loop {
+        let evento = lector.read_event().map_err(|e| e.to_string())?;
+        match &evento {
+            Event::Start(e) | Event::Empty(e) => {
+                if profundidad == 0 { raices += 1; if raices > 1 { return Err("XML XLSX con varias raíces.".into()); } }
+                if matches!(evento, Event::Start(_)) { profundidad += 1; }
+                if profundidad > 128 { return Err("XML XLSX demasiado anidado.".into()); }
+                for a in e.attributes() {
+                    let a = a.map_err(|e| e.to_string())?;
+                    if matches!(a.key.as_ref(), b"count" | b"uniqueCount" | b"numFmtId" | b"sheetId") {
+                        let numero = std::str::from_utf8(a.value.as_ref()).ok().and_then(|s| s.parse::<u32>().ok()).ok_or("Contador o índice XLSX inválido.")?;
+                        if matches!(a.key.as_ref(), b"count" | b"uniqueCount") && numero > 2_000_000 { return Err("Contador XLSX fuera de cuota.".into()); }
+                        if a.key.as_ref() == b"numFmtId" && numero > u16::MAX as u32 { return Err("Identificador de formato fuera de rango.".into()); }
+                        if a.key.as_ref() == b"sheetId" && numero == 0 { return Err("Identificador de hoja XLSX inválido.".into()); }
+                    }
+                }
+            }
+            Event::End(_) => profundidad = profundidad.checked_sub(1).ok_or("XML XLSX malformado.")?,
+            Event::DocType(_) => return Err("DTD no admitido en XLSX.".into()),
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    if profundidad != 0 || raices != 1 { return Err("XML XLSX incompleto.".into()); }
+    Ok(())
+}
+
+fn validar_dimensiones(xml: &str) -> Result<(), String> {
+    let mut lector = Reader::from_str(xml);
+    let mut max_fila = 0usize;
+    let mut max_col = 0usize;
+    let mut cuenta = 0usize;
+    let invalido = "Dimensiones de hoja XLSX fuera de cuota.";
+    loop {
+        match lector.read_event().map_err(|e| e.to_string())? {
+            Event::Start(e) | Event::Empty(e) => {
+                match nombre(&e).as_str() {
+                    "row" => {
+                        if let Some(r) = attr(&e, b"r") {
+                            let fila = r.parse::<usize>().ok().filter(|n| (1..=200_000).contains(n)).ok_or(invalido)?;
+                            max_fila = max_fila.max(fila);
+                        }
+                    }
+                    "c" => {
+                        cuenta += 1;
+                        if let Some(r) = attr(&e, b"r") {
+                            max_fila = max_fila.max(fila_numero(&r).filter(|n| *n <= 200_000).ok_or(invalido)?);
+                            max_col = max_col.max(columna_numero(&r).ok_or(invalido)? + 1);
+                        }
+                    }
+                    "dimension" => {
+                        if let Some(r) = attr(&e, b"ref") {
+                            for extremo in r.split(':') {
+                                max_fila = max_fila.max(fila_numero(extremo).filter(|n| *n <= 200_000).ok_or(invalido)?);
+                                max_col = max_col.max(columna_numero(extremo).ok_or(invalido)? + 1);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if cuenta > 2_000_000 || max_fila.saturating_mul(max_col) > 2_000_000 { return Err(invalido.into()); }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 struct Muestra {
@@ -35,13 +134,9 @@ fn nombre(e: &BytesStart<'_>) -> String {
     String::from_utf8_lossy(e.local_name().as_ref()).into_owned()
 }
 fn zip_leer<R: Read + std::io::Seek>(archivo: &mut ZipArchive<R>, ruta: &str) -> Result<String, String> {
-    let mut entrada = archivo.by_name(ruta).map_err(|_| format!("Falta {ruta} en la plantilla XLSX."))?;
-    if entrada.size() > LIMITE_XML {
-        return Err(format!("{ruta} excede el tamaño permitido."));
-    }
-    let mut texto = String::new();
-    entrada.read_to_string(&mut texto).map_err(|_| format!("{ruta} no es XML UTF-8 válido."))?;
-    Ok(texto)
+    let entrada = archivo.by_name(ruta).map_err(|_| format!("Falta {ruta} en la plantilla XLSX."))?;
+    let datos = leer_acotado(entrada, LIMITE_XML).map_err(|e| format!("{ruta}: {e}"))?;
+    String::from_utf8(datos).map_err(|_| format!("{ruta} no es XML UTF-8 válido."))
 }
 fn sheet_names<R: Read + std::io::Seek>(archivo: &mut ZipArchive<R>) -> Result<BTreeMap<String, String>, String> {
     let libro = zip_leer(archivo, "xl/workbook.xml")?;
@@ -97,11 +192,11 @@ fn columna_numero(ref_celda: &str) -> Option<usize> {
     for c in letras {
         resultado = resultado.checked_mul(26)?.checked_add((c.to_ascii_uppercase() - b'A' + 1) as usize)?;
     }
-    resultado.checked_sub(1)
+    resultado.checked_sub(1).filter(|n| *n < 16_384)
 }
 fn fila_numero(ref_celda: &str) -> Option<usize> {
     ref_celda.bytes().skip_while(|b| b.is_ascii_alphabetic())
-        .map(char::from).collect::<String>().parse::<usize>().ok()
+        .map(char::from).collect::<String>().parse::<usize>().ok().filter(|n| (1..=1_048_576).contains(n))
 }
 fn analizar_celdas(xml: &str) -> Result<(BTreeMap<(usize, usize), usize>, BTreeMap<usize, String>), String> {
     let mut estilos = BTreeMap::new();
@@ -112,15 +207,19 @@ fn analizar_celdas(xml: &str) -> Result<(BTreeMap<(usize, usize), usize>, BTreeM
             Event::Start(e) | Event::Empty(e) => match nombre(&e).as_str() {
                 "row" => {
                     if let (Some(n), Some(h)) = (attr(&e, b"r"), attr(&e, b"ht")) {
-                        if let Ok(fila) = n.parse::<usize>() { alturas.insert(fila, h); }
+                        let fila = n.parse::<usize>().ok().filter(|n| (1..=1_048_576).contains(n)).ok_or("Fila de plantilla inválida.")?;
+                        alturas.insert(fila, h);
                     }
                 }
                 "c" => {
                     if let Some(referencia) = attr(&e, b"r") {
-                        if let (Some(fila), Some(col)) = (fila_numero(&referencia), columna_numero(&referencia)) {
-                            let estilo = attr(&e, b"s").and_then(|s| s.parse().ok()).unwrap_or(0);
-                            estilos.insert((fila, col), estilo);
-                        }
+                        let fila = fila_numero(&referencia).ok_or("Fila de celda de plantilla inválida.")?;
+                        let col = columna_numero(&referencia).ok_or("Columna de celda de plantilla inválida.")?;
+                        let estilo = match attr(&e, b"s") {
+                            Some(s) => s.parse::<usize>().map_err(|_| "Índice de estilo inválido.")?,
+                            None => 0,
+                        };
+                        estilos.insert((fila, col), estilo);
                     }
                 }
                 _ => {}
@@ -287,7 +386,7 @@ fn estilos_con_fecha(original: &str, indices: &BTreeSet<usize>) -> Result<(Strin
             mayor = mayor.max(n);
         }
     }
-    let formato_id = mayor + 1;
+    let formato_id = mayor.checked_add(1).filter(|n| *n <= u16::MAX as usize).ok_or("Identificador de formato de número fuera de rango.")?;
     let mut nuevos = String::new();
     let mut ids = BTreeMap::new();
     for i in indices {
@@ -318,11 +417,20 @@ fn estilos_con_fecha(original: &str, indices: &BTreeSet<usize>) -> Result<(Strin
             nuevo.replace_range(inicio..fin_apertura, &format!("<numFmts count=\"1\">{fmt}</numFmts>"));
         } else {
             let cierre = fin_apertura + nuevo[fin_apertura..].find("</numFmts>").ok_or("numFmts sin cierre.")?;
-            let anterior = n.split("count=\"").nth(1).and_then(|p| p.split('"').next()).and_then(|p| p.parse::<usize>().ok()).unwrap_or(0);
-            let cabecera = poner_attr(&n, "count", &(anterior+1).to_string())?;
-            nuevo.replace_range(inicio..fin_apertura, &cabecera);
-            let cierre = cierre + (cabecera.len() - n.len());
+            // Contar nodos reales, no usar un count aportado como índice ni para reservar memoria.
+            let mut lector = Reader::from_str(&nuevo[fin_apertura..cierre]);
+            let mut anterior = 0usize;
+            loop {
+                match lector.read_event().map_err(|e| e.to_string())? {
+                    Event::Start(e) | Event::Empty(e) if nombre(&e) == "numFmt" => anterior += 1,
+                    Event::Eof => break,
+                    _ => {}
+                }
+            }
+            let cabecera = poner_attr(&n, "count", &(anterior + 1).to_string())?;
+            // Primero insertar en el cierre original, después cambiar la apertura; ninguna resta unsigned.
             nuevo.insert_str(cierre, &fmt);
+            nuevo.replace_range(inicio..fin_apertura, &cabecera);
         }
     } else {
         let root = nuevo.find("<styleSheet").ok_or("styles.xml no es un estilo de Excel.")?;
@@ -333,10 +441,10 @@ fn estilos_con_fecha(original: &str, indices: &BTreeSet<usize>) -> Result<(Strin
 }
 /// Aplica al libro generado la plantilla de estilos. No altera la plantilla ni el contenido.
 pub fn aplicar(plantilla: &Path, generado: &Path) -> Result<(), String> {
-    if plantilla == generado { return Err("La plantilla no puede ser el libro de salida.".into()); }
-    let bytes = std::fs::read(plantilla).map_err(|e| format!("No se pudo abrir plantilla: {e}"))?;
-    if bytes.len() > LIMITE_PLANTILLA { return Err("La plantilla XLSX supera 20 MiB.".into()); }
-    let mut zip = ZipArchive::new(Cursor::new(bytes)).map_err(|_| "La plantilla no es un XLSX válido.".to_string())?;
+    if plantilla == generado || plantilla.canonicalize().map_err(|e| e.to_string())? == generado.canonicalize().map_err(|e| e.to_string())? { return Err("La plantilla no puede ser el libro de salida.".into()); }
+    let archivo = std::fs::File::open(plantilla).map_err(|e| format!("No se pudo abrir plantilla: {e}"))?;
+    let bytes = leer_acotado(archivo, LIMITE_PLANTILLA as u64)?;
+    let mut zip = ZipArchive::new(Cursor::new(bytes.as_slice())).map_err(|_| "La plantilla no es un XLSX válido.".to_string())?;
     if zip.len() > 512 { return Err("La plantilla contiene demasiadas partes.".into()); }
     if (0..zip.len()).any(|i| {
         let f = zip.by_index(i).ok();
@@ -344,7 +452,8 @@ pub fn aplicar(plantilla: &Path, generado: &Path) -> Result<(), String> {
     }) {
         return Err("La plantilla contiene macros o vínculos externos, que no se admiten.".into());
     }
-    let origen = flow_tabular::leer(plantilla)?;
+    validar_zip(&mut zip, LIMITE_XML, LIMITE_TOTAL)?;
+    let origen = flow_tabular::leer_bytes("plantilla.xlsx", bytes.clone())?;
     if origen.formato != flow_tabular::Formato::Xlsx { return Err("La plantilla debe ser XLSX.".into()); }
     let rutas = sheet_names(&mut zip)?;
     let mut muestras = BTreeMap::new();
@@ -361,28 +470,24 @@ pub fn aplicar(plantilla: &Path, generado: &Path) -> Result<(), String> {
     let mut fechas = BTreeSet::new();
     for m in muestras.values() { fechas.extend(m.estilo[4].into_iter()); }
     let (estilos, fecha_ids) = estilos_con_fecha(&zip_leer(&mut zip, "xl/styles.xml")?, &fechas)?;
-    let tema = zip.by_name("xl/theme/theme1.xml").ok().map(|mut e| {
-        let mut b = Vec::new();
-        e.read_to_end(&mut b).map_err(|e| e.to_string())?;
-        if b.len() > LIMITE_XML as usize { return Err("Tema demasiado grande.".into()); }
-        Ok::<Vec<u8>, String>(b)
-    }).transpose()?;
+    let tema = zip.by_name("xl/theme/theme1.xml").ok().map(|e| leer_acotado(e, LIMITE_XML)).transpose()?;
 
-    let generado_bytes = std::fs::read(generado).map_err(|e| format!("No se pudo leer la planilla generada: {e}"))?;
-    let generado_libro = flow_tabular::leer(generado)?;
-    let mut fuente = ZipArchive::new(Cursor::new(generado_bytes)).map_err(|_| "La planilla generada no es XLSX.".to_string())?;
+    let generado_bytes = leer_acotado(std::fs::File::open(generado).map_err(|e| format!("No se pudo leer la planilla generada: {e}"))?, LIMITE_TOTAL)?;
+    let mut fuente = ZipArchive::new(Cursor::new(generado_bytes.as_slice())).map_err(|_| "La planilla generada no es XLSX.".to_string())?;
+    validar_zip(&mut fuente, LIMITE_GENERADO, LIMITE_TOTAL)?;
+    let generado_libro = flow_tabular::leer_bytes("generado.xlsx", generado_bytes.clone())?;
     let temporal = generado.with_extension("meta4-temporal-xlsx");
-    if temporal.exists() { return Err("Ya existe un temporal de plantilla: no se sobrescribe.".into()); }
-    let mut operacion = || -> Result<(), String> {
-        let mut escritor = ZipWriter::new(std::fs::File::create(&temporal).map_err(|e| e.to_string())?);
+    let archivo_temporal = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporal).map_err(|e| format!("No se pudo crear temporal de plantilla exclusivo: {e}"))?;
+    let operacion = || -> Result<(), String> {
+        let mut escritor = ZipWriter::new(archivo_temporal);
         let opciones = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        let mut total = 0u64;
         for i in 0..fuente.len() {
-            let mut archivo = fuente.by_index(i).map_err(|e| e.to_string())?;
+            let archivo = fuente.by_index(i).map_err(|e| e.to_string())?;
             let nombre = archivo.name().to_string();
             if archivo.is_dir() { escritor.add_directory(&nombre, opciones).map_err(|e| e.to_string())?; continue; }
-            if archivo.size() > 80 * 1024 * 1024 { return Err("La planilla generada supera el límite permitido.".into()); }
-            let mut contenido = Vec::new();
-            archivo.read_to_end(&mut contenido).map_err(|e| e.to_string())?;
+            let mut contenido = leer_acotado(archivo, LIMITE_GENERADO.min(LIMITE_TOTAL.saturating_sub(total)))?;
+            total += contenido.len() as u64;
             if nombre == "xl/styles.xml" { contenido = estilos.as_bytes().to_vec(); }
             else if nombre == "xl/theme/theme1.xml" {
                 if let Some(ref tema) = tema { contenido = tema.clone(); }
@@ -401,7 +506,11 @@ pub fn aplicar(plantilla: &Path, generado: &Path) -> Result<(), String> {
         }
         escritor.finish().map_err(|e| e.to_string())?;
         // Control estructural y de contenido: los estilos no autorizan un cambio de datos.
-        let revisado = flow_tabular::leer(&temporal)?;
+        let revisado_bytes = leer_acotado(std::fs::File::open(&temporal).map_err(|e| e.to_string())?, LIMITE_TOTAL)?;
+        let mut revisado_zip = ZipArchive::new(Cursor::new(revisado_bytes.as_slice())).map_err(|e| e.to_string())?;
+        validar_zip(&mut revisado_zip, LIMITE_GENERADO, LIMITE_TOTAL)?;
+        drop(revisado_zip);
+        let revisado = flow_tabular::leer_bytes("revisado.xlsx", revisado_bytes)?;
         if generado_libro.hojas.len() != revisado.hojas.len() {
             return Err("La aplicación de la plantilla cambió el número de hojas.".into());
         }
@@ -420,4 +529,22 @@ pub fn aplicar(plantilla: &Path, generado: &Path) -> Result<(), String> {
         let _ = std::fs::remove_file(&temporal);
         format!("No se pudo aplicar la plantilla: {e}")
     })
+}
+
+#[cfg(test)]
+mod cuotas_tests {
+    use super::*;
+    #[test]
+    fn zip_cuota_real() {
+        let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+        for nombre in ["uno.bin", "dos.bin"] {
+            zip.start_file(nombre, SimpleFileOptions::default()).unwrap();
+            zip.write_all(b"12345678").unwrap();
+        }
+        let bytes = zip.finish().unwrap().into_inner();
+        let mut zip = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        assert!(validar_zip(&mut zip, 7, 20).is_err());
+        assert!(validar_zip(&mut zip, 8, 15).is_err());
+        assert!(validar_zip(&mut zip, 8, 16).is_ok());
+    }
 }

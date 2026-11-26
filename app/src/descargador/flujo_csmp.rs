@@ -154,9 +154,12 @@ fn seleccion_de(perfil: &Perfil) -> Value {
 fn guardar_estado(ruta: &Path, datos: &Value) -> Result<(), String> {
     let mut bytes = serde_json::to_vec_pretty(datos).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
-    let temporal = ruta.with_extension("tmp");
-    std::fs::write(&temporal, bytes).map_err(|e| e.to_string())?;
-    std::fs::rename(temporal, ruta).map_err(|e| e.to_string())
+    let temporal = ruta.with_extension(format!("{}-{}.tmp", std::process::id(), chrono::Local::now().timestamp_nanos_opt().unwrap_or_default()));
+    lote::guardar_exclusivo(&temporal, &bytes)?;
+    std::fs::rename(&temporal, ruta).map_err(|e| {
+        let _ = std::fs::remove_file(&temporal);
+        e.to_string()
+    })
 }
 
 /// Ejecuta o recupera una fase, reutilizando las consultas validadas ya guardadas.
@@ -188,8 +191,12 @@ pub fn ejecutar_fase(
         .filter(|(q, _)| matches!(q["estado"].as_str(), Some("VALIDADA" | "SIN_RESULTADOS")))
         .map(|(q, _)| clave_seleccion(&q["seleccion"])).collect();
     let pendientes: Vec<_> = plan_completo.consultas.iter().filter(|p| !terminadas.contains(&clave_seleccion(&seleccion_de(p)))).cloned().collect();
+    paquete::dentro(raiz, &fase.clave)?;
     let destino = raiz.join(&fase.clave);
     std::fs::create_dir_all(&destino).map_err(|e| e.to_string())?;
+    let real = destino.canonicalize().map_err(|e| e.to_string())?;
+    let base = raiz.canonicalize().map_err(|e| e.to_string())?;
+    if real == base || !real.starts_with(&base) { return Err("La fase está fuera del conjunto.".into()); }
     let mut carpeta_nueva = None;
     let resultado = if pendientes.is_empty() {
         reunir_fase(&anteriores, &esperadas, &destino)
@@ -209,6 +216,8 @@ pub fn ejecutar_fase(
     };
     match &resultado {
         Ok(carpeta) => {
+            let real = carpeta.canonicalize().map_err(|e| e.to_string())?;
+            if real == base || !real.starts_with(&base) { return Err("La fuente de recuperación está fuera del flujo.".into()); }
             let relativa = carpeta.strip_prefix(raiz).map_err(|_| "La fuente de recuperación está fuera del flujo.")?.to_string_lossy().replace('\\', "/");
             estado["fases"][&fase.clave] = json!({"estado": "VALIDADA", "carpeta": relativa, "consultas": esperadas.len()});
         }
@@ -245,6 +254,12 @@ pub fn ensamblar(lotes: &[paquete::Lote], tribunales: &[String], hoy: NaiveDate,
         Hoja::simple(&nombre, filas)
     }).collect();
     completar_rut_informes(&mut hojas)?;
+    // Conservar valores de la lectura de paridad, pero recuperar la presentación de encabezados.
+    for hoja in &mut hojas {
+        if let Some(cabecera) = hoja.filas.first() {
+            hoja.presentacion = Some(cabecera.iter().map(Celda::texto_python).collect());
+        }
+    }
     let desde = hoy.checked_sub_days(chrono::Days::new(u64::from(dias.saturating_sub(1)))).ok_or("Fecha fuera de rango.")?;
     let texto = |s: &str| Celda::Texto(s.to_string());
     let mut cobertura = vec![["tribunal_codigo", "desde", "hasta", "estado", "criterio_temporal", "sin_coincidencias"].into_iter().map(texto).collect()];
@@ -300,7 +315,9 @@ pub fn ejecutar(
         "corte": hoy.to_string(), "dias_firmas": dias, "consultar_firmas": false});
     let (raiz, mut estado) = if let Some(carpeta) = recuperar {
         let raiz = carpeta.canonicalize().map_err(|e| e.to_string())?;
-        let bytes = std::fs::read(raiz.join("flujo.json")).map_err(|e| e.to_string())?;
+        let ruta = paquete::dentro(&raiz, "flujo.json")?;
+        if ruta != raiz.join("flujo.json") { return Err("El control de flujo no es un archivo directo del conjunto.".into()); }
+        let bytes = paquete::leer_archivo_acotado(&ruta, 32 * 1024 * 1024)?;
         let mut estado: Value = serde_json::from_slice(&bytes).map_err(|error| {
             if error.is_eof() && bytes.iter().rev().find(|b| !b.is_ascii_whitespace()) == Some(&b'{') {
                 let texto = String::from_utf8_lossy(&bytes);

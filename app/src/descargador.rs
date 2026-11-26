@@ -23,7 +23,7 @@ pub mod preferencias;
 pub mod resultados;
 mod puente;
 pub mod sitfa;
-mod xls;
+pub mod xls;
 pub use xls::leer_carga;
 #[cfg(test)]
 mod sitfa_ficticio;

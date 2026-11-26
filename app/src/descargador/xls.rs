@@ -7,8 +7,138 @@ use chrono::{Datelike, NaiveDate};
 use scraper::{Html, Selector};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::sync::LazyLock;
+
+pub const MAX_FILAS: usize = 200_000;
+pub const MAX_COLUMNAS: usize = 16_384;
+pub const MAX_CELDAS: usize = 2_000_000;
+pub const MAX_ENTRADA: u64 = 80 * 1024 * 1024;
+const MAX_ZIP_REAL: u64 = 200 * 1024 * 1024;
+
+/// Límite sobre bytes efectivamente leídos, no sobre metadatos del archivo.
+pub fn leer_acotado(lector: impl Read, max: u64) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    lector.take(max.saturating_add(1)).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > max { return Err("El archivo supera el límite de lectura.".into()); }
+    Ok(bytes)
+}
+
+pub fn validar_xml(xml: &str, spreadsheet: bool) -> Result<(), String> {
+    use quick_xml::events::Event;
+    let mut lector = quick_xml::Reader::from_str(xml);
+    let error = || "No se pudo abrir/parsear el archivo Excel; requiere revision local.".to_string();
+    let (mut profundidad, mut raices) = (0usize, 0usize);
+    let (mut filas, mut celdas) = (0usize, 0usize);
+    loop {
+        let evento = lector.read_event().map_err(|_| error())?;
+        match &evento {
+            Event::Start(e) | Event::Empty(e) => {
+                if profundidad == 0 { raices += 1; if raices > 1 { return Err(error()); } }
+                if matches!(evento, Event::Start(_)) { profundidad += 1; }
+                if profundidad > 128 { return Err(error()); }
+                if spreadsheet {
+                    match e.local_name().as_ref() {
+                        "Row" => { filas += 1; if filas > MAX_FILAS { return Err(error()); } }
+                        "Cell" => { celdas += 1; if celdas > MAX_CELDAS { return Err(error()); } }
+                        _ => {}
+                    }
+                }
+                for a in e.attributes() {
+                    let a = a.map_err(|_| error())?;
+                    if !spreadsheet && matches!(a.key.as_ref(), "count" | "uniqueCount") && e.local_name().as_ref() == "sst"
+                        && !a.value.parse::<usize>().ok().is_some_and(|n| n <= MAX_CELDAS) { return Err(error()); }
+                    if spreadsheet && matches!(a.key.as_ref(), "ss:Index" | "Index") {
+                        let n = a.value.parse::<usize>().ok();
+                        if !n.is_some_and(|n| (1..=MAX_COLUMNAS).contains(&n)) { return Err("Índice XML inválido o fuera de cuota.".into()); }
+                    }
+                }
+            }
+            Event::End(_) => profundidad = profundidad.checked_sub(1).ok_or_else(error)?,
+            Event::DocType(_) => return Err(error()),
+            Event::GeneralRef(r) => {
+                if profundidad == 0 || (r.resolve_char_ref().map_err(|_| error())?.is_none() && !matches!(&**r, "amp" | "lt" | "gt" | "quot" | "apos")) { return Err(error()); }
+            }
+            Event::Text(t) if profundidad == 0 && !t.xml10_content().trim().is_empty() => return Err(error()),
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    if profundidad != 0 || raices != 1 { return Err(error()); }
+    Ok(())
+}
+
+/// Prevalidación antes de entregar ZIP a Calamine (que descomprime internamente).
+pub fn validar_zip_excel(bytes: &[u8]) -> Result<(), String> {
+    validar_zip_excel_con_limite(bytes, MAX_ENTRADA, MAX_ZIP_REAL)
+}
+
+pub fn validar_zip_excel_con_limite(bytes: &[u8], max: u64, total_max: u64) -> Result<(), String> {
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| e.to_string())?;
+    if zip.len() > 4096 { return Err("El Excel contiene demasiadas entradas ZIP.".into()); }
+    let mut total = 0u64;
+    for i in 0..zip.len() {
+        let entrada = zip.by_index(i).map_err(|e| e.to_string())?;
+        let nombre = entrada.name().to_string();
+        let datos = leer_acotado(entrada, max.min(total_max.saturating_sub(total)))?;
+        total += datos.len() as u64;
+        if nombre.ends_with(".xml") || nombre.ends_with(".rels") {
+            let xml = std::str::from_utf8(&datos).map_err(|e| e.to_string())?;
+            validar_xml(xml, false)?;
+            if nombre.starts_with("xl/worksheets/") && nombre.ends_with(".xml") { validar_dimensiones_ooxml(xml)?; }
+        }
+    }
+    Ok(())
+}
+
+pub fn validar_dimensiones_ooxml(xml: &str) -> Result<(), String> {
+    use quick_xml::events::Event;
+    let mut lector = quick_xml::Reader::from_str(xml);
+    let mut min = (usize::MAX, usize::MAX);
+    let mut max = (0usize, 0usize);
+    let mut cantidad = 0usize;
+    let error = || "Las dimensiones del Excel exceden los límites de lectura.".to_string();
+    let coordenada = |r: &str| -> Result<(usize, usize), String> {
+        let letras = r.bytes().take_while(|b| b.is_ascii_uppercase()).count();
+        let mut col = 0usize;
+        for b in r.bytes().take(letras) { col = col.checked_mul(26).and_then(|n| n.checked_add((b - b'A' + 1) as usize)).ok_or_else(error)?; }
+        let fila = r[letras..].parse::<usize>().map_err(|_| error())?;
+        if !(1..=MAX_FILAS).contains(&fila) || !(1..=MAX_COLUMNAS).contains(&col) { return Err(error()); }
+        Ok((fila, col))
+    };
+    loop {
+        match lector.read_event().map_err(|e| e.to_string())? {
+            Event::Start(e) | Event::Empty(e) => {
+                let local = e.local_name();
+                let etiqueta = local.as_ref();
+                if etiqueta == "c" {
+                    cantidad += 1;
+                    if cantidad > MAX_CELDAS { return Err(error()); }
+                }
+                if !matches!(etiqueta, "c" | "row" | "dimension") { continue; }
+                for a in e.attributes() {
+                    let a = a.map_err(|e| e.to_string())?;
+                    let r: &str = a.value.as_ref();
+                    if etiqueta == "row" && a.key.as_ref() == "r"
+                        && !r.parse::<usize>().ok().is_some_and(|n| (1..=MAX_FILAS).contains(&n)) { return Err(error()); }
+                    if etiqueta == "dimension" && a.key.as_ref() == "ref" {
+                        let (a, b) = r.split_once(':').unwrap_or((r, r));
+                        let (f0, c0) = coordenada(a)?; let (f1, c1) = coordenada(b)?;
+                        if f1 < f0 || c1 < c0 || (f1 - f0 + 1).saturating_mul(c1 - c0 + 1) > MAX_CELDAS { return Err(error()); }
+                    }
+                    if etiqueta == "c" && a.key.as_ref() == "r" {
+                        let (fila, col) = coordenada(r)?;
+                        min = (min.0.min(fila), min.1.min(col)); max = (max.0.max(fila), max.1.max(col));
+                        if (max.0 - min.0 + 1).saturating_mul(max.1 - min.1 + 1) > MAX_CELDAS { return Err(error()); }
+                    }
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(())
+}
 
 const XML_2003: &[u8] = b"urn:schemas-microsoft-com:office:spreadsheet";
 
@@ -68,13 +198,14 @@ fn texto_celda_con(dato: &Data, formato_fecha: &str) -> String {
 }
 
 fn grillas_calamine_con(datos: &[u8], formato_fecha: &str) -> Result<Vec<Grilla>, String> {
+    if datos.starts_with(b"PK\x03\x04") { validar_zip_excel(datos)?; }
     let mut libro = calamine::open_workbook_auto_from_rs(Cursor::new(datos.to_vec()))
         .map_err(|_| "No se pudo abrir/parsear el archivo Excel; requiere revision local.")?;
     let mut celdas = 0usize;
     let mut grillas = Vec::new();
     for (_, rango) in libro.worksheets() {
         let (filas, cols) = rango.get_size();
-        celdas += filas * cols;
+        celdas = celdas.saturating_add(filas.saturating_mul(cols));
         if filas > 200_000 || cols > 200 || celdas > 2_000_000 {
             return Err("Las dimensiones del Excel exceden los límites de lectura.".into());
         }
@@ -95,9 +226,17 @@ fn grillas_html(datos: &[u8]) -> Result<Vec<Grilla>, String> {
     if raiz.select(&ACTIVOS).next().is_some() {
         return Err("La descarga es una pagina web activa, no un Excel verificable.".into());
     }
-    raiz.select(&TABLAS)
-        .map(super::sitfa::registros::grilla)
-        .collect()
+    let mut total = 0usize;
+    let mut filas = 0usize;
+    let mut grillas = Vec::new();
+    for tabla in raiz.select(&TABLAS) {
+        let g = super::sitfa::registros::grilla(tabla)?;
+        filas = filas.saturating_add(g.len());
+        total = total.saturating_add(g.iter().map(Vec::len).sum::<usize>());
+        if filas > MAX_FILAS || total > MAX_CELDAS { return Err("La tabla supera los límites de filas/celdas.".into()); }
+        grillas.push(g);
+    }
+    Ok(grillas)
 }
 
 /// `read_excel` para SpreadsheetML 2003: una grilla por `ss:Table`, con `ss:Index` de filas y celdas, el texto de
@@ -109,12 +248,15 @@ fn grillas_xml_2003(datos: &[u8]) -> Result<Vec<Grilla>, String> {
         Ok(t) => std::borrow::Cow::Borrowed(t),
         Err(_) => std::borrow::Cow::Owned(decodificar(datos)),
     };
+    validar_xml(&texto, true).map_err(|_| "No se pudo abrir/parsear el archivo Excel; requiere revision local.".to_string())?;
     let mut lector = quick_xml::Reader::from_str(&texto);
+    let mut total = 0usize;
+    let mut total_filas = 0usize;
     let invalido = |_| "No se pudo abrir/parsear el archivo Excel; requiere revision local.".to_string();
     let indice = |e: &quick_xml::events::BytesStart| -> Result<Option<usize>, String> {
         for a in e.attributes() {
             let a = a.map_err(|_| "No se pudo abrir/parsear el archivo Excel; requiere revision local.".to_string())?;
-            if a.key.as_ref() == "ss:Index" {
+            if matches!(a.key.as_ref(), "ss:Index" | "Index") {
                 return a.value.trim().parse().map(Some).map_err(|_| "Índice de fila XML inválido.".to_string());
             }
         }
@@ -133,9 +275,11 @@ fn grillas_xml_2003(datos: &[u8]) -> Result<Vec<Grilla>, String> {
             Event::Start(e) | Event::Empty(e) => {
                 let vacio = matches!(evento, Event::Empty(_));
                 match e.local_name().as_ref() {
-                    "Table" if !vacio => grilla = Some(Vec::new()),
+                    "Table" if !vacio && grilla.is_none() => grilla = Some(Vec::new()),
+                    "Table" if !vacio => return Err("Tabla XML anidada inválida.".into()),
                     "Table" => grillas.push(Vec::new()),
                     "Row" if grilla.is_some() => {
+                        if fila.is_some() { return Err("Fila XML anidada inválida.".into()); }
                         let g = grilla.as_mut().unwrap();
                         if let Some(objetivo) = indice(e)? {
                             if !(g.len() < objetivo && objetivo <= 200_000) {
@@ -143,6 +287,7 @@ fn grillas_xml_2003(datos: &[u8]) -> Result<Vec<Grilla>, String> {
                             }
                             g.resize(objetivo - 1, Vec::new());
                         }
+                        if g.len() >= 200_000 { return Err("La tabla XML excede los límites de filas.".into()); }
                         if vacio {
                             g.push(Vec::new());
                         } else {
@@ -150,15 +295,17 @@ fn grillas_xml_2003(datos: &[u8]) -> Result<Vec<Grilla>, String> {
                         }
                     }
                     "Cell" if fila.is_some() => {
+                        if celda.is_some() { return Err("Celda XML anidada inválida.".into()); }
                         let f = fila.as_mut().unwrap();
                         if let Some(i) = indice(e)? {
-                            if !(1..=200).contains(&i) {
+                            if !(1..=200).contains(&i) || i <= f.len() {
                                 return Err("El índice XML excede los límites de columnas.".into());
                             }
                             if f.len() < i - 1 {
                                 f.resize(i - 1, String::new());
                             }
                         }
+                        if f.len() >= 200 { return Err("La fila XML excede los límites de columnas.".into()); }
                         if vacio {
                             f.push(String::new());
                         } else {
@@ -213,18 +360,27 @@ fn grillas_xml_2003(datos: &[u8]) -> Result<Vec<Grilla>, String> {
                 }
                 "Row" if fila.is_some() => {
                     let g = grilla.as_mut().unwrap();
-                    g.push(fila.take().unwrap());
+                    let f = fila.take().unwrap();
+                    total = total.saturating_add(f.len());
+                    if total > MAX_CELDAS { return Err("El XML excede los límites de lectura.".into()); }
+                    g.push(f);
                     if g.len() > 200_000 {
                         return Err("La tabla XML excede los límites de filas.".into());
                     }
                 }
-                "Table" if grilla.is_some() => grillas.push(grilla.take().unwrap()),
+                "Table" if grilla.is_some() => {
+                    let g = grilla.take().unwrap();
+                    total_filas = total_filas.saturating_add(g.len());
+                    if total_filas > MAX_FILAS { return Err("La tabla XML excede los límites de filas.".into()); }
+                    grillas.push(g);
+                },
                 _ => {}
             },
             Event::Eof => break,
             _ => {}
         }
     }
+    if grilla.is_some() || fila.is_some() || celda.is_some() || dentro_dato != 0 { return Err("XML incompleto.".into()); }
     Ok(grillas)
 }
 
@@ -513,6 +669,16 @@ mod tests {
         assert_eq!(fecha_serial(46300.0), NaiveDate::from_ymd_opt(2026, 10, 5));
     }
 
+    #[test]
+    fn xml_cuotas_y_malformado() {
+        for i in ["0", "-1", "16385"] {
+            let xml = format!("<Workbook><Table><Row><Cell ss:Index=\"{i}\"/></Row></Table></Workbook>");
+            assert!(grillas_xml_2003(xml.as_bytes()).is_err());
+        }
+        assert!(grillas_xml_2003(b"<Workbook><Table></Workbook>").is_err());
+        let profundo = format!("{}{}", "<a>".repeat(129), "</a>".repeat(129));
+        assert!(grillas_xml_2003(profundo.as_bytes()).is_err());
+    }
     #[test]
     fn a7_excel_xml_2003() {
         // 1. Libro SpreadsheetML ficticio con ss:Index, html:Font y DateTime
