@@ -9,6 +9,7 @@
 use super::lote::{self, Conexion};
 use super::sitfa::{self, Consulta, Pares, Respuesta};
 use super::{lecturas, vinculos, Alcance, Catalogo, Edicion, Pantalla, Perfil};
+use chrono::NaiveDate;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -55,12 +56,13 @@ const PESTANAS_CALENDARIO: [&str; 2] = ["Cumplimiento", "Informes"];
 const REUTILIZAR_HORAS: i64 = 12;
 const REUTILIZAR_CARPETAS: usize = 10;
 
-/// `lotes.Batch` de Seguimiento para bitácoras (informe por omisión «1», sin fechas ni filtros conservados).
+/// `lotes.Batch` de Seguimiento para bitácoras (informe por omisión «1», sin otros filtros conservados).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LoteBitacoras {
     pub tribunales: Vec<String>,
     pub modalidades: Vec<String>,
     pub pestanas: Vec<String>,
+    pub fechas: Option<(NaiveDate, NaiveDate)>,
 }
 
 impl LoteBitacoras {
@@ -76,17 +78,25 @@ impl LoteBitacoras {
                 .map(|v| v.as_str().map(str::to_string).ok_or_else(|| "El lote recuperado no trae su alcance.".to_string()))
                 .collect()
         };
-        Ok(Self { tribunales: lista("tribunals")?, modalidades: lista("modalities")?, pestanas: lista("tabs")? })
+        let fechas = match s.get("dates") {
+            Some(Value::Null) => None,
+            Some(rango) => Some(leer_rango(rango, "start", "end")?),
+            None => return Err("El lote recuperado no trae su alcance de ingresos.".into()),
+        };
+        Ok(Self { tribunales: lista("tribunals")?, modalidades: lista("modalities")?, pestanas: lista("tabs")?, fechas })
     }
 
     /// `asdict(batch)`.
     fn seleccion(&self) -> Value {
         json!({"tribunals": self.tribunales, "modalities": self.modalidades, "tabs": self.pestanas, "report": "1",
-            "dates": null, "keep_filters": false, "screen": "seguimiento", "state": "1", "month": null, "year": null})
+            "dates": fechas_sitfa(self.fechas), "keep_filters": false, "screen": "seguimiento", "state": "1", "month": null, "year": null})
     }
 
     /// `Batch.plan`: tribunal × pestaña × modalidad, con informe solo en Informes.
     fn plan(&self, catalogo: &Catalogo) -> Result<Vec<Perfil>, String> {
+        if self.fechas.is_some_and(|(a, b)| a > b || !fecha_admitida(a) || !fecha_admitida(b)) {
+            return Err("El rango de ingresos del lote no es válido.".into());
+        }
         if self.tribunales.is_empty() || self.modalidades.is_empty() || self.pestanas.is_empty() {
             return Err("Seleccione tribunales, modalidades y pestañas.".into());
         }
@@ -120,6 +130,24 @@ impl LoteBitacoras {
         }
         Ok(plan)
     }
+}
+
+/// Formato de fechas del puente SITFA y de los comprobantes de descarga.
+fn fechas_sitfa(fechas: Option<(NaiveDate, NaiveDate)>) -> Value {
+    json!(fechas.map(|(a, b)| json!({"start": a.format("%d/%m/%Y").to_string(), "end": b.format("%d/%m/%Y").to_string()})))
+}
+
+fn fecha_admitida(fecha: NaiveDate) -> bool {
+    use chrono::Datelike;
+    (1900..=2100).contains(&fecha.year())
+}
+
+pub(super) fn leer_rango(rango: &Value, desde: &str, hasta: &str) -> Result<(NaiveDate, NaiveDate), String> {
+    let leer = |k: &str| rango[k].as_str().and_then(|t| {
+        NaiveDate::parse_from_str(t, "%d/%m/%Y").or_else(|_| NaiveDate::parse_from_str(t, "%Y-%m-%d")).ok()
+    });
+    leer(desde).zip(leer(hasta)).filter(|(a, b)| a <= b && fecha_admitida(*a) && fecha_admitida(*b))
+        .ok_or_else(|| "El rango de ingresos guardado no es válido.".into())
 }
 
 enum Detencion {
@@ -359,7 +387,7 @@ pub fn ejecutar_con_avance(
         }
         for (indice, perfil) in plan.iter().enumerate() {
             (s.avance)("query", json!({"index": indice + 1, "total": plan.len(), "label": perfil.etiqueta}));
-            if !enumerar(&mut s, catalogo, perfil)? {
+            if !enumerar(&mut s, catalogo, perfil, lote_bitacoras.fechas)? {
                 break;
             }
         }
@@ -450,7 +478,7 @@ pub fn ejecutar_con_avance(
 }
 
 /// `enumerar_listado`: formulario, páginas del listado y lectura de cada fila. `Ok(false)` detiene el lote.
-fn enumerar(s: &mut Sesion<'_>, catalogo: &Catalogo, perfil: &Perfil) -> Result<bool, Detencion> {
+fn enumerar(s: &mut Sesion<'_>, catalogo: &Catalogo, perfil: &Perfil, fechas: Option<(NaiveDate, NaiveDate)>) -> Result<bool, Detencion> {
     s.detener_si_cancelada()?;
     let Alcance::Seguimiento { pestana, modalidad, reporte } = &perfil.alcance else {
         return Err(Detencion::Lote("Las bitácoras se consultan desde Seguimiento.".into()));
@@ -470,7 +498,7 @@ fn enumerar(s: &mut Sesion<'_>, catalogo: &Catalogo, perfil: &Perfil) -> Result<
         let consulta = Consulta::desde(perfil)?;
         let preparado = s.pedir(
             "prepare",
-            json!({"selection": lote::seleccion_edicion(perfil, Edicion::Integral), "dates": null, "keep_filters": false}),
+            json!({"selection": lote::seleccion_edicion(perfil, Edicion::Integral), "dates": fechas_sitfa(fechas), "keep_filters": false}),
         )?;
         let pares: Pares = preparado["pairs"]
             .as_array()
@@ -485,8 +513,16 @@ fn enumerar(s: &mut Sesion<'_>, catalogo: &Catalogo, perfil: &Perfil) -> Result<
             })
             .ok_or("El formulario no entregó parámetros válidos.".to_string())?;
         consulta.validar_consulta(&pares)?;
-        if pares.iter().find(|(k, _)| k == "FLG_Consulta").map(|(_, v)| v.as_str()) != Some("0") {
+        let campo = |k: &str| pares.iter().find(|(c, _)| c == k).map(|(_, v)| v.as_str());
+        if campo("FLG_Consulta") != Some(if fechas.is_some() { "1" } else { "0" }) {
             return Err(Detencion::Consulta("El filtro de fechas no coincide.".into()));
+        }
+        if let Some((a, b)) = fechas {
+            if campo("FEC_Inicio") != Some(a.format("%d/%m/%Y").to_string().as_str())
+                || campo("FEC_Fin") != Some(b.format("%d/%m/%Y").to_string().as_str())
+                || campo("CHK_Consulta") != Some("on") {
+                return Err(Detencion::Consulta("Las fechas enviadas no coinciden con la selección.".into()));
+            }
         }
         let html = lote::cuerpo(&s.pedir("search", json!({"pairs": pares, "timeout": ESPERA_MS}))?, false)?;
         let primera = match sitfa::validar_respuesta(&html, &pares, &consulta, None)? {
@@ -1444,7 +1480,7 @@ mod tests {
         for e in escenarios {
             let nombre = e["escenario"].as_str().unwrap();
             let lista = |k: &str| -> Vec<String> { serde_json::from_value(e["lote"][k].clone()).unwrap() };
-            let lote = LoteBitacoras { tribunales: lista("tribunales"), modalidades: lista("modalidades"), pestanas: lista("pestanas") };
+            let lote = LoteBitacoras { tribunales: lista("tribunales"), modalidades: lista("modalidades"), pestanas: lista("pestanas"), fechas: None };
             let guion = Guion { pasos: e["guion"].as_array().unwrap().clone(), pedidos: RefCell::default() };
             let destino = std::env::temp_dir().join(format!("flow-eq4-{}-{nombre}", std::process::id()));
             let _ = std::fs::remove_dir_all(&destino);

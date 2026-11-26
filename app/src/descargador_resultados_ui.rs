@@ -130,8 +130,10 @@ fn detalles(lote: &Lote) -> Result<Vec<Detalle>, String> {
 }
 
 fn leer(carpeta: &Path, parcial: bool) -> Result<Carga, String> {
-    if !carpeta.is_dir() {
-        return Err(format!("No se pudo abrir el lote: {}", std::fs::metadata(carpeta).unwrap_err()));
+    match std::fs::metadata(carpeta) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Err("No se pudo abrir el lote: la ruta no es una carpeta.".into()),
+        Err(e) => return Err(format!("No se pudo abrir el lote: {e}")),
     }
     let tipo = archivo_local::tipo(carpeta)?;
     if tipo == Tipo::Bitacoras {
@@ -521,7 +523,7 @@ impl Resultados {
         for (i, carpeta) in self.carpetas_paquete.clone().iter().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(format!("{} · {}", carpeta.file_name().unwrap_or_default().to_string_lossy(), carpeta.display()));
-                if ui.add_enabled(!self.ocupado, egui::Button::new("Quitar##carpeta".to_string() + &i.to_string())).clicked() {
+                if ui.push_id(("quitar_carpeta", carpeta), |ui| ui.add_enabled(!self.ocupado, egui::Button::new("Quitar"))).inner.clicked() {
                     self.carpetas_paquete.remove(i);
                 }
             });
@@ -529,7 +531,7 @@ impl Resultados {
         for (i, diario) in self.bitacoras_paquete.clone().iter().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(format!("{} · {}", if diario.is_file() { "Bitácoras" } else { "NO_DISPONIBLE" }, diario.display()));
-                if ui.add_enabled(!self.ocupado, egui::Button::new("Quitar##bitacora".to_string() + &i.to_string())).clicked() {
+                if ui.push_id(("quitar_bitacora", diario), |ui| ui.add_enabled(!self.ocupado, egui::Button::new("Quitar"))).inner.clicked() {
                     self.bitacoras_paquete.remove(i);
                 }
             });
@@ -581,6 +583,14 @@ fn crear_paquete(carpetas: &[PathBuf], bitacoras: &[PathBuf], parcial: bool, des
 #[cfg(test)]
 mod pruebas {
     use super::*;
+
+    #[test]
+    fn leer_rechaza_archivo_regular_y_ruta_inexistente() {
+        let archivo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        assert!(archivo.is_file());
+        assert!(matches!(leer(&archivo, false), Err(e) if e.contains("no es una carpeta")));
+        assert!(leer(&archivo.join("no-existe"), false).is_err());
+    }
     use base64::Engine;
     use egui_kittest::kittest::Queryable;
     use egui_kittest::Harness;

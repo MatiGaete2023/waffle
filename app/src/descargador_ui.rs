@@ -30,6 +30,8 @@ pub struct Descargador {
     lote: SeleccionLote,
     lote_desde: String,
     lote_hasta: String,
+    todas_las_fechas: bool,
+    plan_pendiente: Option<PlanLote>,
     plan: Option<Result<PlanLote, String>>,
     conexion: Conexion,
     catalogo_remoto: bool,
@@ -278,6 +280,7 @@ impl Flujo {
         opciones: flujo_paquete::Opciones,
     ) {
         self.limpiar();
+        self.por_hoja = false;
         let (envio, recepcion) = mpsc::channel();
         self.recepcion = Some(recepcion);
         let cancelar = Arc::new(AtomicBool::new(false));
@@ -353,6 +356,7 @@ impl Flujo {
         opciones: flujo_paquete::Opciones,
     ) {
         self.limpiar();
+        self.por_hoja = false;
         let (envio, recepcion) = mpsc::channel();
         self.recepcion = Some(recepcion);
         let cancelar = Arc::new(AtomicBool::new(false));
@@ -386,6 +390,7 @@ impl Flujo {
         conectado: bool,
         catalogo: &Catalogo,
         lote: &SeleccionLote,
+        plan: Option<&PlanLote>,
         destino: &str,
         pausa: f64,
         opciones: flujo_paquete::Opciones,
@@ -402,11 +407,7 @@ impl Flujo {
         );
         let activa = self.activa();
         let seguimiento = catalogo.pantalla == Pantalla::Seguimiento;
-        let plan = if seguimiento && !lote.tribunales.is_empty() && !lote.modalidades.is_empty() && !lote.pestanas.is_empty() {
-            catalogo.planificar(Edicion::Integral, lote).ok()
-        } else {
-            None
-        };
+        let plan = plan.filter(|_| seguimiento && !lote.pestanas.is_empty());
         let puede = conectado && plan.is_some() && !destino.trim().is_empty() && conexion.is_some();
         if activa {
             ui.horizontal_wrapped(|ui| {
@@ -421,17 +422,22 @@ impl Flujo {
         } else {
             ui.horizontal_wrapped(|ui| {
                 ui.checkbox(&mut self.informes, "Informes por vencer (60 días)");
+                ui.checkbox(&mut self.por_hoja, "Un paquete por hoja");
+                if self.por_hoja {
+                    ui.label(format!("{} hojas / {} paquetes previstos", lote.pestanas.len(), lote.pestanas.len()));
+                }
                 let boton = ui.add_enabled(
                     puede,
                     egui::Button::new(RichText::new("Consultar y crear paquete").color(egui::Color32::WHITE).strong())
                         .fill(p.accent),
                 );
                 if boton.clicked() {
-                    if let (Some(conexion), Some(plan)) = (conexion.clone(), plan.clone()) {
+                    if let (Some(conexion), Some(plan)) = (conexion.clone(), plan.cloned()) {
                         let alcance = LoteBitacoras {
                             tribunales: lote.tribunales.clone(),
                             modalidades: lote.modalidades.clone(),
                             pestanas: lote.pestanas.clone(),
+                            fechas: plan.fechas,
                         };
                         let mut opciones = opciones.clone();
                         opciones.informes = self.informes;
@@ -741,6 +747,7 @@ impl Contexto {
         destino: &str,
         pausa: f64,
         ocupado: bool,
+        rango_valido: bool,
     ) {
         self.recibir();
         ui.add_space(8.0);
@@ -772,8 +779,11 @@ impl Contexto {
             tribunales: lote.tribunales.clone(),
             modalidades: lote.modalidades.clone(),
             pestanas: lote.pestanas.clone(),
+            fechas: lote.fechas,
         };
-        let impedimento_lectura = if !conectado {
+        let impedimento_lectura = if !rango_valido {
+            Some("Completa y valida el alcance de ingresos del lote.")
+        } else if !conectado {
             Some("Conecta la extensión Integral desde la pestaña SITFA.")
         } else if alcance.tribunales.is_empty() || alcance.modalidades.is_empty() || alcance.pestanas.is_empty() {
             Some("Selecciona tribunales, modalidades y pestañas.")
@@ -1036,6 +1046,7 @@ impl Ejecucion {
         edicion: Edicion,
         catalogo: &Catalogo,
         plan: Option<&PlanLote>,
+        plan_visible: Option<&PlanLote>,
         puente: Option<Arc<Puente>>,
         remoto: bool,
         lote: &SeleccionLote,
@@ -1043,7 +1054,8 @@ impl Ejecucion {
     ) {
         let conectado = puente.as_ref().is_some_and(|b| b.conectado());
         let conexion: Option<Arc<dyn lote::Conexion + Send + Sync>> = puente.clone().map(|p| p as Arc<dyn lote::Conexion + Send + Sync>);
-        self.flujo.mostrar(ui, p, conectado, catalogo, lote, &self.destino, f64::from(self.pausa), opciones_paquete, conexion);
+        let disponible_flujo = conectado && edicion == Edicion::Integral && remoto && !self.activa() && !self.contexto.activa();
+        self.flujo.mostrar(ui, p, disponible_flujo, catalogo, lote, plan_visible, &self.destino, f64::from(self.pausa), opciones_paquete, conexion);
         ui.add_space(8.0);
         theme::seccion(ui, p, "Avanzado · pasos sueltos");
         let activa = self.activa();
@@ -1078,7 +1090,9 @@ impl Ejecucion {
             });
         });
         let conectado = puente.as_ref().is_some_and(|b| b.conectado());
-        let impedimento = if catalogo.pantalla == Pantalla::Carga && edicion != Edicion::Integral {
+        let impedimento = if self.flujo.activa() || self.contexto.activa() {
+            Some("Termina la operación en curso antes de descargar otro lote.")
+        } else if catalogo.pantalla == Pantalla::Carga && edicion != Edicion::Integral {
             Some("Carga está disponible en Integral.")
         } else if !remoto {
             Some("Carga las opciones desde Chrome para ejecutar el lote.")
@@ -1089,7 +1103,7 @@ impl Ejecucion {
                 "Conecta la extensión Integral desde la pestaña SITFA."
             })
         } else if plan.is_none() {
-            Some("Prepara el lote para revisar sus consultas antes de descargar.")
+            Some("Completa el alcance y las fechas del lote antes de descargar.")
         } else {
             None
         };
@@ -1161,7 +1175,7 @@ impl Ejecucion {
             // El paquete se arma desde un lote terminado: sin `fin`, una carpeta a medias no se ofrece.
             let listados = self.carpeta.clone().filter(|_| !activa && self.fin.is_some());
             let pausa = preferencias::limitar_pausa(f64::from(self.pausa));
-            self.contexto.mostrar(ui, p, catalogo, lote, puente, listados, &self.destino, pausa, activa);
+            self.contexto.mostrar(ui, p, catalogo, lote, puente, listados, &self.destino, pausa, activa || self.flujo.activa(), plan_visible.is_some());
         }
     }
 }
@@ -1355,6 +1369,9 @@ impl Descargador {
         self.lote = SeleccionLote::default();
         self.lote_desde.clear();
         self.lote_hasta.clear();
+        self.todas_las_fechas = false;
+        self.plan_pendiente = None;
+        self.ejecucion.flujo.por_hoja = false;
         self.plan = None;
     }
 
@@ -1393,6 +1410,8 @@ impl Descargador {
             if ui.add_enabled(!ejecutando && conectado && seguimiento && !self.lote.tribunales.is_empty(), egui::Button::new("Descarga conjunta CSMP")).clicked() {
                 if self.lote.pestanas.len() != 1 || !matches!(self.lote.pestanas[0].as_str(), "Espera" | "Cumplimiento") {
                     self.conjunta.mensajes.push("Selecciona Espera o Cumplimiento para la descarga conjunta.".into());
+                } else if !matches!(rango_visible(Pantalla::Seguimiento, &self.lote_desde, &self.lote_hasta, self.todas_las_fechas), Ok(None)) {
+                    self.conjunta.mensajes.push("La descarga conjunta CSMP usa todas las fechas. Marca esa opción expresamente o utiliza Consultar y crear paquete para un rango de ingresos.".into());
                 } else if let Some(puente) = self.conexion.puente.clone() {
                     self.conjunta.lanzar(ui.ctx(), puente, PathBuf::from(&self.ejecucion.destino), self.lote.tribunales.clone(), self.lote.modalidades.clone(), self.lote.pestanas[0].clone(), chrono::Local::now().date_naive(), 60, None, self.ejecucion.pausa);
                 }
@@ -1416,15 +1435,18 @@ impl Descargador {
                         .default_open(self.plan.is_some())
                         .show(ui, |ui| {
                             ui.add_enabled_ui(!ejecutando, |ui| {
-                                mostrar_lote(
+                                if mostrar_lote(
                                     ui,
                                     p,
                                     catalogo,
                                     self.edicion,
                                     &mut self.lote,
                                     (&mut self.lote_desde, &mut self.lote_hasta),
+                                    &mut self.todas_las_fechas,
                                     &mut self.plan,
-                                );
+                                ) {
+                                    self.plan_pendiente = None;
+                                }
                                 let hoy = chrono::Local::now().date_naive();
                                 let favoritos = self.favoritos.get_or_insert_with(|| {
                                     Preferencias::cargar(&Preferencias::ruta()).favoritos.into_keys().collect()
@@ -1434,8 +1456,7 @@ impl Descargador {
                                     if ui.button("Guardar favorito").on_hover_text("Guarda el alcance; las fechas se recalculan al aplicarlo").clicked() {
                                         let ruta = Preferencias::ruta();
                                         let mut prefs = Preferencias::cargar(&ruta);
-                                        let resultado = catalogo
-                                            .planificar(self.edicion, &self.lote)
+                                        let resultado = plan_desde_campos(catalogo, self.edicion, &mut self.lote, &self.lote_desde, &self.lote_hasta, self.todas_las_fechas)
                                             .and_then(|_| prefs.guardar_favorito(&self.favorito_nombre, catalogo.pantalla, &self.lote, self.ejecucion.conservar_filtros, hoy))
                                             .and_then(|()| prefs.guardar(&ruta));
                                         self.favorito_mensaje = Some(resultado.map(|()| "Perfil guardado; recalcula el período al aplicarlo.".into()));
@@ -1460,6 +1481,9 @@ impl Descargador {
                                                         self.lote_hasta.clear();
                                                     }
                                                     self.lote = lote;
+                                                    // Un favorito sin fechas no sustituye la confirmación explícita.
+                                                    self.todas_las_fechas = false;
+                                                    self.plan_pendiente = None;
                                                     self.plan = None;
                                                     let mut texto = String::from("Favorito aplicado; revisa el alcance y las fechas.");
                                                     if !retirados.is_empty() {
@@ -1484,14 +1508,39 @@ impl Descargador {
                                 {
                                     if let Some(carpeta) = rfd::FileDialog::new().set_title("Carpeta del lote incompleto").pick_folder() {
                                         let edicion = self.edicion;
-                                        self.plan = Some(
-                                            lote::pendientes(&carpeta)
-                                                .and_then(|p| catalogo.planificar_pendientes(edicion, &p)),
-                                        );
+                                        match lote::pendientes(&carpeta).and_then(|p| catalogo.planificar_pendientes(edicion, &p)) {
+                                            Ok(plan) => {
+                                                if let Some((a, b)) = plan.fechas {
+                                                    self.lote_desde = a.format("%d/%m/%Y").to_string();
+                                                    self.lote_hasta = b.format("%d/%m/%Y").to_string();
+                                                } else {
+                                                    self.lote_desde.clear();
+                                                    self.lote_hasta.clear();
+                                                }
+                                                self.todas_las_fechas = false;
+                                                self.plan = None;
+                                                self.plan_pendiente = Some(plan);
+                                            }
+                                            Err(e) => { self.plan_pendiente = None; self.plan = Some(Err(e)); }
+                                        }
                                     }
                                 }
                             });
-                            let plan = self.plan.as_ref().and_then(|r| r.as_ref().ok());
+                            let actual = plan_desde_campos(catalogo, self.edicion, &mut self.lote, &self.lote_desde, &self.lote_hasta, self.todas_las_fechas);
+                            let plan_visible = actual.as_ref().ok();
+                            if let Err(e) = &actual {
+                                ui.label(RichText::new(e).color(p.amber));
+                            }
+                            let rango = rango_visible(catalogo.pantalla, &self.lote_desde, &self.lote_hasta, self.todas_las_fechas);
+                            if let Some(pendiente) = &self.plan_pendiente {
+                                ui.label(format!("Descarga avanzada: {} consultas pendientes recuperadas.", pendiente.consultas.len()));
+                                if ui.button("Descartar pendientes").clicked() { self.plan_pendiente = None; }
+                            }
+                            let plan = match &self.plan_pendiente {
+                                Some(pendiente) if rango.as_ref().ok() == Some(&pendiente.fechas) => Some(pendiente),
+                                Some(_) => None,
+                                None => plan_visible,
+                            };
                             let opciones_paquete = flujo_paquete::Opciones {
                                 consolidado: self.ejecucion.contexto.consolidado,
                                 calendarios: self.ejecucion.contexto.calendarios,
@@ -1511,6 +1560,7 @@ impl Descargador {
                                 self.edicion,
                                 catalogo,
                                 plan,
+                                plan_visible,
                                 self.conexion.puente.clone(),
                                 self.catalogo_remoto,
                                 &self.lote,
@@ -1566,6 +1616,7 @@ impl Descargador {
                 self.perfil = None;
                 self.error = None;
                 self.plan = None;
+                self.plan_pendiente = None;
             }
             self.conexion.mostrar(ui, p, self.edicion);
             if let Some(catalogo) = &self.catalogo {
@@ -1693,11 +1744,39 @@ impl Descargador {
             medidas: vec![TODAS_LAS_MEDIDAS.into()],
             ..Default::default()
         };
-        self.plan = self
-            .catalogo
-            .as_ref()
-            .map(|c| c.planificar(self.edicion, &self.lote));
+        self.lote_desde.clear();
+        self.lote_hasta.clear();
+        self.todas_las_fechas = true;
+        self.plan_pendiente = None;
+        self.plan = self.catalogo.as_ref().map(|c| c.planificar(self.edicion, &self.lote));
     }
+}
+
+/// Una sola fuente para preparar, descargar o empaquetar. No reutiliza el rango de una preparación anterior.
+fn rango_visible(pantalla: Pantalla, desde: &str, hasta: &str, todas: bool) -> Result<Option<(chrono::NaiveDate, chrono::NaiveDate)>, String> {
+    if matches!(pantalla, Pantalla::CalendarioInformes | Pantalla::CalendarioMedidas) {
+        return Ok(None); // calendario: mes y año, no filtro de ingresos
+    }
+    if todas {
+        if !desde.trim().is_empty() || !hasta.trim().is_empty() {
+            return Err("Borra ambas fechas antes de elegir Todas las fechas.".into());
+        }
+        if pantalla == Pantalla::Carga { return Err("Carga requiere un rango de fechas.".into()); }
+        return Ok(None);
+    }
+    let (a, b) = parse_date_text(desde).zip(parse_date_text(hasta))
+        .ok_or("Completa Desde y Hasta con fechas válidas o marca Todas las fechas.")?;
+    use chrono::Datelike;
+    if a > b || [a, b].iter().any(|d| !(1900..=2100).contains(&d.year())) {
+        return Err("Usa fechas entre 1900 y 2100, con Desde anterior o igual a Hasta.".into());
+    }
+    Ok(Some((a, b)))
+}
+
+fn plan_desde_campos(catalogo: &Catalogo, edicion: Edicion, lote: &mut SeleccionLote, desde: &str, hasta: &str, todas: bool) -> Result<PlanLote, String> {
+    lote.fechas = None;
+    lote.fechas = rango_visible(catalogo.pantalla, desde, hasta, todas)?;
+    catalogo.planificar(edicion, lote)
 }
 
 fn mostrar_lote(
@@ -1707,8 +1786,9 @@ fn mostrar_lote(
     edicion: Edicion,
     lote: &mut SeleccionLote,
     (desde, hasta): (&mut String, &mut String),
+    todas: &mut bool,
     plan: &mut Option<Result<PlanLote, String>>,
-) {
+) -> bool {
     let mut cambio = marcas(
         ui,
         "Tribunales",
@@ -1755,28 +1835,23 @@ fn mostrar_lote(
         }
         Pantalla::Carga => {}
     }
-    if !matches!(
-        catalogo.pantalla,
-        Pantalla::CalendarioInformes | Pantalla::CalendarioMedidas
-    ) {
-        cambio |= ui
-            .horizontal_wrapped(|ui| fecha(ui, "Desde", desde) | fecha(ui, "Hasta", hasta))
-            .inner;
+    let mut descartar_pendientes = cambio;
+    if !matches!(catalogo.pantalla, Pantalla::CalendarioInformes | Pantalla::CalendarioMedidas) {
+        ui.label("Alcance de ingresos del lote");
+        let edito = ui.horizontal_wrapped(|ui| fecha(ui, "Desde", desde) | fecha(ui, "Hasta", hasta)).inner;
+        if edito { *todas = false; }
+        descartar_pendientes |= edito;
+        cambio |= edito;
+        if catalogo.pantalla != Pantalla::Carga {
+            // No se borran fechas escritas automáticamente: la opción es excluyente.
+            cambio |= ui.add_enabled(desde.trim().is_empty() && hasta.trim().is_empty(), egui::Checkbox::new(todas, "Todas las fechas")).changed();
+        }
     }
-    if cambio {
-        *plan = None;
-    }
+    if cambio { *plan = None; }
     ui.add_space(6.0);
     if theme::primary(ui, p, "Preparar lote").clicked() {
-        *plan = Some(if desde.trim().is_empty() && hasta.trim().is_empty() {
-            lote.fechas = None;
-            catalogo.planificar(edicion, lote)
-        } else if let Some(fechas) = parse_date_text(desde).zip(parse_date_text(hasta)) {
-            lote.fechas = Some(fechas);
-            catalogo.planificar(edicion, lote)
-        } else {
-            Err("Completa las dos fechas del período.".into())
-        });
+        *plan = Some(plan_desde_campos(catalogo, edicion, lote, desde, hasta, *todas));
+        descartar_pendientes = true;
     }
     match plan.as_ref() {
         Some(Ok(plan)) => {
@@ -1797,6 +1872,7 @@ fn mostrar_lote(
         }
         None => {}
     }
+    descartar_pendientes
 }
 
 fn fecha(ui: &mut Ui, titulo: &str, texto: &mut String) -> bool {
@@ -1988,7 +2064,7 @@ mod pruebas_interfaz {
         let mut h = Harness::builder().with_size(egui::Vec2::new(1200.0, 700.0)).build_ui_state(
             move |ui, v: &mut Vista| {
                 let Vista { contexto, catalogo, lote, listados, destino } = v;
-                contexto.mostrar(ui, &pal, catalogo, lote, None, listados.clone(), destino, 1.0, false);
+                contexto.mostrar(ui, &pal, catalogo, lote, None, listados.clone(), destino, 1.0, false, true);
             },
             vista,
         );
@@ -2104,6 +2180,30 @@ mod pruebas_interfaz {
     /// «Retomar paquete…», muestra el error de la extensión y no deja hilos colgados.
     /// E-Q10 Â· Con Â«Un paquete por hojaÂ» la secciÃ³n lista cada ZIP con Â«Abrir carpetaÂ» y Â«Abrir en TrabajoÂ».
     #[test]
+    fn plan_vigente_sin_preparar_y_despues_de_editar() {
+        let catalogo: Catalogo = serde_json::from_value(serde_json::json!({
+            "pantalla": "seguimiento", "tribunales": {"901": "Tribunal Ficticio"},
+            "pestanas": ["Cumplimiento", "Espera"], "modalidades": {"2": "Ambulatorio"},
+            "informes": {"1": "Por vencer"}, "medidas": {"4": "Medidas por vencer"},
+        })).unwrap();
+        let mut lote = SeleccionLote {
+            tribunales: vec!["901".into()], pestanas: vec!["Cumplimiento".into()],
+            modalidades: vec!["2".into()], informes: vec!["1".into()],
+            medidas: vec![TODAS_LAS_MEDIDAS.into()], ..Default::default()
+        };
+        let primero = plan_desde_campos(&catalogo, Edicion::Integral, &mut lote, "01/11/2026", "26/11/2026", false).unwrap();
+        assert_eq!(primero.fechas, Some(("2026-11-01".parse().unwrap(), "2026-11-26".parse().unwrap())));
+        let segundo = plan_desde_campos(&catalogo, Edicion::Integral, &mut lote, "03/11/2026", "20/11/2026", false).unwrap();
+        assert_eq!(segundo.fechas, Some(("2026-11-03".parse().unwrap(), "2026-11-20".parse().unwrap())));
+        assert_ne!(primero.fechas, segundo.fechas);
+        for (a, b, todas) in [("", "", false), ("03/11/2026", "", false), ("31/11/2026", "20/11/2026", false), ("26/11/2026", "01/11/2026", false), ("01/11/2026", "", true)] {
+            assert!(plan_desde_campos(&catalogo, Edicion::Integral, &mut lote, a, b, todas).is_err());
+            assert!(lote.fechas.is_none());
+        }
+        assert!(plan_desde_campos(&catalogo, Edicion::Integral, &mut lote, "", "", true).unwrap().fechas.is_none());
+    }
+
+    #[test]
     fn ui_flujo_un_paquete_por_hoja() {
         use egui_kittest::kittest::Queryable;
         use egui_kittest::Harness;
@@ -2143,7 +2243,7 @@ mod pruebas_interfaz {
         let mut h = Harness::builder().with_size(egui::Vec2::new(1200.0, 700.0)).build_ui_state(
             move |ui, f: &mut Flujo| {
                 f.mostrar(
-                    ui, &pal, true, &catalogo_pantalla, &lote_pantalla, "C:/destino", 0.0,
+                    ui, &pal, true, &catalogo_pantalla, &lote_pantalla, None, "C:/destino", 0.0,
                     flujo_paquete::Opciones::default(), None,
                 );
             },
@@ -2153,6 +2253,13 @@ mod pruebas_interfaz {
         assert!(h.query_by_label("2 paquete(s), uno por hoja:").is_some(), "falta la lista");
         assert_eq!(h.get_all_by_label("Abrir carpeta").count(), 2);
         assert_eq!(h.get_all_by_label("Abrir en Trabajo").count(), 2);
+        h.get_by_label("Un paquete por hoja").click();
+        h.run();
+        assert!(!h.state().por_hoja);
+        h.get_by_label("Un paquete por hoja").click();
+        h.run();
+        assert!(h.state().por_hoja);
+        assert!(h.query_by_label("2 hojas / 2 paquetes previstos").is_some());
     }
 
     #[test]
@@ -2187,6 +2294,7 @@ mod pruebas_interfaz {
             tribunales: vec!["901".into()],
             modalidades: vec!["2".into()],
             pestanas: vec!["Cumplimiento".into()],
+            fechas: None,
         };
         let destino = perfil.join("paquete-en-una-accion");
         let mut flujo = Flujo::default();
@@ -2217,7 +2325,7 @@ mod pruebas_interfaz {
         };
         let mut h = Harness::builder().with_size(egui::Vec2::new(1200.0, 700.0)).build_ui_state(
             move |ui, f: &mut Flujo| {
-                f.mostrar(ui, &pal, true, &catalogo_pantalla, &lote_pantalla, "", 0.0, flujo_paquete::Opciones::default(), None);
+                f.mostrar(ui, &pal, true, &catalogo_pantalla, &lote_pantalla, None, "", 0.0, flujo_paquete::Opciones::default(), None);
             },
             flujo,
         );

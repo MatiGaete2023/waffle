@@ -101,7 +101,11 @@ impl Opciones {
             informes: b("informes")?,
             fecha_informes: fecha,
             pdf_vacias: b("pdf_vacias")?,
-            pausa: Default::default(),
+            // Los controles antiguos carecen de pausa; nunca recuperar cero por omisión.
+            pausa: match v.get("pausa_ms") {
+                Some(ms) => Duration::from_millis(ms.as_u64().filter(|n| *n > 0).ok_or(OPCIONES_INVALIDAS)?),
+                None => Self::default().pausa,
+            },
             reutilizar: Default::default(),
         })
     }
@@ -111,7 +115,7 @@ impl Opciones {
             "consolidado": self.consolidado, "calendarios": self.calendarios, "historia": self.historia,
             "historico": self.historico, "historia_en_paquete": self.historia_en_paquete, "meses": self.meses,
             "informes": self.informes, "fecha_informes": self.fecha_informes.to_string(),
-            "pdf_vacias": self.pdf_vacias,
+            "pdf_vacias": self.pdf_vacias, "pausa_ms": self.pausa.as_millis().min(u128::from(u64::MAX)) as u64,
         })
     }
 }
@@ -237,11 +241,52 @@ fn registrar_origen(
     Ok(())
 }
 
-fn consultas_validadas(carpeta: Option<&PathBuf>) -> bool {
-    carpeta
-        .and_then(|c| std::fs::read(c.join("resumen.json")).ok())
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        .is_some_and(|r| r["estado"] == "VALIDADA")
+fn consultas_validadas(carpeta: Option<&PathBuf>, fechas: Option<(NaiveDate, NaiveDate)>) -> bool {
+    carpeta.is_some_and(|c| {
+        std::fs::read(c.join("resumen.json")).ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .is_some_and(|r| rango_comprobado_lote(c, &r).ok() == Some(fechas))
+    })
+}
+
+/// El alcance aplicado del listado debe coincidir con cada comprobante de consulta validada.
+/// `None` dentro de `Ok` prueba que no se aplicó filtro, pero no prueba por sí solo que fue solicitado así.
+pub fn rango_comprobado_lote(carpeta: &Path, resumen: &Value) -> Result<Option<(NaiveDate, NaiveDate)>, String> {
+    let invalido = || "Las consultas no acreditan el rango de ingresos solicitado.".to_string();
+    let rango = |v: &Value, desde: &str, hasta: &str| -> Result<Option<(NaiveDate, NaiveDate)>, String> {
+        if v.is_null() { Ok(None) } else { bitacoras::leer_rango(v, desde, hasta).map(Some) }
+    };
+    if resumen["estado"] != "VALIDADA" { return Err(invalido()); }
+    let esperado = rango(resumen.get("filtro_fecha").ok_or_else(invalido)?, "desde", "hasta")?;
+    let consultas = resumen["consultas"].as_array().filter(|c| !c.is_empty()).ok_or_else(invalido)?;
+    for consulta in consultas {
+        if !matches!(consulta["estado"].as_str(), Some("VALIDADA" | "SIN_RESULTADOS")) { return Err(invalido()); }
+        let nombre = consulta["verificacion"].as_str().ok_or_else(invalido)?;
+        if !matches!(Path::new(nombre).components().collect::<Vec<_>>().as_slice(), [std::path::Component::Normal(_)])
+            || nombre.contains(['/', '\\', ':']) { return Err(invalido()); }
+        let comprobante = paquete::leer_json(&carpeta.join(nombre))?;
+        if comprobante["estado"] != consulta["estado"]
+            || rango(comprobante.get("filtro_fecha").ok_or_else(invalido)?, "start", "end")? != esperado {
+            return Err(invalido());
+        }
+    }
+    Ok(esperado)
+}
+
+/// Alcance solicitado, independiente del período de observaciones de Meta 4.
+fn alcance_json(fechas: Option<(NaiveDate, NaiveDate)>) -> Value {
+    match fechas {
+        Some((a, b)) => json!({"modo": "rango", "desde": a.to_string(), "hasta": b.to_string()}),
+        None => json!({"modo": "todas_las_fechas"}),
+    }
+}
+
+pub fn leer_alcance_ingresos(v: &Value) -> Result<Option<(NaiveDate, NaiveDate)>, String> {
+    match v["modo"].as_str() {
+        Some("rango") => bitacoras::leer_rango(v, "desde", "hasta").map(Some),
+        Some("todas_las_fechas") if v.get("desde").is_none() && v.get("hasta").is_none() => Ok(None),
+        _ => Err("Alcance de ingresos sin acreditar. Crea un paquete nuevo con el rango explícito.".into()),
+    }
 }
 
 fn carpeta_del_estado(raiz: &Path, estado: &Value, fase: &str) -> Option<PathBuf> {
@@ -307,13 +352,17 @@ fn alcance_guardado(raiz: &Path, estado: &Value) -> Result<LoteBitacoras, String
     if estado["seleccion"].is_object() {
         let s = &estado["seleccion"];
         match (lista(s, "tribunals"), lista(s, "modalities"), lista(s, "tabs")) {
-            (Some(t), Some(m), Some(p)) => return Ok(LoteBitacoras { tribunales: t, modalidades: m, pestanas: p }),
+            (Some(t), Some(m), Some(p)) => return Ok(LoteBitacoras { tribunales: t, modalidades: m, pestanas: p, fechas: leer_alcance_ingresos(&estado["alcance_ingresos"]["solicitado"])? }),
             _ => return Err(SIN_ALCANCE.into()),
         }
     }
     if let Some(carpeta) = carpeta_del_estado(raiz, estado, "bitacoras") {
         if carpeta.join(MANIFIESTO).is_file() {
-            return LoteBitacoras::guardado(&carpeta);
+            let mut alcance = LoteBitacoras::guardado(&carpeta)?;
+            let fechas = leer_alcance_ingresos(&estado["alcance_ingresos"]["solicitado"])?;
+            if alcance.fechas != fechas { return Err(SIN_ALCANCE.into()); }
+            alcance.fechas = fechas;
+            return Ok(alcance);
         }
     }
     Err(SIN_ALCANCE.into())
@@ -327,6 +376,7 @@ fn plan_del_alcance(alcance: &LoteBitacoras, catalogo: &Catalogo, edicion: Edici
         modalidades: alcance.modalidades.clone(),
         informes: vec!["1".into()],
         medidas: vec![TODAS_LAS_MEDIDAS.into()],
+        fechas: alcance.fechas,
         ..Default::default()
     };
     catalogo.planificar(edicion, &lote)
@@ -414,6 +464,40 @@ fn aviso_faltantes(faltantes: &Value, con_nombre: bool) -> Vec<String> {
     avisos
 }
 
+/// Conserva ambos productos anteriores antes de publicar y no borra el temporal si falla la pareja.
+fn publicar_captura(nuevo: &Path, objetivo: &Path, respaldo: &Path) -> Result<(), String> {
+    let diagnostico_nuevo = nuevo.with_extension("diagnostico_cobertura.json");
+    let diagnostico = objetivo.with_extension("diagnostico_cobertura.json");
+    let marca = ahora().format("%Y-%m-%d %H-%M-%S-%6f").to_string();
+    let anterior_zip = respaldo.join(format!("Captura_CSMP anterior {marca}.zip"));
+    let anterior_diag = anterior_zip.with_extension("diagnostico_cobertura.json");
+    let tenia_diag = diagnostico.exists();
+    // Los respaldos son exclusivos, incluso si el reloj repite una marca.
+    for (origen, anterior) in [(objetivo, &anterior_zip), (diagnostico.as_path(), &anterior_diag)] {
+        if origen.exists() {
+            let datos = std::fs::read(origen).map_err(|e| format!("No se pudo conservar el producto anterior: {e}"))?;
+            lote::guardar_exclusivo(anterior, &datos)?;
+        }
+    }
+    if tenia_diag && !diagnostico_nuevo.is_file() {
+        return Err("El nuevo paquete no trae diagnóstico; se conserva la pareja anterior.".into());
+    }
+    if diagnostico_nuevo.is_file() {
+        std::fs::rename(&diagnostico_nuevo, &diagnostico).map_err(|e| format!("No se pudo publicar el diagnóstico: {e}"))?;
+    }
+    if let Err(e) = std::fs::rename(nuevo, objetivo) {
+        // Devuelve el diagnóstico nuevo al temporal y restituye el anterior, si lo había.
+        if diagnostico.is_file() && !diagnostico_nuevo.exists() {
+            std::fs::rename(&diagnostico, &diagnostico_nuevo).map_err(|r| format!("No se pudo publicar el ZIP ({e}) ni recuperar su diagnóstico ({r}). Respaldo conservado."))?;
+        }
+        if tenia_diag {
+            std::fs::copy(&anterior_diag, &diagnostico).map_err(|r| format!("No se pudo publicar el ZIP ({e}) ni restaurar el diagnóstico ({r}). Respaldo conservado."))?;
+        }
+        return Err(format!("No se pudo publicar el paquete: {e}"));
+    }
+    Ok(())
+}
+
 /// Fases del flujo y estado a partir del cual se puede retomar. `ejecutar` crea y ejecuta la carpeta; `retomar`
 /// continúa una cortada.
 #[allow(clippy::too_many_arguments)]
@@ -431,6 +515,9 @@ fn correr(
     emitir: &mut dyn FnMut(Evento),
 ) -> Result<Resultado, String> {
     let retomando = previo.is_some();
+    if plan.fechas != alcance.fechas {
+        return Err("El rango de consultas y bitácoras no coincide.".into());
+    }
     if catalogo.pantalla != Pantalla::Seguimiento
         || plan.consultas.iter().any(|p| p.pantalla != Pantalla::Seguimiento)
     {
@@ -441,6 +528,9 @@ fn correr(
         None => json!({
             "estado": "EN_CURSO", "fase": "consultas", "carpetas": {},
             "seleccion": {"tribunals": alcance.tribunales, "modalities": alcance.modalidades, "tabs": alcance.pestanas},
+            "alcance_ingresos": {"solicitado": alcance_json(plan.fechas), "aplicado": null, "bitacoras_aplicado": null},
+            "consultas_planificadas": plan.consultas.iter().map(|p| lote::seleccion_edicion(p, edicion)).collect::<Vec<_>>(),
+            "compilacion": {"version": env!("CARGO_PKG_VERSION"), "commit": option_env!("GITHUB_SHA")},
         }),
     };
     let respaldo = raiz.join("respaldo");
@@ -448,11 +538,14 @@ fn correr(
     let guardadas = estado.get("opciones").cloned();
     let op = match guardadas {
         Some(v) => Opciones::desde_json(&v)?,
+        None if retomando => return Err(OPCIONES_INVALIDAS.into()),
         None => {
             estado["opciones"] = opciones.a_json();
             opciones.clone()
         }
     };
+    estado["opciones"]["pausa_ms"] = op.a_json()["pausa_ms"].clone();
+    estado["ultima_compilacion"] = json!({"version": env!("CARGO_PKG_VERSION"), "commit": option_env!("GITHUB_SHA")});
     std::fs::create_dir_all(&respaldo)
         .map_err(|e| format!("No se pudo crear la carpeta del paquete: {e}"))?;
     if estado["historial_version"] != 2 {
@@ -475,10 +568,12 @@ fn correr(
     let corrida = (|| -> Result<(Resultado, Value), String> {
         // -- consultas (`BatchRunner.run`)
         fase(&mut estado, &control, "consultas", cancelar, emitir)?;
-        if consultas_validadas(anterior.get("consultas")) {
+        if consultas_validadas(anterior.get("consultas"), plan.fechas) {
             anotar(&mut estado, "consultas reutilizadas del intento anterior");
             emitir(Evento::Estado("Consultas ya validadas en el intento anterior: se reutilizan.".into()));
         } else {
+            estado["alcance_ingresos"]["aplicado"] = Value::Null;
+            estado["alcance_ingresos"]["bitacoras_aplicado"] = Value::Null;
             if let Some(carpetas) = estado["carpetas"].as_object_mut() {
                 carpetas.remove("consultas");
             }
@@ -498,6 +593,11 @@ fn correr(
             registrar_origen(&mut estado, &control, &respaldo, raiz, "consultas", &carpeta, emitir)?;
         }
         let consultas = carpeta_del_estado(raiz, &estado, "consultas").ok_or_else(|| NO_IDENTIFICO.to_string())?;
+        if !consultas_validadas(Some(&consultas), plan.fechas) {
+            return Err("Las consultas no acreditan el rango de ingresos solicitado.".into());
+        }
+        estado["alcance_ingresos"]["aplicado"] = alcance_json(plan.fechas);
+        escribir_control(&control, &estado)?;
         if !consultas.is_dir() {
             return Err(NO_IDENTIFICO.into());
         }
@@ -505,6 +605,8 @@ fn correr(
 
         // -- bitácoras, calendarios, historia e histórico (`DiaryRunner.run`)
         fase(&mut estado, &control, "bitacoras", cancelar, emitir)?;
+        estado["alcance_ingresos"]["bitacoras_aplicado"] = Value::Null;
+        escribir_control(&control, &estado)?;
         let previas = anterior.get("bitacoras").filter(|c| c.join(MANIFIESTO).is_file()).cloned();
         let historia_anterior = previas.as_ref().map(|c| c.join("historia").join("historias.json")).filter(|h| h.is_file());
         let opciones_bit = bitacoras::Opciones {
@@ -536,6 +638,9 @@ fn correr(
             .into_inner()
             .or_else(|| diarios["folder"].as_str().map(PathBuf::from))
             .ok_or_else(|| "El lote de bitácoras no identificó su carpeta; no se creó el paquete.".to_string())?;
+        if diarios["estado"] == "COMPLETA" && diarios["consultas_fallidas"].as_u64() == Some(0) {
+            estado["alcance_ingresos"]["bitacoras_aplicado"] = alcance_json(plan.fechas);
+        }
         registrar_origen(&mut estado, &control, &respaldo, raiz, "bitacoras", &carpeta_bitacoras, emitir)?;
         let n = |k: &str| diarios[k].as_u64().unwrap_or(0);
         let mut resumen_bit = format!(
@@ -631,11 +736,7 @@ fn correr(
             }
         };
         checkpoint(cancelar)?;
-        if objetivo.exists() {
-            let anterior_zip = respaldo.join(format!("Captura_CSMP anterior {}.zip", ahora().format("%Y-%m-%d %H-%M-%S-%6f")));
-            std::fs::copy(&objetivo, &anterior_zip).map_err(|e| format!("No se pudo conservar el paquete anterior: {e}"))?;
-        }
-        std::fs::rename(&nuevo, &objetivo).map_err(|e| format!("No se pudo publicar el paquete: {e}"))?;
+        publicar_captura(&nuevo, &objetivo, &respaldo)?;
         let _ = std::fs::remove_dir_all(&temporal);
         let historico_fallido = op.historico && resultado.historico_incompleto;
         if historico_fallido {
@@ -793,6 +894,9 @@ pub fn ejecutar_por_hoja(
     cancelar: &AtomicBool,
     emitir: &mut dyn FnMut(Evento),
 ) -> Result<Vec<Resultado>, String> {
+    if plan.fechas != alcance.fechas {
+        return Err("El rango de consultas y bitácoras no coincide.".into());
+    }
     let mut resultados = Vec::new();
     let mut fallas: Vec<String> = Vec::new();
     let total = alcance.pestanas.len();
@@ -805,6 +909,7 @@ pub fn ejecutar_por_hoja(
             tribunales: alcance.tribunales.clone(),
             modalidades: alcance.modalidades.clone(),
             pestanas: vec![hoja.clone()],
+            fechas: plan.fechas,
         };
         let mut opciones_hoja = opciones.clone();
         opciones_hoja.informes = opciones.informes && hoja == "Cumplimiento";
@@ -853,7 +958,31 @@ pub fn retomar(
     let raiz = carpeta.canonicalize().map_err(|_| CONTROL_AJENO.to_string())?;
     let mut control = leer_control(&raiz)?;
     let alcance = alcance_guardado(&raiz, &control.datos)?;
-    let plan = plan_del_alcance(&alcance, catalogo, edicion)?;
+    let plan = if let Some(v) = control.datos.get("consultas_planificadas") {
+        let perfiles = v.as_array().filter(|p| !p.is_empty()).ok_or(CONTROL_INVALIDO)?;
+        let mut consultas = Vec::with_capacity(perfiles.len());
+        for p in perfiles {
+            let texto = |k: &str| p[k].as_str().ok_or(CONTROL_INVALIDO);
+            let (tribunal, pestana, modalidad) = (texto("tribunal")?, texto("tab")?, texto("modality")?);
+            if p["screen"] != "seguimiento"
+                || !alcance.tribunales.iter().any(|t| t == tribunal)
+                || !alcance.pestanas.iter().any(|t| t == pestana)
+                || !alcance.modalidades.iter().any(|m| m == modalidad) {
+                return Err(CONTROL_INVALIDO.into());
+            }
+            let seleccion = Seleccion {
+                tribunal: tribunal.into(), pestana: pestana.into(), modalidad: modalidad.into(),
+                reporte: p["report"].as_str().unwrap_or(if pestana == "Cumplimiento" { TODAS_LAS_MEDIDAS } else { "" }).into(),
+                ..Default::default()
+            };
+            let perfil = catalogo.preparar(edicion, &seleccion)?;
+            if consultas.contains(&perfil) { return Err(CONTROL_INVALIDO.into()); }
+            consultas.push(perfil);
+        }
+        PlanLote { consultas, fechas: alcance.fechas }
+    } else {
+        plan_del_alcance(&alcance, catalogo, edicion)?
+    };
     control.datos["estado"] = json!("EN_CURSO");
     let reintentos = control.datos["reintentos"].as_u64().unwrap_or(0) + 1;
     control.datos["reintentos"] = json!(reintentos);
@@ -1240,6 +1369,16 @@ pub(crate) mod pruebas {
         RELOJ.replace_all(&texto, "<FECHA>").replace('\\', "/")
     }
 
+    // El oráculo Python congelado precede a la acreditación de alcance. Solo sus fixtures sintéticos
+    // de reanudación válida se completan con el alcance conocido del guion (sin modificar el oráculo).
+    fn acreditar_fixture(paquete: &Path) {
+        let ruta = paquete.join("respaldo").join(PROCESO);
+        let mut v: Value = serde_json::from_slice(&std::fs::read(&ruta).unwrap()).unwrap();
+        v["alcance_ingresos"] = json!({"solicitado": alcance_json(None), "aplicado": alcance_json(None)});
+        v["opciones"]["pausa_ms"] = json!(1);
+        std::fs::write(ruta, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    }
+
     fn volcado_proceso(carpeta: &Path) -> Value {
         let Ok(crudo) = std::fs::read_to_string(carpeta.join("respaldo").join(PROCESO)) else {
             return json!({"invalido": true});
@@ -1252,13 +1391,15 @@ pub(crate) mod pruebas {
             .as_object()
             .map(|m| m.iter().map(|(k, v)| (k.clone(), normalizar(v.as_str().unwrap_or("")))).collect())
             .unwrap_or_default();
+        let mut opciones = datos["opciones"].clone();
+        if let Some(o) = opciones.as_object_mut() { o.remove("pausa_ms"); }
         json!({
             "estado": datos["estado"], "fase": datos["fase"], "reintentos": datos["reintentos"].as_u64().unwrap_or(0),
             "paquete": normalizar(datos["paquete"].as_str().unwrap_or("")),
             "carpetas": carpetas,
             "historial": datos["historial"].as_array().into_iter().flatten()
                 .map(|h| normalizar(h.as_str().unwrap_or(""))).collect::<Vec<_>>(),
-            "opciones": datos["opciones"],
+            "opciones": opciones,
         })
     }
 
@@ -1344,7 +1485,7 @@ pub(crate) mod pruebas {
             catalogo.clone()
         };
         let alcance = LoteBitacoras {
-            tribunales: vec!["901".into()], modalidades: vec!["2".into()], pestanas: vec!["Cumplimiento".into()],
+            tribunales: vec!["901".into()], modalidades: vec!["2".into()], pestanas: vec!["Cumplimiento".into()], fechas: None,
         };
         let mut eventos: Vec<Evento> = Vec::new();
         let mut emitir = |e: Evento| eventos.push(e);
@@ -1354,6 +1495,7 @@ pub(crate) mod pruebas {
             reconstruir(&entrada, &caso["entrada"]);
             let paquete = std::fs::read_dir(&entrada).unwrap().flatten().map(|e| e.path())
                 .find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(PREFIJO))).unwrap();
+            if matches!(nombre, "retomado" | "bitacora_retomada") { acreditar_fixture(&paquete); }
             retomar(&doble, &ejecucion, Edicion::Integral, &paquete, &op, cancelar.as_ref(), &mut emitir)
         } else {
             let lote = SeleccionLote {
@@ -1457,6 +1599,98 @@ pub(crate) mod pruebas {
         dif
     }
 
+    #[test]
+    fn rango_y_pausa_sobreviven_interrupcion_y_nueva_sesion() {
+        let fechas = Some((NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(), NaiveDate::from_ymd_opt(2026, 11, 26).unwrap()));
+        let catalogo: Catalogo = serde_json::from_value(catalogo_json("seguimiento")).unwrap();
+        let seleccion = SeleccionLote {
+            tribunales: vec!["901".into()], pestanas: vec!["Cumplimiento".into()], modalidades: vec!["2".into()],
+            medidas: vec![TODAS_LAS_MEDIDAS.into()], fechas, ..Default::default()
+        };
+        let plan = catalogo.planificar(Edicion::Integral, &seleccion).unwrap();
+        let alcance = LoteBitacoras { tribunales: seleccion.tribunales, modalidades: seleccion.modalidades, pestanas: seleccion.pestanas, fechas };
+        for (nombre, tras_consultas) in [("antes", false), ("despues", true)] {
+            let base = carpeta(nombre);
+            let cancelar = AtomicBool::new(false);
+            let mut raiz = None;
+            let op = Opciones { pausa: Duration::from_millis(37), ..Default::default() };
+            let primero = ejecutar(&Doble::nuevo(), &catalogo, Edicion::Integral, &plan, &alcance, &base, &op, &cancelar, &mut |e| {
+                match e {
+                    Evento::Carpeta(c) => { raiz = Some(c); if !tras_consultas { cancelar.store(true, Ordering::SeqCst); } }
+                    Evento::Origen { fase, .. } if tras_consultas && fase == "consultas" => cancelar.store(true, Ordering::SeqCst),
+                    _ => {}
+                }
+            });
+            assert!(primero.is_err());
+            let raiz = raiz.unwrap();
+            let ruta = raiz.join("respaldo").join(PROCESO);
+            let antes: Value = paquete::leer_json(&ruta).unwrap();
+            assert_eq!(antes["alcance_ingresos"]["solicitado"], alcance_json(fechas));
+            assert_eq!(antes["opciones"]["pausa_ms"], 37);
+            assert_eq!(Opciones::desde_json(&antes["opciones"]).unwrap().pausa, op.pausa);
+            assert_eq!(antes["compilacion"]["version"], env!("CARGO_PKG_VERSION"));
+            let doble = Doble::nuevo();
+            let resultado = retomar(&doble, &catalogo, Edicion::Integral, &raiz,
+                &Opciones { pausa: Duration::from_secs(9), ..Default::default() }, &AtomicBool::new(false), &mut |_| {}).unwrap();
+            let despues = paquete::leer_json(&ruta).unwrap();
+            assert_eq!(despues["alcance_ingresos"]["aplicado"], alcance_json(fechas));
+            assert_eq!(despues["alcance_ingresos"]["bitacoras_aplicado"], alcance_json(fechas));
+            assert_eq!(despues["opciones"]["pausa_ms"], 37);
+            let resumen = paquete::leer_json(&resultado.consultas.join("resumen.json")).unwrap();
+            assert_eq!(rango_comprobado_lote(&resultado.consultas, &resumen).unwrap(), fechas);
+            let diario = paquete::leer_json(&resultado.manifiesto).unwrap();
+            assert_eq!(diario["seleccion"]["dates"], json!({"start": "01/11/2026", "end": "26/11/2026"}));
+            assert_eq!(doble.pares.borrow().get("FLG_Consulta").map(String::as_str), Some("1"));
+            assert_eq!(doble.pares.borrow().get("FEC_Inicio").map(String::as_str), Some("01/11/2026"));
+            assert_eq!(doble.pares.borrow().get("FEC_Fin").map(String::as_str), Some("26/11/2026"));
+            assert!(resultado.paquete.is_file());
+            assert!(resultado.paquete.with_extension("diagnostico_cobertura.json").is_file());
+            // Una alteración del comprobante debe invalidar la acreditación (no basta el resumen).
+            let comprobante = resultado.consultas.join("verificacion 001.json");
+            let mut v = paquete::leer_json(&comprobante).unwrap();
+            v["filtro_fecha"] = Value::Null;
+            std::fs::write(&comprobante, serde_json::to_vec(&v).unwrap()).unwrap();
+            assert!(rango_comprobado_lote(&resultado.consultas, &resumen).is_err());
+            let _ = std::fs::remove_dir_all(&base);
+        }
+        let mut v = Opciones::default().a_json();
+        v["pausa_ms"] = json!(0);
+        assert!(Opciones::desde_json(&v).is_err());
+        v.as_object_mut().unwrap().remove("pausa_ms");
+        assert_eq!(Opciones::desde_json(&v).unwrap().pausa, Duration::from_secs(1));
+        assert!(leer_alcance_ingresos(&Value::Null).is_err());
+    }
+
+    #[test]
+    fn publicar_reemplazo_conserva_pareja_anterior_y_revierte_si_falla_zip() {
+        let base = carpeta("publicar-pareja");
+        let respaldo = base.join("respaldo");
+        let temporal = respaldo.join("temporal");
+        std::fs::create_dir_all(&temporal).unwrap();
+        let objetivo = base.join(ZIP);
+        let nuevo = temporal.join(ZIP);
+        let diagnostico = objetivo.with_extension("diagnostico_cobertura.json");
+        let diagnostico_nuevo = nuevo.with_extension("diagnostico_cobertura.json");
+        std::fs::write(&objetivo, b"zip anterior").unwrap();
+        std::fs::write(&diagnostico, b"diag anterior").unwrap();
+        std::fs::write(&diagnostico_nuevo, b"diag nuevo").unwrap();
+        assert!(publicar_captura(&nuevo, &objetivo, &respaldo).is_err());
+        assert_eq!(std::fs::read(&objetivo).unwrap(), b"zip anterior");
+        assert_eq!(std::fs::read(&diagnostico).unwrap(), b"diag anterior");
+        assert_eq!(std::fs::read(&diagnostico_nuevo).unwrap(), b"diag nuevo");
+        // Usar carpeta distinta para evitar colisión de marcas en relojes de baja resolución.
+        let respaldo2 = respaldo.join("otra");
+        std::fs::create_dir(&respaldo2).unwrap();
+        std::fs::write(&nuevo, b"zip nuevo").unwrap();
+        publicar_captura(&nuevo, &objetivo, &respaldo2).unwrap();
+        assert_eq!(std::fs::read(&objetivo).unwrap(), b"zip nuevo");
+        assert_eq!(std::fs::read(&diagnostico).unwrap(), b"diag nuevo");
+        let anteriores: Vec<_> = std::fs::read_dir(&respaldo2).unwrap().map(|e| std::fs::read(e.unwrap().path()).unwrap()).collect();
+        assert!(anteriores.iter().any(|a| a.as_slice() == b"zip anterior"));
+        assert!(anteriores.iter().any(|a| a.as_slice() == b"diag anterior"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// E-Q9 · El flujo completo de Rust contra `flujo_paquete.run`/`retomar` de Python sobre el mismo mundo sintético.
     #[test]
     fn flujo_paquete_igual_a_python() {
@@ -1520,7 +1754,7 @@ pub(crate) mod pruebas {
         };
         let plan = catalogo.planificar(Edicion::Integral, &lote).unwrap();
         let alcance = LoteBitacoras {
-            tribunales: vec!["901".into()], modalidades: vec!["2".into()], pestanas: hojas.clone(),
+            tribunales: vec!["901".into()], modalidades: vec!["2".into()], pestanas: hojas.clone(), fechas: None,
         };
         let destino = base.join("destino");
         std::fs::create_dir_all(&destino).unwrap();
@@ -1574,6 +1808,7 @@ pub(crate) mod pruebas {
                 .unwrap();
             let doble = Doble::nuevo();
             let (mut eventos, cancelar) = (Vec::new(), AtomicBool::new(false));
+            acreditar_fixture(&paquete);
             let retomado = retomar(
                 &doble, &catalogo, Edicion::Integral, &paquete,
                 &Opciones { pausa: Duration::ZERO, ..Default::default() }, &cancelar, &mut |e| eventos.push(e),
@@ -1625,7 +1860,7 @@ pub(crate) mod pruebas {
         };
         let plan = catalogo.planificar(Edicion::Integral, &lote).unwrap();
         let alcance = LoteBitacoras {
-            tribunales: vec!["901".into()], modalidades: vec!["2".into()], pestanas: vec!["Cumplimiento".into()],
+            tribunales: vec!["901".into()], modalidades: vec!["2".into()], pestanas: vec!["Cumplimiento".into()], fechas: None,
         };
         let base = carpeta("una-hoja-igual-a-run");
         let opciones = Opciones { pausa: Duration::ZERO, ..Default::default() };
@@ -1656,6 +1891,7 @@ pub(crate) mod pruebas {
             let paquete = std::fs::read_dir(&entrada).unwrap().flatten().map(|e| e.path())
                 .find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(PREFIJO)))
                 .unwrap();
+            acreditar_fixture(&paquete);
             let control = paquete.join("respaldo").join(PROCESO);
             let mut proceso: Value = serde_json::from_slice(&std::fs::read(&control).unwrap()).unwrap();
             for (_, valor) in proceso["carpetas"].as_object_mut().unwrap().iter_mut() {
@@ -1702,7 +1938,7 @@ mod pruebas_flujo {
         };
         let plan = catalogo.planificar(Edicion::Integral, &lote).unwrap();
         let alcance = LoteBitacoras {
-            tribunales: vec!["901".into()], modalidades: vec!["2".into()], pestanas: vec!["Cumplimiento".into()],
+            tribunales: vec!["901".into()], modalidades: vec!["2".into()], pestanas: vec!["Cumplimiento".into()], fechas: None,
         };
         let doble = super::pruebas::Doble::nuevo();
         let mut eventos = Vec::new();
@@ -1719,6 +1955,7 @@ mod pruebas_flujo {
         assert!(paquete.file_name().unwrap().to_string_lossy().starts_with(PREFIJO));
         assert!(paquete.join("respaldo").is_dir());
         assert!(paquete.join(ZIP).is_file());
+        assert!(paquete.join(ZIP).with_extension("diagnostico_cobertura.json").is_file());
         assert_eq!(paquete.join(ZIP), resultado.paquete);
         assert!(!resultado.parcial);
         let proceso: Value = serde_json::from_slice(&std::fs::read(paquete.join("respaldo").join(PROCESO)).unwrap()).unwrap();
