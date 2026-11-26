@@ -62,6 +62,9 @@ fn contrato_instalador_por_usuario_y_actualizaciones() {
 
     assert!(desinstalar.contains("Flow.lnk"));
     assert!(desinstalar.contains("flowDataDir"));
+    assert!(desinstalar.contains(".flow_rust_manifest.json"));
+    assert!(!desinstalar.contains("Remove-Item -LiteralPath $destFull -Recurse"));
+    assert!(cmd.contains(r#"-SourceDir "%~dp0.""#));
     assert!(!desinstalar.contains("actualizaciones\" -Recurse"));
     assert!(cmd.contains("DisableDelayedExpansion"));
     assert!(cmd.contains("-RequireSha256"));
@@ -202,6 +205,8 @@ fn instalador_instala_reinstala_y_desinstala_preservando_actualizaciones() {
     assert_eq!(std::fs::read(aplicadas.join("v0.txt")).unwrap(), b"v0");
     assert_eq!(std::fs::read(&ext).unwrap(), b"{\"version\":\"1.0\"}");
 
+    let testigo = destino.join("archivo_ajeno.txt");
+    std::fs::write(&testigo, b"testigo").unwrap();
     let script_desinstalar = destino.join("Desinstalar_Flow.ps1");
     let salida_uninst = std::process::Command::new("powershell.exe")
         .args([
@@ -225,7 +230,9 @@ fn instalador_instala_reinstala_y_desinstala_preservando_actualizaciones() {
         String::from_utf8_lossy(&salida_uninst.stdout),
         String::from_utf8_lossy(&salida_uninst.stderr)
     );
-    assert!(!destino.exists(), "la carpeta del programa debe eliminarse");
+    assert_eq!(std::fs::read(&testigo).unwrap(), b"testigo");
+    assert!(!destino.join("flow_rust.exe").exists());
+    assert!(!destino.join(".flow_rust_manifest.json").exists());
     assert!(!menu.join("Flow.lnk").exists(), "Flow.lnk debe eliminarse");
     assert_eq!(std::fs::read(&pendiente).unwrap(), b"MZpendiente");
     assert_eq!(std::fs::read(aplicadas.join("v0.txt")).unwrap(), b"v0");

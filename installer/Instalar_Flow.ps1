@@ -46,20 +46,15 @@ function Get-Sha256Hex {
 function Read-ExpectedSha256 {
     param([Parameter(Mandatory = $true)][string]$ShaPath)
     $lines = Get-Content -LiteralPath $ShaPath -Encoding UTF8
-    $fallback = $null
+    $expected = $null
     foreach ($line in $lines) {
-        if ($line -match '^\s*([0-9a-fA-F]{64})\b(.*)$') {
+        if ($line -match '^\s*([0-9a-fA-F]{64})(?:\s+\*?flow_rust\.exe(?:\s+\(debug\))?)?\s*$') {
             $hash = $Matches[1].ToLowerInvariant()
-            $rest = $Matches[2]
-            if ($rest -match 'flow_rust\.exe') {
-                return $hash
-            }
-            if (-not $fallback) {
-                $fallback = $hash
-            }
+            if ($expected -and $expected -ne $hash) { throw 'SHA256.txt contiene huellas contradictorias.' }
+            $expected = $hash
         }
     }
-    if ($fallback) { return $fallback }
+    if ($expected) { return $expected }
     throw "SHA256.txt no contiene una huella SHA-256 valida: $ShaPath"
 }
 
@@ -73,9 +68,17 @@ function New-ShortcutFile {
     if ($parent) {
         New-Item -ItemType Directory -Force -Path $parent | Out-Null
     }
+    if ((Test-Path -LiteralPath $ShortcutPath) -and ((Get-Item -LiteralPath $ShortcutPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        Write-Warning "Se conserva un enlace ajeno: $ShortcutPath"
+        return
+    }
     $wsh = New-Object -ComObject WScript.Shell
     try {
         $lnk = $wsh.CreateShortcut($ShortcutPath)
+        if ((Test-Path -LiteralPath $ShortcutPath) -and $lnk.TargetPath -ne $TargetPath) {
+            Write-Warning "Se conserva un acceso directo ajeno: $ShortcutPath"
+            return
+        }
         $lnk.TargetPath = $TargetPath
         $lnk.WorkingDirectory = $WorkingDirectory
         $lnk.IconLocation = "$TargetPath,0"
@@ -87,7 +90,7 @@ function New-ShortcutFile {
 }
 
 $sourceFull = [IO.Path]::GetFullPath($SourceDir)
-$destFull = [IO.Path]::GetFullPath($Destination)
+$destFull = [IO.Path]::GetFullPath($Destination).TrimEnd('\', '/')
 $dataFull = [IO.Path]::GetFullPath($DataBaseDir)
 $exeSource = Join-Path $sourceFull 'flow_rust.exe'
 $shaSource = Join-Path $sourceFull 'SHA256.txt'
@@ -100,9 +103,16 @@ if (-not (Test-MzHeader -Path $exeSource)) {
     throw "El archivo flow_rust.exe no es un ejecutable Windows valido."
 }
 
+if ($RequireSha256 -and $SinHuella) {
+    throw '-RequireSha256 es incompatible con -SinHuella.'
+}
+if (-not (Test-Path -LiteralPath $uninstallScriptSource -PathType Leaf)) {
+    throw 'Falta Desinstalar_Flow.ps1 junto al instalador.'
+}
+
 $actualHash = Get-Sha256Hex -Path $exeSource
 $hasShaFile = Test-Path -LiteralPath $shaSource -PathType Leaf
-if (-not $SinHuella -and -not $hasShaFile) {
+if (($RequireSha256 -or -not $SinHuella) -and -not $hasShaFile) {
     throw "Falta SHA256.txt junto a flow_rust.exe en: $sourceFull"
 }
 if ($hasShaFile) {
@@ -125,21 +135,124 @@ if ($running) {
     throw "Cierra Flow Rust antes de instalar o actualizar en: $destFull"
 }
 
+# No instalar a traves de enlaces/junctions ni sobre carpetas de datos.
+$protected = @($env:USERPROFILE, $env:LOCALAPPDATA, $env:APPDATA,
+    (Join-Path $env:LOCALAPPDATA 'FlowRust'), (Join-Path $env:APPDATA 'FlowRust'),
+    ([Environment]::GetFolderPath('Desktop')), ([Environment]::GetFolderPath('MyDocuments')),
+    (Join-Path $env:USERPROFILE 'Downloads'), $dataFull)
+$knownFolders = Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -ErrorAction SilentlyContinue
+$downloads = $knownFolders.'{374DE290-123F-4565-9164-39C4925E467B}'
+if ($downloads) { $protected += [Environment]::ExpandEnvironmentVariables($downloads) }
+$protected += @((Join-Path $env:USERPROFILE 'Desktop'), (Join-Path $env:USERPROFILE 'Documents'))
+foreach ($dir in $protected) {
+    if ($dir -and $destFull -eq [IO.Path]::GetFullPath($dir).TrimEnd('\', '/')) {
+        throw "Ruta de instalacion rechazada por seguridad: $destFull"
+    }
+}
+foreach ($dataDir in @((Join-Path $env:LOCALAPPDATA 'FlowRust'), (Join-Path $env:APPDATA 'FlowRust'))) {
+    $dataPrefix = [IO.Path]::GetFullPath($dataDir).TrimEnd('\', '/') + '\'
+    if ($destFull.StartsWith($dataPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Ruta dentro de los datos de Flow rechazada: $destFull"
+    }
+}
+for ($dir = $destFull; $dir; $dir = Split-Path -Parent $dir) {
+    if ((Test-Path -LiteralPath $dir) -and ((Get-Item -LiteralPath $dir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Ruta de instalacion con enlace o junction: $dir"
+    }
+    if ($dir -eq (Split-Path -Parent $dir)) { break }
+}
+if ($destFull.Length -lt 10) { throw 'Ruta de instalacion demasiado corta.' }
+
+if (-not $SkipRegistry -and $UninstallRegistryKey) {
+    if (Test-Path -LiteralPath $UninstallRegistryKey) {
+        $existing = Get-ItemProperty -LiteralPath $UninstallRegistryKey
+        if ($existing.DisplayName -ne 'Flow Rust' -or $existing.InstallLocation -ne $destFull) {
+            throw 'La clave de desinstalacion pertenece a otra instalacion; no se modifico.'
+        }
+    }
+}
+
 # Instalar por usuario sin requerir administrador y respetando %LOCALAPPDATA%\FlowRust\actualizaciones.
 New-Item -ItemType Directory -Force -Path $destFull | Out-Null
 $updatesDir = Join-Path $dataFull 'actualizaciones'
 New-Item -ItemType Directory -Force -Path $updatesDir | Out-Null
 
 $exeDest = Join-Path $destFull 'flow_rust.exe'
-Copy-Item -LiteralPath $exeSource -Destination $exeDest -Force
-
-if ($hasShaFile) {
-    Copy-Item -LiteralPath $shaSource -Destination (Join-Path $destFull 'SHA256.txt') -Force
-}
-
 $uninstallDest = Join-Path $destFull 'Desinstalar_Flow.ps1'
-if (Test-Path -LiteralPath $uninstallScriptSource -PathType Leaf) {
-    Copy-Item -LiteralPath $uninstallScriptSource -Destination $uninstallDest -Force
+$manifestPath = Join-Path $destFull '.flow_rust_manifest.json'
+$allowed = @('flow_rust.exe', 'SHA256.txt', 'Desinstalar_Flow.ps1', 'LEEME.txt')
+$owned = @()
+if (Test-Path -LiteralPath $manifestPath) {
+    $item = Get-Item -LiteralPath $manifestPath -Force
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Manifiesto inseguro.' }
+    $old = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($old.schema -ne 'FlowRustOwnership/1' -or $old.destination -ne $destFull -or
+        -not ($old.files -is [array]) -or $old.files -notcontains 'flow_rust.exe' -or $old.files -notcontains 'Desinstalar_Flow.ps1') {
+        throw 'Manifiesto de propiedad invalido.'
+    }
+    foreach ($name in $old.files) {
+        if ($name -isnot [string] -or $allowed -cnotcontains $name -or $owned -contains $name) { throw 'Manifiesto de propiedad invalido.' }
+        $owned += $name
+    }
+}
+$sources = [ordered]@{'flow_rust.exe' = $exeSource; 'Desinstalar_Flow.ps1' = $uninstallScriptSource}
+if ($hasShaFile) { $sources['SHA256.txt'] = $shaSource }
+$readme = Join-Path $sourceFull 'LEEME.txt'
+if (Test-Path -LiteralPath $readme -PathType Leaf) { $sources['LEEME.txt'] = $readme }
+foreach ($name in $allowed) {
+    $path = Join-Path $destFull $name
+    if (Test-Path -LiteralPath $path) {
+        $item = Get-Item -LiteralPath $path -Force
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Archivo de destino inseguro: $path" }
+        if ($sources.Contains($name) -and $owned -notcontains $name) { throw "Archivo preexistente sin propiedad Flow: $path" }
+    }
+}
+# Preparar y verificar todos los archivos antes de reemplazar el primero.
+$staged = [ordered]@{}
+try {
+    foreach ($name in $sources.Keys) {
+        $target = Join-Path $destFull $name
+        $tmp = "$target.$([guid]::NewGuid().ToString('N')).tmp"
+        [IO.File]::Copy($sources[$name], $tmp, $false)
+        $staged[$name] = $tmp
+        if ($name -eq 'flow_rust.exe' -and (Get-Sha256Hex -Path $tmp) -ne $actualHash) {
+            throw 'La huella SHA-256 de la copia no coincide.'
+        }
+        if ($name -eq 'SHA256.txt' -and (Read-ExpectedSha256 -ShaPath $tmp) -ne $actualHash) {
+            throw 'La huella SHA-256 copiada no corresponde al ejecutable.'
+        }
+    }
+    foreach ($name in $staged.Keys) {
+        $target = Join-Path $destFull $name
+        $tmp = $staged[$name]
+        if ([IO.File]::Exists($target)) {
+            if ($owned -notcontains $name) { throw "Archivo preexistente sin propiedad Flow: $target" }
+            [IO.File]::Replace($tmp, $target, [NullString]::Value)
+        } else { [IO.File]::Move($tmp, $target) }
+    }
+} finally {
+    foreach ($tmp in $staged.Values) {
+        if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) }
+    }
+}
+# Una instalacion sin huella no debe conservar la huella de la version anterior.
+if (-not $hasShaFile -and $owned -contains 'SHA256.txt') {
+    [IO.File]::Delete((Join-Path $destFull 'SHA256.txt'))
+    $owned = @($owned | Where-Object { $_ -ne 'SHA256.txt' })
+}
+$owned = @(@($owned) + @($sources.Keys) | Sort-Object -Unique | Where-Object { Test-Path -LiteralPath (Join-Path $destFull $_) -PathType Leaf })
+$manifestTmp = "$manifestPath.$([guid]::NewGuid().ToString('N')).tmp"
+try {
+    $manifest = @{ schema = 'FlowRustOwnership/1'; destination = $destFull; files = $owned } | ConvertTo-Json -Depth 4
+    $stream = [IO.File]::Open($manifestTmp, [IO.FileMode]::CreateNew)
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($manifest)
+        $stream.Write($bytes, 0, $bytes.Length)
+    } finally { $stream.Dispose() }
+    if ([IO.File]::Exists($manifestPath)) { [IO.File]::Replace($manifestTmp, $manifestPath, [NullString]::Value) }
+    else { [IO.File]::Move($manifestTmp, $manifestPath) }
+} finally {
+    if ([IO.File]::Exists($manifestTmp)) { [IO.File]::Delete($manifestTmp) }
 }
 
 $startMenuShortcut = $null
@@ -156,16 +269,11 @@ if ($CreateDesktopShortcut -and $DesktopDir) {
 
 if (-not $SkipRegistry -and $UninstallRegistryKey) {
     New-Item -Path $UninstallRegistryKey -Force | Out-Null
-    $uninstCmd = if (Test-Path -LiteralPath $uninstallDest -PathType Leaf) {
-        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$uninstallDest`" -Destination `"$destFull`""
-    } else {
-        "powershell.exe -NoProfile -Command `"Remove-Item -LiteralPath '$destFull' -Recurse -Force`""
-    }
-    $quietCmd = if (Test-Path -LiteralPath $uninstallDest -PathType Leaf) {
-        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$uninstallDest`" -Destination `"$destFull`" -Silent"
-    } else {
-        $uninstCmd
-    }
+    # Comando PowerShell con literales escapados, sin alternativa de borrado recursivo.
+    $quotedDest = $destFull.Replace("'", "''")
+    $quotedScript = $uninstallDest.Replace("'", "''")
+    $uninstCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command `"& '$quotedScript' -Destination '$quotedDest'`""
+    $quietCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command `"& '$quotedScript' -Destination '$quotedDest' -Silent`""
     New-ItemProperty -Path $UninstallRegistryKey -Name 'DisplayName' -Value 'Flow Rust' -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $UninstallRegistryKey -Name 'DisplayVersion' -Value $Version -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $UninstallRegistryKey -Name 'Publisher' -Value 'NuRus' -PropertyType String -Force | Out-Null

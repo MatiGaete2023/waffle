@@ -178,6 +178,65 @@
    "severity",
    "message",
    "recoverable"
+  ],
+  "escritos": [
+   "capture_id",
+   "query_id",
+   "source_system",
+   "court_code",
+   "court_name",
+   "rit_original",
+   "cause_id",
+   "ingreso_id",
+   "person_id",
+   "program_id",
+   "modality_raw",
+   "modality_code",
+   "tab",
+   "captured_at",
+   "original_file",
+   "original_sheet",
+   "original_row",
+   "source_sha256",
+   "coverage",
+   "escrito_id",
+   "scope",
+   "doc",
+   "escrito_type",
+   "requester",
+   "escrito_status",
+   "reference",
+   "linked_ingreso_id",
+   "linked_projection",
+   "identity_status",
+   "raw_json"
+  ],
+  "historico_proteccion": [
+   "capture_id",
+   "query_id",
+   "source_system",
+   "court_code",
+   "court_name",
+   "rit_original",
+   "cause_id",
+   "ingreso_id",
+   "person_id",
+   "program_id",
+   "modality_raw",
+   "modality_code",
+   "tab",
+   "captured_at",
+   "original_file",
+   "original_sheet",
+   "original_row",
+   "source_sha256",
+   "coverage",
+   "historico_id",
+   "program_name",
+   "egreso_date",
+   "egreso_cause",
+   "ownership",
+   "raw_json"
   ]
  },
  "control": [
@@ -209,7 +268,8 @@
   "status",
   "tab",
   "time_precision",
-  "time_zone"
+  "time_zone",
+  "ownership"
  ],
  "libre": [
   "description",
@@ -217,7 +277,11 @@
   "message",
   "reference",
   "response",
-  "text"
+  "text",
+  "escrito_type",
+  "escrito_status",
+  "program_name",
+  "egreso_cause"
  ],
  "tiempo": [
   "captured_at",
@@ -235,5 +299,15 @@
   "tab",
   "tribunal",
   "tribunal_nombre"
+ ],
+ "identidad": [
+  "requester"
+ ],
+ "token": [
+  "doc"
+ ],
+ "tiempo_literal": [
+  "egreso_date",
+  "linked_projection"
  ]
 }

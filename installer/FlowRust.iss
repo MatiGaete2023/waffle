@@ -38,6 +38,7 @@ Name: "{localappdata}\FlowRust\actualizaciones"; Flags: uninsneveruninstall
 [Files]
 Source: "{#SourceDir}\flow_rust.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\SHA256.txt"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#SourceDir}\LEEME.txt"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 [Icons]
 Name: "{autoprograms}\Flow"; Filename: "{app}\flow_rust.exe"
 Name: "{autodesktop}\Flow"; Filename: "{app}\flow_rust.exe"; Tasks: desktopicon

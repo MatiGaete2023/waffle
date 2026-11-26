@@ -1,6 +1,6 @@
 //! Anonimizador local: copias con identidades ficticias. Nunca escribe sobre el original ni usa la red.
 //! Delega en `flow-anonimo`: tablas (.xlsx, .xls, HTML/XML de SITFA, .csv), texto, calendario, Word, ZIP y paquetes de
-//! captura. Cada copia se verifica antes de publicarse.
+//! captura CSMP_CAPTURE 1.0.0, 1.1.0 y 1.2.0. Cada copia se verifica antes de publicarse.
 
 use std::path::{Path, PathBuf};
 
@@ -115,6 +115,24 @@ mod tests {
         for (p, antes) in [&txt, &zip, &paquete].iter().zip(originales) {
             assert_eq!(std::fs::read(p).unwrap(), antes, "el original no debe cambiar");
         }
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn captura_v12_se_publica_sin_cambiar_version() {
+        let d = carpeta("v12");
+        let paquete = d.join("captura.zip");
+        let original = include_bytes!("../../rust/crates/flow-trabajo/tests/datos/paquete_rust_historico.zip");
+        std::fs::write(&paquete, original).unwrap();
+        let inf = ejecutar(std::slice::from_ref(&paquete), &d.join("salida"), &Opciones::default());
+        assert!(inf.errores.is_empty(), "{:?}", inf.errores);
+        assert_eq!(inf.creados.len(), 1);
+        let datos = std::fs::read(&inf.creados[0]).unwrap();
+        let miembros = flow_anonimo::formatos::validar_zip(&datos).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&miembros.iter().find(|(n, _)| n == "manifest.json").unwrap().1).unwrap();
+        assert_eq!(manifest["schema_version"], "1.2.0");
+        assert!(miembros.iter().any(|(n, _)| n == "data/historico_proteccion.csv"));
+        assert_eq!(std::fs::read(&paquete).unwrap().as_slice(), original.as_slice());
         let _ = std::fs::remove_dir_all(d);
     }
 

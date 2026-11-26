@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Instalar_Flow.ps1" -SourceDir "%~dp0" -RequireSha256
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Instalar_Flow.ps1" -SourceDir "%~dp0." -RequireSha256 %*
 set "FLOW_INST_ERR=%errorlevel%"
 if not "%FLOW_INST_ERR%"=="0" (
   echo.
@@ -11,3 +11,4 @@ if not "%FLOW_INST_ERR%"=="0" (
 echo.
 echo Instalacion completada. Puedes abrir "Flow" desde el menu Inicio.
 pause
+exit /b 0

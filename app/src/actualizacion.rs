@@ -6,7 +6,10 @@
 //! carpetas y la extensión solo cambia cuando cambia su propio código. Nada se descarga: el archivo lo deja la persona.
 
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::{io::{self, Read}, path::{Path, PathBuf}};
+
+const MAX_EXE: u64 = 256 * 1024 * 1024;
+const MAX_SHA: u64 = 64 * 1024;
 
 pub const NOMBRE: &str = "flow_rust.exe";
 
@@ -30,17 +33,54 @@ pub fn carpeta() -> PathBuf {
 }
 
 pub fn huella(ruta: &Path) -> Result<String, String> {
-    let bytes = std::fs::read(ruta).map_err(|e| format!("No se pudo leer {}: {e}", ruta.display()))?;
-    Ok(crate::trabajo::hex(&Sha256::digest(bytes)))
+    huella_archivo(ruta, false)
+}
+
+fn huella_archivo(ruta: &Path, mz: bool) -> Result<String, String> {
+    let mut f = std::fs::File::open(ruta).map_err(|e| format!("No se pudo leer {}: {e}", ruta.display()))?;
+    let mut sha = Sha256::new();
+    let prefijo = if mz {
+        let mut bytes = [0; 2];
+        if f.read_exact(&mut bytes).is_err() || &bytes != b"MZ" {
+            return Err(format!("{NOMBRE} no parece un ejecutable de Windows; vuelve a copiarlo desde la entrega de la CI."));
+        }
+        sha.update(bytes);
+        2
+    } else { 0 };
+    let n = io::copy(&mut f.take(MAX_EXE - prefijo + 1), &mut sha)
+        .map_err(|e| format!("No se pudo calcular la huella: {e}"))?;
+    if n + prefijo > MAX_EXE {
+        return Err("El ejecutable supera el límite de 256 MiB.".into());
+    }
+    Ok(crate::trabajo::hex(&sha.finalize()))
 }
 
 /// `SHA256.txt` de la CI: «<huella>  flow_rust.exe (…)» y una línea «commit <sha>».
-fn declarada(carpeta: &Path) -> (Option<String>, String) {
-    let Ok(texto) = std::fs::read_to_string(carpeta.join("SHA256.txt")) else { return (None, String::new()) };
-    let primera = texto.lines().next().and_then(|l| l.split_whitespace().next()).map(str::to_lowercase);
-    let huella = primera.filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()));
+fn declarada_archivo(ruta: &Path) -> (Option<String>, String) {
+    let mut texto = String::new();
+    let Ok(f) = std::fs::File::open(ruta) else { return (None, String::new()) };
+    if f.take(MAX_SHA + 1).read_to_string(&mut texto).is_err() || texto.len() as u64 > MAX_SHA {
+        return (None, String::new());
+    }
+    let mut huella: Option<String> = None;
+    for linea in texto.trim_start_matches('\u{feff}').lines() {
+        let mut partes = linea.split_whitespace();
+        let Some(h) = partes.next() else { continue };
+        if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) { continue; }
+        let resto = partes.collect::<Vec<_>>().join(" ");
+        if !resto.is_empty() && !matches!(resto.trim_start_matches('*'), "flow_rust.exe" | "flow_rust.exe (debug)") {
+            continue;
+        }
+        let h = h.to_lowercase();
+        if huella.as_ref().is_some_and(|previa| previa != &h) { return (None, String::new()); }
+        huella = Some(h);
+    }
     let commit = texto.lines().find_map(|l| l.strip_prefix("commit ")).map(|c| c.trim().to_string()).unwrap_or_default();
     (huella, commit)
+}
+
+fn declarada(carpeta: &Path) -> (Option<String>, String) {
+    declarada_archivo(&carpeta.join("SHA256.txt"))
 }
 
 /// La versión nueva que espera en `carpeta`, si la hay y difiere del programa que corre (`actual`).
@@ -49,17 +89,13 @@ pub fn buscar(carpeta: &Path, actual: &Path) -> Result<Option<Pendiente>, String
     if !nuevo.is_file() {
         return Ok(None);
     }
-    let bytes = std::fs::read(&nuevo).map_err(|e| format!("No se pudo leer la actualización: {e}"))?;
-    if !bytes.starts_with(b"MZ") {
-        return Err(format!("{NOMBRE} no parece un ejecutable de Windows; vuelve a copiarlo desde la entrega de la CI."));
+    let h = huella_archivo(&nuevo, true)?;
+    let (esperada, commit) = declarada(carpeta);
+    if esperada.as_deref() != Some(h.as_str()) {
+        return Err("Falta SHA256.txt válido o la huella de la actualización no coincide: no se aplicó.".into());
     }
-    let h = crate::trabajo::hex(&Sha256::digest(&bytes));
     if huella(actual).is_ok_and(|a| a == h) {
         return Ok(None);
-    }
-    let (esperada, commit) = declarada(carpeta);
-    if esperada.is_some_and(|e| e != h) {
-        return Err("La huella de la actualización no coincide con SHA256.txt: el archivo está incompleto o cambió. No se aplicó.".into());
     }
     Ok(Some(Pendiente { ruta: nuevo, huella: h, commit }))
 }
@@ -68,7 +104,7 @@ pub fn buscar(carpeta: &Path, actual: &Path) -> Result<Option<Pendiente>, String
 /// y se puede abrir para lectura.
 #[cfg(windows)]
 fn archivo_disponible_localmente(ruta: &Path) -> bool {
-    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     if let Ok(meta) = std::fs::metadata(ruta) {
         let attrs = meta.file_attributes();
         // FILE_ATTRIBUTE_OFFLINE (0x1000)
@@ -78,7 +114,7 @@ fn archivo_disponible_localmente(ruta: &Path) -> bool {
             return false;
         }
     }
-    std::fs::File::open(ruta).is_ok()
+    std::fs::OpenOptions::new().read(true).share_mode(0).open(ruta).is_ok()
 }
 
 #[cfg(not(windows))]
@@ -111,33 +147,93 @@ fn copiar_de_adicional_a_fija(
     std::fs::create_dir_all(fija)
         .map_err(|e| format!("No se pudo crear la carpeta fija de actualizaciones {}: {e}", fija.display()))?;
 
-    let tmp_exe = fija.join("flow_rust.exe.tmp");
-    let tmp_sha = fija.join("SHA256.txt.tmp");
-    let _ = std::fs::remove_file(&tmp_exe);
-    let _ = std::fs::remove_file(&tmp_sha);
-
-    let limpiar = |e: String| {
-        let _ = std::fs::remove_file(&tmp_exe);
-        let _ = std::fs::remove_file(&tmp_sha);
-        e
-    };
-
-    std::fs::copy(exe_origen, &tmp_exe)
-        .map_err(|e| limpiar(format!("No se pudo copiar el ejecutable a {}: {e}", fija.display())))?;
-
-    let h_copia = huella(&tmp_exe).map_err(|e| limpiar(format!("No se pudo verificar la copia: {e}")))?;
-    if h_copia != huella_esperada {
-        return Err(limpiar(AVISO_SINCRONIZANDO.into()));
+    // Directorio exclusivo en el mismo volumen; no borrar temporales de otros procesos.
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce).map_err(|e| format!("No se pudo generar un temporal: {e}"))?;
+    let transaccion = fija.join(format!(".flow-actualizacion-{}", crate::trabajo::hex(&nonce)));
+    std::fs::create_dir(&transaccion).map_err(|e| format!("No se pudo crear el temporal: {e}"))?;
+    let tmp_exe = transaccion.join("nuevo.exe");
+    let tmp_sha = transaccion.join("nuevo.sha");
+    let copia = (|| -> Result<(), String> {
+        copiar_limitado(exe_origen, &tmp_exe, MAX_EXE)?;
+        if huella_archivo(&tmp_exe, true)? != huella_esperada {
+            return Err(AVISO_SINCRONIZANDO.into());
+        }
+        copiar_limitado(sha_origen, &tmp_sha, MAX_SHA)?;
+        if declarada_archivo(&tmp_sha).0.as_deref() != Some(huella_esperada) {
+            return Err(AVISO_SINCRONIZANDO.into());
+        }
+        publicar_pareja(fija, &transaccion, |a, b| std::fs::rename(a, b))
+    })();
+    // Si la restauración falla, conservar respaldos y su ubicación para recuperación manual.
+    for p in [&tmp_exe, &tmp_sha] {
+        let _ = std::fs::remove_file(p);
     }
+    let _ = std::fs::remove_dir(&transaccion);
+    copia
+}
 
-    std::fs::copy(sha_origen, &tmp_sha)
-        .map_err(|e| limpiar(format!("No se pudo copiar SHA256.txt a {}: {e}", fija.display())))?;
+fn copiar_limitado(origen: &Path, destino: &Path, max: u64) -> Result<(), String> {
+    let f = std::fs::File::open(origen).map_err(|e| format!("No se pudo abrir {}: {e}", origen.display()))?;
+    let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(destino)
+        .map_err(|e| format!("No se pudo crear {}: {e}", destino.display()))?;
+    let n = io::copy(&mut f.take(max + 1), &mut out).map_err(|e| format!("No se pudo copiar: {e}"))?;
+    if n > max { return Err("La actualización excede el límite de tamaño.".into()); }
+    out.sync_all().map_err(|e| format!("No se pudo guardar la copia: {e}"))
+}
 
-    std::fs::rename(&tmp_exe, fija.join(NOMBRE))
-        .map_err(|e| limpiar(format!("No se pudo mover el ejecutable en {}: {e}", fija.display())))?;
-    std::fs::rename(&tmp_sha, fija.join("SHA256.txt"))
-        .map_err(|e| limpiar(format!("No se pudo mover SHA256.txt en {}: {e}", fija.display())))?;
-
+// Separa respaldo y publicación para poder inyectar fallos de renombrado en pruebas.
+fn publicar_pareja(
+    fija: &Path,
+    transaccion: &Path,
+    mut mover: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> Result<(), String> {
+    let destinos = [fija.join(NOMBRE), fija.join("SHA256.txt")];
+    let respaldos = [transaccion.join("previo.exe"), transaccion.join("previo.sha")];
+    let nuevos = [transaccion.join("nuevo.exe"), transaccion.join("nuevo.sha")];
+    let mut respaldado = [false; 2];
+    let mut publicado = [false; 2];
+    let operacion = (|| -> io::Result<()> {
+        // Retirar primero la huella: nunca ofrecer una pareja parcialmente publicada.
+        for i in [1, 0] {
+            match std::fs::symlink_metadata(&destinos[i]) {
+                Ok(m) if m.file_type().is_file() => {
+                    mover(&destinos[i], &respaldos[i])?;
+                    respaldado[i] = true;
+                }
+                Ok(_) => return Err(io::Error::other("Destino de actualización no es un archivo regular")),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {},
+                Err(e) => return Err(e),
+            }
+        }
+        for i in [0, 1] {
+            mover(&nuevos[i], &destinos[i])?;
+            publicado[i] = true;
+        }
+        Ok(())
+    })();
+    if let Err(e) = operacion {
+        let mut fallos = Vec::new();
+        for i in [1, 0] {
+            if publicado[i] {
+                if let Err(e) = mover(&destinos[i], &nuevos[i]) { fallos.push(e.to_string()); }
+            }
+        }
+        for i in [0, 1] {
+            if respaldado[i] {
+                if destinos[i].exists() {
+                    fallos.push(format!("Destino ocupado: {}", destinos[i].display()));
+                } else if let Err(e) = mover(&respaldos[i], &destinos[i]) { fallos.push(e.to_string()); }
+            }
+        }
+        if !fallos.is_empty() {
+            return Err(format!("No se pudo publicar: {e}. Restauración incompleta en {}: {}", transaccion.display(), fallos.join("; ")));
+        }
+        return Err(format!("No se pudo publicar la actualización; se restauró el estado previo: {e}"));
+    }
+    for i in [0, 1] {
+        if respaldado[i] { let _ = std::fs::remove_file(&respaldos[i]); }
+    }
     Ok(())
 }
 
@@ -163,17 +259,7 @@ pub fn buscar_con_adicional_pausa(
                 return Err(AVISO_SINCRONIZANDO.into());
             }
 
-            // Leer bytes para verificar si es ejecutable
-            let bytes = std::fs::read(&nuevo_adicional).map_err(|_| AVISO_SINCRONIZANDO.to_string())?;
-            if !bytes.starts_with(b"MZ") {
-                return Err(format!("{NOMBRE} no parece un ejecutable de Windows; vuelve a copiarlo desde la entrega de la CI."));
-            }
-            let h_nuevo = crate::trabajo::hex(&Sha256::digest(&bytes));
-
-            // Si es idéntico al programa que ya está corriendo, no hay nueva versión en la adicional
-            if h_actual.as_deref() == Some(&h_nuevo) {
-                return buscar(fija, actual);
-            }
+            let h_nuevo = huella_archivo(&nuevo_adicional, true)?;
 
             // (a) Falta SHA256.txt o no coincide
             let sha_adicional = adicional.join("SHA256.txt");
@@ -183,6 +269,10 @@ pub fn buscar_con_adicional_pausa(
             let (esperada, _) = declarada(adicional);
             if esperada.as_deref() != Some(&h_nuevo) {
                 return Err(AVISO_SINCRONIZANDO.into());
+            }
+
+            if h_actual.as_deref() == Some(h_nuevo.as_str()) {
+                return buscar(fija, actual);
             }
 
             // Copiar a la fija (por temporal y renombrado, nunca sobrescribe a medias)
@@ -214,7 +304,8 @@ pub fn anterior(actual: &Path) -> Option<PathBuf> {
 
 /// Reemplaza `actual` por la versión pendiente. Si algo falla antes de terminar, el programa queda como estaba.
 pub fn aplicar(p: &Pendiente, actual: &Path) -> Result<PathBuf, String> {
-    if huella(&p.ruta)? != p.huella {
+    if huella_archivo(&p.ruta, true)? != p.huella ||
+        p.ruta.parent().and_then(|dir| declarada(dir).0).as_deref() != Some(p.huella.as_str()) {
         return Err("La actualización cambió después de verificarse; vuelve a buscarla.".into());
     }
     let anterior = anterior_de(actual);
@@ -252,14 +343,33 @@ pub fn volver(actual: &Path) -> Result<(), String> {
     if !anterior.is_file() {
         return Err("No hay una versión anterior guardada.".into());
     }
+    intercambiar(actual, &anterior, |a, b| std::fs::rename(a, b))
+}
+
+fn intercambiar(actual: &Path, anterior: &Path, mut mover: impl FnMut(&Path, &Path) -> io::Result<()>) -> Result<(), String> {
     let temporal = actual.with_file_name("flow_rust.exe.intercambio");
-    let paso = |a: &Path, b: &Path| std::fs::rename(a, b).map_err(|e| format!("No se pudo volver a la versión anterior: {e}"));
+    if std::fs::symlink_metadata(&temporal).is_ok() {
+        return Err("Hay un intercambio previo pendiente de recuperación; no se sobrescribió.".into());
+    }
+    let mut paso = |a: &Path, b: &Path| mover(a, b).map_err(|e| format!("No se pudo volver a la versión anterior: {e}"));
     paso(actual, &temporal)?;
-    if let Err(e) = paso(&anterior, actual) {
-        let _ = std::fs::rename(&temporal, actual);
+    if let Err(e) = paso(anterior, actual) {
+        return match paso(&temporal, actual) {
+            Ok(()) => Err(e),
+            Err(r) => Err(format!("{e}; restauración fallida: {r}; respaldo en {}", temporal.display())),
+        };
+    }
+    if let Err(e) = paso(&temporal, anterior) {
+        // Deshacer en orden inverso, sin destruir ninguna de las dos versiones.
+        if let Err(r) = paso(actual, anterior) {
+            return Err(format!("{e}; restauración fallida: {r}; respaldo en {}", temporal.display()));
+        }
+        if let Err(r) = paso(&temporal, actual) {
+            return Err(format!("{e}; restauración fallida: {r}; respaldo en {}", temporal.display()));
+        }
         return Err(e);
     }
-    paso(&temporal, &anterior)
+    Ok(())
 }
 
 /// Abre el programa que quedó en `actual` (el nuevo) para que continúe el trabajo.
@@ -320,8 +430,11 @@ mod pruebas {
         std::fs::create_dir_all(&nuevas).unwrap();
         let actual = base.join(NOMBRE);
         exe(&actual, "version vieja");
-        // Igual al programa que corre: está al día.
+        // Igual al programa que corre: está al día, con huella válida.
         exe(&nuevas.join(NOMBRE), "version vieja");
+        assert!(buscar(&nuevas, &actual).is_err());
+        let h = huella(&nuevas.join(NOMBRE)).unwrap();
+        std::fs::write(nuevas.join("SHA256.txt"), format!("{h}  flow_rust.exe\n")).unwrap();
         assert_eq!(buscar(&nuevas, &actual).unwrap(), None);
         // La huella declarada no coincide: archivo incompleto o cambiado.
         exe(&nuevas.join(NOMBRE), "version nueva");
@@ -333,6 +446,11 @@ mod pruebas {
         assert!(buscar(&nuevas, &actual).unwrap_err().contains("ejecutable"));
         // Cambió entre la verificación y la aplicación: el programa queda como estaba.
         exe(&nuevas.join(NOMBRE), "version nueva");
+        assert!(buscar(&nuevas, &actual).is_err());
+        std::fs::write(nuevas.join("SHA256.txt"), "huella corrupta").unwrap();
+        assert!(buscar(&nuevas, &actual).is_err());
+        let h = huella(&nuevas.join(NOMBRE)).unwrap();
+        std::fs::write(nuevas.join("SHA256.txt"), format!("{h}  flow_rust.exe\n")).unwrap();
         let pendiente = buscar(&nuevas, &actual).unwrap().unwrap();
         exe(&nuevas.join(NOMBRE), "otra cosa");
         assert!(aplicar(&pendiente, &actual).unwrap_err().contains("cambió"));
@@ -443,4 +561,65 @@ mod pruebas {
 
         let _ = std::fs::remove_dir_all(&base);
     }
+    #[test]
+    fn sha_copiada_de_otra_version_no_reemplaza_pareja_previa() {
+        let base = carpeta_temporal("sha-copiada-ajena");
+        let fija = base.join("fija");
+        let adicional = base.join("adicional");
+        std::fs::create_dir_all(&fija).unwrap();
+        std::fs::create_dir_all(&adicional).unwrap();
+        exe(&fija.join(NOMBRE), "previo");
+        let h_previa = huella(&fija.join(NOMBRE)).unwrap();
+        std::fs::write(fija.join("SHA256.txt"), format!("{h_previa}  flow_rust.exe\n")).unwrap();
+        exe(&adicional.join(NOMBRE), "nuevo");
+        let h_nueva = huella(&adicional.join(NOMBRE)).unwrap();
+        let sha = adicional.join("SHA256.txt");
+        std::fs::write(&sha, format!("{h_previa}  flow_rust.exe\n")).unwrap();
+        assert!(copiar_de_adicional_a_fija(&fija, &adicional.join(NOMBRE), &sha, &h_nueva).is_err());
+        assert_eq!(huella(&fija.join(NOMBRE)).unwrap(), h_previa);
+        assert_eq!(declarada(&fija).0.as_deref(), Some(h_previa.as_str()));
+        assert_eq!(std::fs::read_dir(&fija).unwrap().count(), 2);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn falla_segunda_publicacion_restaura_pareja_previa() {
+        let base = carpeta_temporal("rollback-pareja");
+        let tx = base.join("tx");
+        std::fs::create_dir(&tx).unwrap();
+        exe(&base.join(NOMBRE), "previo");
+        let previo = huella(&base.join(NOMBRE)).unwrap();
+        std::fs::write(base.join("SHA256.txt"), &previo).unwrap();
+        exe(&tx.join("nuevo.exe"), "nuevo");
+        std::fs::write(tx.join("nuevo.sha"), "nuevo").unwrap();
+        let resultado = publicar_pareja(&base, &tx, |a, b| {
+            if a == tx.join("nuevo.sha").as_path() { Err(io::Error::other("fallo inyectado")) }
+            else { std::fs::rename(a, b) }
+        });
+        assert!(resultado.is_err());
+        assert_eq!(huella(&base.join(NOMBRE)).unwrap(), previo);
+        assert_eq!(std::fs::read_to_string(base.join("SHA256.txt")).unwrap(), previo);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn falla_intercambio_final_restaura_ambas_versiones() {
+        let base = carpeta_temporal("rollback-intercambio");
+        let actual = base.join(NOMBRE);
+        let anterior = anterior_de(&actual);
+        exe(&actual, "actual");
+        exe(&anterior, "anterior");
+        let mut pasos = 0;
+        let resultado = intercambiar(&actual, &anterior, |a, b| {
+            pasos += 1;
+            if pasos == 3 { Err(io::Error::other("fallo inyectado")) }
+            else { std::fs::rename(a, b) }
+        });
+        assert!(resultado.is_err());
+        assert_eq!(std::fs::read(&actual).unwrap(), b"MZactual");
+        assert_eq!(std::fs::read(&anterior).unwrap(), b"MZanterior");
+        assert!(!base.join("flow_rust.exe.intercambio").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
 }
