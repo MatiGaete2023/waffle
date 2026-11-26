@@ -364,9 +364,8 @@ impl Trabajo {
             let calendario = contexto.and_then(|ctx| ctx.calendario.as_ref());
             let fecha_hoja2 = if mode == Mode::Cumplimiento {
                 if self.paquete.is_some() {
-                    fecha_calendario_91.map(|fecha| {
+                    fecha_calendario_91.inspect(|_| {
                         self.cruce = Some("Hoja2 (calendario 91)".into());
-                        fecha
                     }).or_else(|| {
                         let fecha = calendario?.proxima_pendiente(corte)?;
                         self.cruce.get_or_insert_with(|| "Calendario del ingreso".into());
@@ -818,7 +817,7 @@ fn limpiar_sesiones() {
         .flatten()
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|a| std::cmp::Reverse(a.0));
     let limite = std::time::Duration::from_secs(config::RETENCION_DIAS as u64 * 86400);
     for (i, (t, p)) in files.iter().enumerate() {
         let viejo = t.elapsed().map(|e| e > limite).unwrap_or(false);

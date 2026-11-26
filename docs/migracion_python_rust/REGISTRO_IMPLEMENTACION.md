@@ -16,6 +16,24 @@ Una entrada por encargo, de diez líneas como máximo, la más reciente arriba:
 
 No se copian salidas completas ni listas de mutaciones: la prueba afirma sus conteos y la CI del commit es la evidencia.
 
+## 2026-11-26 · Plan Waffle (Paso 4): validación diferenciada de fechas en `lote.rs` y `bitacoras.rs` (commit separado)
+- Cambió: `app/src/descargador/{lote.rs,bitacoras.rs}`, `app/src/descargador_ui.rs` (limpieza `unused_mut`) y `docs/migracion_python_rust/{ESTADO.md,PLAN.md,REGISTRO_IMPLEMENTACION.md}`.
+- Acredita: comprobador común `validar_fechas_formulario` detiene la búsqueda antes de `search` distinguiendo `FLG_Consulta`, `CHK_Consulta`, `FEC_Inicio`, `FEC_Fin`, «todas las fechas» y rangos invertidos, respetando Carga/calendario, alcance persistido al retomar y lecturas frescas en lote nuevo; suite Linux completa, `clippy --lib -D warnings` y los 6 verificadores en PASA.
+- Diferencias declaradas: ninguna (mantiene contratos de Carga, calendario, descarga conjunta y no reutilización entre lotes).
+- Pendiente: CI Windows en `waffle` y validación con sesión autorizada de SITFA (no `ACEPTADO`).
+
+## 2026-11-26 · Plan Waffle (Pasos 1–3 y 5): política multi-tribunal con perfil Tomé, productos y oráculos · `be9d9ae` / `450f72e`
+- Cambió: `flow-python` (`be9d9ae`: `utilidades.py`, `rus/util.py`, `work.py`, `record_edits.py`, `reglas_espera.py`, `outputs.py`, `resolutions.py`, `test_reglas_informes.py`), sincronizado en `src/`/`tests/`/`descargador/`; `app/src/{util.rs,motor.rs,productos.rs,ui.rs}`; `rust/crates/{flow-dominio,flow-motor}`; `rust/oraculo/generar_casos.py` + `rust/casos/*.json`; `app/qa/REFERENCIA_PYTHON.json`; `.github/workflows/flow-rust-local.yml`; `app/{MECHANICS.md,mechanics.json}`.
+- Acredita: perfil Tomé en otros tribunales válidos (DCE solo correo) y revisión manual sin observación/acciones ante vacíos, marcadores o rótulos ambiguos; identidad original conservada y aviso de matriz faltante; Python `test_reglas_informes` + `test_retomar_paquete` 27 passed (5 xfailed), `flow-motor` 10/10 (924/924/911/943 casos), `app/` verde y 6 verificadores en PASA (`REFERENCIA_PYTHON: be9d9aee717d`, 0 diferencias).
+- Diferencias declaradas: ninguna (criterio compartido en los tres motores).
+- Pendiente: push de `flow-python` (`be9d9ae`) y paridad a `waffle`, CI Windows (`entrega=true`) y validación operativa real (no `ACEPTADO`).
+
+## 2026-11-26 · E-P2-OPT: calibración real de Modo Rápido Seguro, aviso extensión 2.10.0 y limpieza de rendimiento/clippy · `b9402bf`
+- Cambió: `descargador/{preferencias.rs,bitacoras.rs,flujo_paquete.rs,puente.rs}`, `descargador.rs`, `descargador_ui.rs`, `descargador_resultados_ui.rs`, `lectura.rs`, `sincronizar.rs`, `captura_trabajo.rs`, `producto_excel.rs`, `productos.rs`, `trabajo.rs`, `ui.rs`, `util.rs`, `rust/crates/flow-meta4/src/plantilla.rs`.
+- Acredita: habilita concurrencia 2–3 de bitácoras también con `calendarios`/`historico` activos, calibra `PausaAdaptativa` para latencia real de SITFA (arranca en 150–350 ms con tope 2–3; solo frena en ≥ 4 s / ≥ 8 s o fallas), aplica pausa rápida en listados/informes, avisa en UI y evento `warning` si Chrome sigue en extensión `2.9.0`, elimina recompilación de `Regex` por celda HTML en `lectura.rs` y limpia advertencias de clippy; suite Linux completa y 6 verificadores PASA.
+- Diferencias declaradas: ninguna adicional sobre el contrato Python (Modo Rápido sigue siendo opt-in, solo lectura y sin caché entre lotes del día).
+- Pendiente: CI Windows en `waffle` y nueva medición real con extensión `2.10.0` recargada (no `ACEPTADO`).
+
 ## 2026-11-26 · E-P1-C2: puente HTTP chunked/acotado, extensión 2.10.0, Modo Rápido Seguro V-01..V-04 y display (Agente C · ChatGPT)
 - Cambió: `descargador/{puente.rs,extension.rs,preferencias.rs,bitacoras.rs,historia.rs,flujo_paquete.rs}`, nueva extensión propia `descargador/extension_integral/*` (2.10.0), `descargador_ui.rs`, `descargador_resultados_ui.rs`, `meta4_ui.rs` e informe `AGENTE_C_20261126_puente_rapido_display.md`.
 - Acredita: lector HTTP loopback con `chunked`, presupuestos diferenciados (256 KiB control / 112 MiB datos), timeouts y recuperación de `Mutex`; índice DOM por página (`V-01`), pipelining local (`V-02`), pausa adaptativa (`V-03`) y concurrencia acotada 1–3 con degradación (`V-04`), sin reutilización entre lotes del día; Descargador en 3 pasos + Dos Calendarios + índice de Resultados en memoria; suite Linux y 6 verificadores PASA.

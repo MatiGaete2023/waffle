@@ -151,6 +151,50 @@ def contiene_token(texto, *tokens) -> bool:
     return any(normalizar(t) in palabras for t in tokens)
 
 
+_MARCADORES_AUSENCIA_TRIBUNAL = frozenset({
+    "nan", "nat", "none", "null", "na", "n a", "s i", "s d", "s n", "sd", "sn",
+    "sin dato", "sin datos", "sin informacion", "sin tribunal", "sin asignar",
+    "sin especificar", "sin registro", "no informado", "no aplica", "no indica",
+    "no especificado", "no identificado", "no disponible", "no registra",
+    "ninguno", "ninguna", "desconocido", "desconocida", "indeterminado",
+    "pendiente", "por definir", "por confirmar", "otro", "otros", "varios",
+    "multiple", "todos", "total",
+})
+_SEP_AMBIGUO_TRIBUNAL = re.compile(r"[/|;]")
+_PUNT_TRIBUNAL_RE = re.compile(r"[-()._,:/\\|;]+")
+
+
+def perfil_tribunal(valor) -> str | None:
+    """Resuelve el perfil de reglas del tribunal ('LAJA', 'MULCHEN' o 'TOME').
+
+    Laja, Mulchén y Tomé inequívocos conservan su perfil; cualquier otro tribunal válido
+    usa el perfil 'TOME' (conservando su tribunal de origen para identidad y productos).
+    Vacíos, marcadores de ausencia y rótulos compuestos/ambiguos devuelven None.
+    """
+    if valor is None:
+        return None
+    bruto = str(valor).strip()
+    if not bruto:
+        return None
+    if _SEP_AMBIGUO_TRIBUNAL.search(bruto):
+        partes = [p for p in _SEP_AMBIGUO_TRIBUNAL.split(bruto) if re.search(r"[a-zA-Z]", normalizar(p))]
+        if len(partes) >= 2:
+            return None
+    sin_acentos = unicodedata.normalize("NFKD", bruto).encode("ASCII", "ignore").decode().lower()
+    norm = _ESPACIOS_RE.sub(" ", _PUNT_TRIBUNAL_RE.sub(" ", sin_acentos)).strip()
+    if sum(1 for c in norm if "a" <= c <= "z") < 3:
+        return None
+    if norm in _MARCADORES_AUSENCIA_TRIBUNAL:
+        return None
+    palabras = set(re.findall(r"[a-z0-9]+", norm))
+    conocidos = [c for c in ("MULCHEN", "LAJA", "TOME") if c.lower() in palabras]
+    if len(conocidos) > 1:
+        return None
+    if len(conocidos) == 1:
+        return conocidos[0]
+    return "TOME"
+
+
 def es_dce(txt):
     if not txt: return False
     t = normalizar(txt).upper()

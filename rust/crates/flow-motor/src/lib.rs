@@ -164,9 +164,9 @@ pub fn analizar(e: &Entrada) -> Resultado {
             ctx.invalidas.push("CUMPLIMIENTO.C04_VENCIDA");
         }
     }
-    let observacion = match Tribunal::desde(&r.texto("tribunal")) {
+    let observacion = match Tribunal::perfil(&r.texto("tribunal")) {
         None => {
-            avisos.push("Tribunal fuera de Laja, Mulchén y Tomé: sin reglas configuradas; requiere revisión manual.".to_string());
+            avisos.push("Tribunal sin identificar o ambiguo: sin reglas configuradas; requiere revisión manual.".to_string());
             String::new()
         }
         Some(tribunal) => match e.etapa {
@@ -306,5 +306,75 @@ mod pruebas {
         assert_eq!(salida[5], None, "ingresos distintos no se acumulan");
         assert_eq!(salida[6], None);
         assert_eq!(acumulados(&filas, corte)[5], Some((2, antiguo)));
+    }
+
+    #[test]
+    fn otros_tribunales_validos_perfil_tome_y_ausentes_o_ambiguos_revision_manual() {
+        let mut cfg = Config::default();
+        cfg.umbrales.insert("espera_tome".into(), 50);
+        cfg.umbrales.insert("proyecto_tome".into(), 80);
+        let corte: NaiveDate = "2026-10-09".parse().unwrap();
+
+        let eval = |etapa: Etapa, pares: &[(&str, &str)]| {
+            let mut r = Registro::default();
+            for (k, v) in pares {
+                r.poner(k, Celda::Texto((*v).into()));
+            }
+            let e = Entrada {
+                etapa,
+                registro: &r,
+                corte,
+                config: &cfg,
+                historia: None,
+                bitacora: &[],
+                duplicidad: None,
+                acumulado: None,
+                fecha_hoja2: None,
+                escritos: None,
+                historico: None,
+                evidencia: None,
+                consignados: &[],
+                bitacora_parcial: false,
+            };
+            analizar(&e)
+        };
+
+        // Espera en otro tribunal válido con umbrales 50 y 80 (49 -> E-06, 50 -> E05 correo, 80 -> E05 proyecto+correo; DCE solo correo).
+        let r49 = eval(Etapa::Espera, &[("tribunal", "Juzgado de Familia de Coronel"), ("nombre", "Uno"), ("programa", "PRM Uno"), ("espera", "49")]);
+        assert_eq!(r49.reglas, vec!["ESPERA.E06_SIN_RESOLUCION"]);
+        assert!(r49.acciones.is_empty());
+
+        let r50 = eval(Etapa::Espera, &[("tribunal", "Juzgado de Familia de Coronel"), ("nombre", "Uno"), ("programa", "PRM Uno"), ("espera", "50")]);
+        assert_eq!(r50.reglas, vec!["ESPERA.E05_SOLO_CORREO"]);
+        assert_eq!(r50.acciones, vec!["programa_espera"]);
+
+        let r80 = eval(Etapa::Espera, &[("tribunal", "Juzgado de Familia de Coronel"), ("nombre", "Uno"), ("programa", "PRM Uno"), ("espera", "80")]);
+        assert_eq!(r80.reglas, vec!["ESPERA.E05_PROYECTO_Y_CORREO"]);
+        assert_eq!(r80.acciones, vec!["programa_espera", "PC_IE"]);
+
+        let rdce = eval(Etapa::Espera, &[("tribunal", "Juzgado de Familia de Coronel"), ("nombre", "Uno"), ("programa", "DCE Uno"), ("espera", "80")]);
+        assert_eq!(rdce.reglas, vec!["ESPERA.E05_SOLO_CORREO"]);
+        assert_eq!(rdce.acciones, vec!["programa_espera"]);
+
+        // Vacíos, marcadores de ausencia y rótulos ambiguos quedan en revisión manual.
+        for invalido in ["", "---", "N/A", "S/I", "SIN INFORMACIÓN", "Ninguno", "Laja / Mulchén", "Laja y Tomé", "Coronel / Talcahuano"] {
+            let r = eval(Etapa::Espera, &[("tribunal", invalido), ("nombre", "Uno"), ("programa", "PRM Uno"), ("espera", "90")]);
+            assert!(r.observacion.is_empty() && r.reglas.is_empty() && r.acciones.is_empty(), "{invalido:?}: {r:?}");
+            assert!(r.avisos.iter().any(|a| a.contains("Tribunal sin identificar o ambiguo")), "{invalido:?}: {:?}", r.avisos);
+        }
+
+        // Cumplimiento e Informes en otro tribunal válido.
+        let c05 = eval(Etapa::Cumplimiento, &[
+            ("tribunal", "Juzgado de Familia de Coronel"), ("nombre", "Uno"), ("programa", "PRM Uno"),
+            ("dias_cumpl", "100"), ("dias_egresar", "10"), ("ingreso", "2026-01-01"), ("egreso_proy", "2026-10-19"),
+        ]);
+        assert_eq!(c05.reglas, vec!["CUMPLIMIENTO.C05_POR_VENCER"]);
+        assert_eq!(c05.acciones, vec!["medidas"]);
+
+        let i01 = eval(Etapa::Informes, &[
+            ("tribunal", "Juzgado de Familia de Coronel"), ("nombre", "Uno"), ("programa", "PRM Uno"), ("vencimiento", "2026-10-08"),
+        ]);
+        assert_eq!(i01.reglas, vec!["INFORMES.I01_VENCIDO_GENERAL"]);
+        assert_eq!(i01.acciones, vec!["programa_vencido", "PC_INFO"]);
     }
 }

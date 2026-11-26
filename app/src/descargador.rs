@@ -115,6 +115,10 @@ impl Puente {
             Duration::from_secs(15),
         )?;
         comprobar_extension(edicion, &version)?;
+        let rapido = edicion == Edicion::Integral
+            && version["flow_rust_rapido"] == 1
+            && version["flow_rust_version"] == "2.10.0";
+        self.registrar_rapido(rapido);
         serde_json::from_value::<Catalogo>(datos)
             .map_err(|_| "Chrome no devolvió un catálogo válido.".into())
     }
@@ -130,7 +134,13 @@ impl Puente {
         )?;
         let resultado = comprobar_extension(edicion, &version);
         // E-Q3: las lecturas de contexto quedan habilitadas solo tras verificar la extensión Integral.
-        self.habilitar_lecturas(resultado.is_ok() && edicion == Edicion::Integral);
+        let ok_integral = resultado.is_ok() && edicion == Edicion::Integral;
+        self.habilitar_lecturas(ok_integral);
+        self.registrar_rapido(
+            ok_integral
+                && version["flow_rust_rapido"] == 1
+                && version["flow_rust_version"] == "2.10.0",
+        );
         resultado
     }
 }

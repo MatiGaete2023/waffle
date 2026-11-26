@@ -158,9 +158,12 @@ fn equivalente(a: &Option<serde_json::Value>, b: &Option<serde_json::Value>) -> 
         let heredado = d.get("structured").and_then(serde_json::Value::as_bool) != Some(true);
         d.insert("structured".into(), serde_json::json!(true));
         let modo = d.get("resolution").and_then(serde_json::Value::as_str).unwrap_or("auto");
-        let modo = if compat && modo == "review" { tipo.unwrap_or("review") }
-            else if compat && heredado && modo == "auto" && con_celda { tipo.unwrap_or("review") }
-            else { modo }.to_string();
+        let modo = if compat && (modo == "review" || (heredado && modo == "auto" && con_celda)) {
+            tipo.unwrap_or("review")
+        } else {
+            modo
+        }
+        .to_string();
         d.insert("resolution".into(), serde_json::json!(modo));
         let mail = d.entry("mail").or_insert_with(|| serde_json::json!({}));
         if let Some(m) = mail.as_object_mut() { m.retain(|_, v| v.as_str() != Some("auto")); }

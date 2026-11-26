@@ -172,7 +172,7 @@ fn hoja(modo: Mode, filas: &[Fila<'_>]) -> Result<(Sheet, Vec<Cols>), String> {
         .iter()
         .map(|&(_, titulo)| titulo)
         .chain(PROCEDENCIA.iter().map(|&(titulo, _)| titulo))
-        .map(|t| normalizar_titulo(t))
+        .map(normalizar_titulo)
         .collect();
     let mut usados: HashSet<String> = HashSet::new();
     let mut extras: Vec<String> = Vec::new();

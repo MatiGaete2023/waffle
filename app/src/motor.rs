@@ -746,10 +746,10 @@ pub(crate) fn evaluar_con_captura(
             }
         }
     }
-    let trib = tribunal(&f.text("tribunal"));
+    let trib = perfil_tribunal(&f.text("tribunal"));
     let observacion = match trib {
         None => {
-            ctx.aviso("Tribunal fuera de Laja, Mulchén y Tomé: sin reglas configuradas; requiere revisión manual.");
+            ctx.aviso("Tribunal sin identificar o ambiguo: sin reglas configuradas; requiere revisión manual.");
             String::new()
         }
         Some(t) => match mode {
@@ -1020,5 +1020,96 @@ mod tests {
         let hoy = NaiveDate::from_ymd_opt(2026, 11, 19).unwrap();
         let r = evaluar(&cfg, Mode::Informes, &f, hoy, &Prepaso::default(), 0, None);
         assert!(r.observacion.starts_with("Ana PIE: Informe de avance vencido desde el 1 de octubre de 2026."), "{}", r.observacion);
+    }
+
+    #[test]
+    fn otros_tribunales_validos_perfil_tome_y_ausentes_o_ambiguos_revision_manual() {
+        let mut cfg = Config::default();
+        cfg.umbrales.insert("espera_tome".into(), 50);
+        cfg.umbrales.insert("proyecto_tome".into(), 80);
+        let hoy = NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
+
+        let cols = fila_cols(&["rit", "tribunal", "nombre", "rut", "programa", "espera"]);
+        let eval_espera = |trib: &str, prog: &str, dias: f64| {
+            let vals = vec![
+                Cell::Text("X-1-2099".into()),
+                Cell::Text(trib.into()),
+                Cell::Text("Persona Ficticia".into()),
+                Cell::Text("11111111-1".into()),
+                Cell::Text(prog.into()),
+                Cell::Number(dias),
+            ];
+            let f = Fila { values: &vals, cols: &cols };
+            evaluar(&cfg, Mode::Espera, &f, hoy, &Prepaso::default(), 0, None)
+        };
+
+        // Otro tribunal válido en Espera (umbrales 50 y 80): 49 -> E-06, 50 -> E05 solo correo, 80 -> E05 proyecto+correo; DCE solo correo.
+        let r49 = eval_espera("Juzgado de Familia de Coronel", "PRM Uno", 49.0);
+        assert_eq!(r49.eventos, vec!["ESPERA.E06_SIN_RESOLUCION"]);
+        assert!(acciones(&r49.eventos, None, hoy).is_empty());
+
+        let r50 = eval_espera("Juzgado de Familia de Coronel", "PRM Uno", 50.0);
+        assert_eq!(r50.eventos, vec!["ESPERA.E05_SOLO_CORREO"]);
+        assert_eq!(acciones(&r50.eventos, None, hoy), vec!["programa_espera"]);
+
+        let r80 = eval_espera("Juzgado de Familia de Coronel", "PRM Uno", 80.0);
+        assert_eq!(r80.eventos, vec!["ESPERA.E05_PROYECTO_Y_CORREO"]);
+        assert_eq!(acciones(&r80.eventos, None, hoy), vec!["programa_espera", "PC_IE"]);
+
+        let rdce = eval_espera("Juzgado de Familia de Coronel", "DCE Uno", 80.0);
+        assert_eq!(rdce.eventos, vec!["ESPERA.E05_SOLO_CORREO"]);
+        assert_eq!(acciones(&rdce.eventos, None, hoy), vec!["programa_espera"]);
+
+        // Vacíos, marcadores de ausencia y rótulos ambiguos quedan en revisión manual.
+        for invalido in ["", "---", "N/A", "S/I", "SIN INFORMACIÓN", "Ninguno", "Laja / Mulchén", "Laja y Tomé", "Coronel / Talcahuano"] {
+            let r = eval_espera(invalido, "PRM Uno", 90.0);
+            assert!(r.observacion.is_empty(), "tribunal inválido {invalido:?} emitió: {}", r.observacion);
+            assert!(r.eventos.is_empty() && acciones(&r.eventos, None, hoy).is_empty());
+            assert!(r.avisos.iter().any(|a| a.contains("Tribunal sin identificar o ambiguo")), "{invalido:?}: {:?}", r.avisos);
+        }
+
+        // Cumplimiento: C05 en otro tribunal y contradicción días negativos + egreso futuro preservada incluso con tribunal ausente.
+        let cc = fila_cols(&["rit", "tribunal", "nombre", "programa", "dias_cumpl", "dias_egresar", "ingreso", "egreso_proy"]);
+        let v_c05 = vec![
+            Cell::Text("X-2-2099".into()), Cell::Text("Juzgado de Familia de Coronel".into()),
+            Cell::Text("Persona".into()), Cell::Text("PRM Uno".into()),
+            Cell::Number(100.0), Cell::Number(10.0), Cell::Text("2026-01-01".into()), Cell::Text("2026-10-19".into()),
+        ];
+        let r_c05 = evaluar(&cfg, Mode::Cumplimiento, &Fila { values: &v_c05, cols: &cc }, hoy, &Prepaso::default(), 0, None);
+        assert_eq!(r_c05.eventos, vec!["CUMPLIMIENTO.C05_POR_VENCER"]);
+        assert_eq!(acciones(&r_c05.eventos, None, hoy), vec!["medidas"]);
+
+        let v_neg = vec![
+            Cell::Text("X-3-2099".into()), Cell::Text("SIN INFORMACIÓN".into()),
+            Cell::Text("Persona".into()), Cell::Text("PRM Uno".into()),
+            Cell::Number(-5.0), Cell::Number(10.0), Cell::Text("2026-01-01".into()), Cell::Text("2026-10-19".into()),
+        ];
+        let r_neg = evaluar(&cfg, Mode::Cumplimiento, &Fila { values: &v_neg, cols: &cc }, hoy, &Prepaso::default(), 0, None);
+        assert!(r_neg.observacion.is_empty());
+        assert!(r_neg.avisos.iter().any(|a| a.contains("Días negativos y egreso futuro")));
+        assert!(r_neg.avisos.iter().any(|a| a.contains("Tribunal sin identificar o ambiguo")));
+
+        // Informes: I01 y vencimiento faltante en otro tribunal válido.
+        let ci = fila_cols(&["rit", "tribunal", "nombre", "programa", "vencimiento"]);
+        let v_i01 = vec![
+            Cell::Text("X-4-2099".into()), Cell::Text("Juzgado de Familia de Coronel".into()),
+            Cell::Text("Persona".into()), Cell::Text("PRM Uno".into()), Cell::Text("2026-10-08".into()),
+        ];
+        let r_i01 = evaluar(&cfg, Mode::Informes, &Fila { values: &v_i01, cols: &ci }, hoy, &Prepaso::default(), 0, None);
+        assert_eq!(r_i01.eventos, vec!["INFORMES.I01_VENCIDO_GENERAL"]);
+        assert_eq!(acciones(&r_i01.eventos, None, hoy), vec!["programa_vencido", "PC_INFO"]);
+
+        let v_sv = vec![
+            Cell::Text("X-5-2099".into()), Cell::Text("Juzgado de Familia de Coronel".into()),
+            Cell::Text("Persona".into()), Cell::Text("PRM Uno".into()), Cell::Text(String::new()),
+        ];
+        let r_sv = evaluar(&cfg, Mode::Informes, &Fila { values: &v_sv, cols: &ci }, hoy, &Prepaso::default(), 0, None);
+        assert!(r_sv.observacion.is_empty() && r_sv.avisos.iter().any(|a| a.contains("sin fecha de vencimiento")));
+
+        // Dos tribunales con igual RIT, persona y programa NO disparan duplicidad R6.
+        let f1_v = vec![Cell::Text("X-77-2099".into()), Cell::Text("Juzgado de Familia de Coronel".into()), Cell::Text("Uno".into()), Cell::Text("11111111-1".into()), Cell::Text("PRM Uno".into()), Cell::Number(80.0)];
+        let f2_v = vec![Cell::Text("X-77-2099".into()), Cell::Text("Juzgado de Familia de Talcahuano".into()), Cell::Text("Uno".into()), Cell::Text("11111111-1".into()), Cell::Text("PRM Uno".into()), Cell::Number(80.0)];
+        let pre = prepaso(Mode::Espera, &[Fila { values: &f1_v, cols: &cols }, Fila { values: &f2_v, cols: &cols }], hoy, |_| None);
+        assert!(pre.duplicidad.is_empty(), "dos tribunales distintos no deben cruzar R6");
     }
 }

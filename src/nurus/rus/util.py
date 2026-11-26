@@ -63,13 +63,18 @@ def as_int(value: object) -> int | None:
 
 
 def tribunal(value: object) -> str | None:
-    text = normalize(value).upper()
-    if "MULCHEN" in text:
-        return "MULCHEN"
-    if "LAJA" in text:
-        return "LAJA"
-    if "TOME" in text:
-        return "TOME"
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if re.search(r"[/|;]", raw):
+        parts = [p for p in re.split(r"[/|;]", raw) if re.search(r"[a-zA-Z]", normalize(p))]
+        if len(parts) >= 2:
+            return None
+    text = normalize(raw).upper()
+    words = set(re.findall(r"[A-Z0-9]+", text))
+    matches = [c for c in ("MULCHEN", "LAJA", "TOME") if c in words]
+    if len(matches) == 1:
+        return matches[0]
     return None
 
 

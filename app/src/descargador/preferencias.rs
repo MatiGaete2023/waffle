@@ -49,15 +49,18 @@ pub struct Rapido {
     pub concurrencia: usize,
 }
 impl Default for Rapido {
-    fn default() -> Self { Self { activado: false, pausa_ms: 350, concurrencia: 2 } }
+    fn default() -> Self { Self { activado: false, pausa_ms: 250, concurrencia: 2 } }
 }
 impl Rapido {
     pub fn limitado(mut self) -> Self {
-        self.pausa_ms = self.pausa_ms.clamp(200, 350);
+        self.pausa_ms = self.pausa_ms.clamp(150, 350);
         self.concurrencia = self.concurrencia.clamp(1, 3);
         self
     }
     pub fn tope(self) -> usize { if self.activado { self.limitado().concurrencia } else { 1 } }
+    pub fn pausa_lote(self, fija: Duration) -> Duration {
+        if self.activado { Duration::from_millis(self.limitado().pausa_ms).min(fija) } else { fija }
+    }
 }
 
 /// Control de la sesión de lectura, sin almacenamiento entre corridas.
@@ -72,7 +75,9 @@ pub(super) struct PausaAdaptativa {
 }
 impl PausaAdaptativa {
     pub(super) fn nueva(fija: Duration, config: Rapido) -> Self {
-        Self { config: config.limitado(), fija, ms: 1000, sanas: 0, fallas: 0, degradada: false }
+        let config = config.limitado();
+        let ms = if config.activado { config.pausa_ms } else { 1000 };
+        Self { config, fija, ms, sanas: 0, fallas: 0, degradada: false }
     }
     pub(super) fn observar(&mut self, latencia: Duration, sana: bool) {
         if !self.config.activado { return; }
@@ -81,8 +86,8 @@ impl PausaAdaptativa {
             self.sanas = 0;
             self.fallas = self.fallas.saturating_add(1);
             if self.fallas >= 2 { self.degradada = true; }
-        } else if latencia >= Duration::from_millis(400) {
-            self.ms = if latencia >= Duration::from_secs(1) { 2000 } else { 1000.max(self.ms) };
+        } else if latencia >= Duration::from_secs(4) {
+            self.ms = if latencia >= Duration::from_secs(8) { 2000 } else { 1000.max(self.ms) };
             self.sanas = 0;
             self.fallas = 0;
         } else {
@@ -292,12 +297,23 @@ mod tests {
     #[test]
     fn pausa_adaptativa_reacciona_y_desciende_gradualmente() {
         let mut p = PausaAdaptativa::nueva(Duration::from_secs(1), Rapido { activado: true, pausa_ms: 250, concurrencia: 99 });
-        assert_eq!(p.tope(), 1);
-        for _ in 0..6 { p.observar(Duration::from_millis(150), true); }
+        // Arranca rápido con tope acotado a 3; latencias sanas típicas de SITFA (800 ms) conservan el ritmo.
         assert_eq!(p.pausa(), Duration::from_millis(250));
         assert_eq!(p.tope(), 3);
-        p.observar(Duration::from_millis(500), true);
+        p.observar(Duration::from_millis(800), true);
+        assert_eq!(p.pausa(), Duration::from_millis(250));
+        assert_eq!(p.tope(), 3);
+        // Lentitud real (>= 4 s) sube la pausa a 1 s y baja el tope a 1; >= 8 s sube a 2 s.
+        p.observar(Duration::from_secs(4), true);
         assert_eq!(p.pausa(), Duration::from_secs(1));
+        assert_eq!(p.tope(), 1);
+        for _ in 0..6 { p.observar(Duration::from_millis(800), true); }
+        assert_eq!(p.pausa(), Duration::from_millis(250));
+        assert_eq!(p.tope(), 3);
+        p.observar(Duration::from_secs(8), true);
+        assert_eq!(p.pausa(), Duration::from_secs(2));
+        assert_eq!(p.tope(), 1);
+        // Dos fallas consecutivas degradan la concurrencia a 1 para el resto del lote.
         p.observar(Duration::from_secs(2), false);
         p.observar(Duration::from_millis(1), false);
         assert_eq!(p.pausa(), Duration::from_secs(2));

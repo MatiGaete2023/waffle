@@ -769,6 +769,58 @@ pub fn pendientes(carpeta: &Path) -> Result<Pendientes, String> {
     Ok(Pendientes { pantalla, selecciones, fechas })
 }
 
+/// Valida los campos de filtro de fechas preparados por la extensión en el formulario SITFA.
+/// Distingue bandera (`FLG_Consulta`), casilla (`CHK_Consulta`), inicio (`FEC_Inicio`) y fin (`FEC_Fin`)
+/// para detener la búsqueda antes de enviarla a SITFA señalando el campo incoherente.
+pub(super) fn validar_fechas_formulario(
+    pares: &Pares,
+    fechas: Option<(NaiveDate, NaiveDate)>,
+) -> Result<(), String> {
+    if let Some((a, b)) = fechas {
+        if a > b {
+            return Err("El rango de fechas está invertido (fecha inicial posterior a la final).".into());
+        }
+    }
+    let campo = |k: &str| pares.iter().find(|(c, _)| c == k).map(|(_, v)| v.as_str());
+    let bandera_esperada = if fechas.is_some() { "1" } else { "0" };
+    if campo("FLG_Consulta") != Some(bandera_esperada) {
+        return Err(if fechas.is_some() {
+            "La bandera del filtro de fechas (FLG_Consulta) no quedó activa para el rango elegido.".into()
+        } else {
+            "La bandera del filtro de fechas (FLG_Consulta) quedó activa para «todas las fechas».".into()
+        });
+    }
+    match fechas {
+        Some((a, b)) => {
+            if campo("CHK_Consulta") != Some("on") {
+                return Err(
+                    "La casilla del filtro de fechas (CHK_Consulta) no quedó activa para el rango elegido.".into(),
+                );
+            }
+            let inicio = fecha_sitfa(a);
+            if campo("FEC_Inicio") != Some(inicio.as_str()) {
+                return Err(format!(
+                    "La fecha inicial preparada (FEC_Inicio) no coincide con el rango elegido ({inicio})."
+                ));
+            }
+            let fin = fecha_sitfa(b);
+            if campo("FEC_Fin") != Some(fin.as_str()) {
+                return Err(format!(
+                    "La fecha final preparada (FEC_Fin) no coincide con el rango elegido ({fin})."
+                ));
+            }
+        }
+        None => {
+            if campo("CHK_Consulta") == Some("on") {
+                return Err(
+                    "La casilla del filtro de fechas (CHK_Consulta) quedó activa para «todas las fechas».".into(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Ejecuta el plan en una carpeta nueva dentro de `destino`. Devuelve las consultas completadas.
 #[allow(clippy::too_many_arguments)]
 pub fn ejecutar(
@@ -787,6 +839,9 @@ pub fn ejecutar(
     }
     if plan.consultas.is_empty() {
         return Err("El lote no tiene consultas.".into());
+    }
+    if plan.fechas.is_some_and(|(a, b)| a > b) {
+        return Err("El rango de fechas está invertido (fecha inicial posterior a la final).".into());
     }
     let consultas: Vec<Consulta> = plan.consultas.iter().map(Consulta::desde).collect::<Result<_, _>>()?;
     let carpeta = carpeta_nueva(destino)?;
@@ -917,20 +972,9 @@ pub fn ejecutar(
                 })
                 .ok_or("El formulario no entregó parámetros válidos.")?;
             consulta.validar_consulta(&pares)?;
-            let campo = |k: &str| pares.iter().find(|(c, _)| c == k).map(|(_, v)| v.as_str());
             // `descargador/lotes.py`: Carga no usa FLG_Consulta ni FEC_Inicio/FEC_Fin; su período va en el objetivo.
             if !calendario(perfil.pantalla) && perfil.pantalla != Pantalla::Carga {
-                if campo("FLG_Consulta") != Some(if fechas.is_some() { "1" } else { "0" }) {
-                    return Err("No se pudo activar correctamente el filtro de fecha.".into());
-                }
-                if let Some((a, b)) = fechas {
-                    if campo("FEC_Inicio") != Some(fecha_sitfa(a).as_str())
-                        || campo("FEC_Fin") != Some(fecha_sitfa(b).as_str())
-                        || campo("CHK_Consulta") != Some("on")
-                    {
-                        return Err("Las fechas enviadas no coinciden con la selección.".into());
-                    }
-                }
+                validar_fechas_formulario(&pares, fechas)?;
             }
             let html = cuerpo(&lote.pedir("search", json!({"pairs": pares, "timeout": ESPERA_SITFA_MS}))?, false)?;
             let manifiesto = format!("verificacion {indice:03}.json");
@@ -1186,5 +1230,242 @@ mod pruebas_lote_python {
     fn huella_archivo(b: &[u8]) -> String {
         use sha2::{Digest, Sha256};
         format!("{:x}", Sha256::digest(b))
+    }
+
+    fn pares_con_fechas(
+        base: &Value,
+        flg: Option<&str>,
+        chk: Option<&str>,
+        inicio: Option<&str>,
+        fin: Option<&str>,
+    ) -> Value {
+        let mut pares: Vec<Value> = base
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|par| {
+                !matches!(
+                    par.as_array().and_then(|a| a.first()).and_then(Value::as_str),
+                    Some("FLG_Consulta" | "CHK_Consulta" | "FEC_Inicio" | "FEC_Fin")
+                )
+            })
+            .cloned()
+            .collect();
+        for (k, v) in [("FLG_Consulta", flg), ("CHK_Consulta", chk), ("FEC_Inicio", inicio), ("FEC_Fin", fin)] {
+            if let Some(v) = v {
+                pares.push(json!([k, v]));
+            }
+        }
+        Value::Array(pares)
+    }
+
+    #[test]
+    fn validar_fechas_formulario_distingue_bandera_casilla_inicio_fin_y_todas_las_fechas() {
+        let d1 = NaiveDate::from_ymd_opt(2099, 3, 1).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2099, 3, 31).unwrap();
+        let par = |items: &[(&str, &str)]| -> Pares {
+            items.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+
+        // Rango válido
+        let ok_rango = par(&[
+            ("FLG_Consulta", "1"),
+            ("CHK_Consulta", "on"),
+            ("FEC_Inicio", "01/03/2099"),
+            ("FEC_Fin", "31/03/2099"),
+        ]);
+        assert_eq!(validar_fechas_formulario(&ok_rango, Some((d1, d2))), Ok(()));
+
+        // Bandera incorrecta
+        let err_flg = validar_fechas_formulario(
+            &par(&[("FLG_Consulta", "0"), ("CHK_Consulta", "on"), ("FEC_Inicio", "01/03/2099"), ("FEC_Fin", "31/03/2099")]),
+            Some((d1, d2)),
+        )
+        .unwrap_err();
+        assert!(err_flg.contains("FLG_Consulta"), "{err_flg}");
+
+        // Casilla inactiva
+        let err_chk = validar_fechas_formulario(
+            &par(&[("FLG_Consulta", "1"), ("FEC_Inicio", "01/03/2099"), ("FEC_Fin", "31/03/2099")]),
+            Some((d1, d2)),
+        )
+        .unwrap_err();
+        assert!(err_chk.contains("CHK_Consulta"), "{err_chk}");
+
+        // Fecha inicial distinta
+        let err_ini = validar_fechas_formulario(
+            &par(&[("FLG_Consulta", "1"), ("CHK_Consulta", "on"), ("FEC_Inicio", "02/03/2099"), ("FEC_Fin", "31/03/2099")]),
+            Some((d1, d2)),
+        )
+        .unwrap_err();
+        assert!(err_ini.contains("FEC_Inicio"), "{err_ini}");
+
+        // Fecha final distinta
+        let err_fin = validar_fechas_formulario(
+            &par(&[("FLG_Consulta", "1"), ("CHK_Consulta", "on"), ("FEC_Inicio", "01/03/2099"), ("FEC_Fin", "30/03/2099")]),
+            Some((d1, d2)),
+        )
+        .unwrap_err();
+        assert!(err_fin.contains("FEC_Fin"), "{err_fin}");
+
+        // «Todas las fechas» válido
+        assert_eq!(validar_fechas_formulario(&par(&[("FLG_Consulta", "0")]), None), Ok(()));
+
+        // «Todas las fechas» con bandera activa
+        let err_todas_flg = validar_fechas_formulario(&par(&[("FLG_Consulta", "1")]), None).unwrap_err();
+        assert!(err_todas_flg.contains("FLG_Consulta"), "{err_todas_flg}");
+
+        // «Todas las fechas» con casilla activa
+        let err_todas_chk =
+            validar_fechas_formulario(&par(&[("FLG_Consulta", "0"), ("CHK_Consulta", "on")]), None).unwrap_err();
+        assert!(err_todas_chk.contains("CHK_Consulta"), "{err_todas_chk}");
+
+        // Rango invertido
+        let err_inv = validar_fechas_formulario(&ok_rango, Some((d2, d1))).unwrap_err();
+        assert!(err_inv.contains("invertido"), "{err_inv}");
+    }
+
+    #[test]
+    fn lote_acepta_rango_valido_y_detiene_busqueda_ante_cada_discrepancia_de_fechas() {
+        let datos: Value = serde_json::from_str(include_str!("../../tests/datos/lote.json")).unwrap();
+        let catalogo: Catalogo = serde_json::from_value(datos["catalogo"].clone()).unwrap();
+        let escenario = datos["escenarios"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["escenario"] == "sin_registros")
+            .unwrap_or(&datos["escenarios"][0]);
+        let lista = |k: &str| -> Vec<String> { serde_json::from_value(escenario["lote"][k].clone()).unwrap() };
+        let pasos_base = escenario["guion"].as_array().unwrap();
+        let prepare_base = pasos_base.iter().find(|p| p["comando"] == "prepare").unwrap();
+        let search_base = pasos_base.iter().find(|p| p["comando"] == "search").unwrap();
+        let d1 = NaiveDate::from_ymd_opt(2099, 3, 1).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2099, 3, 31).unwrap();
+
+        let hacer_plan = |fechas: Option<(NaiveDate, NaiveDate)>| -> PlanLote {
+            let seleccion = SeleccionLote {
+                tribunales: vec![lista("tribunales")[0].clone()],
+                modalidades: vec![lista("modalidades")[0].clone()],
+                pestanas: vec![lista("pestanas")[0].clone()],
+                informes: vec!["1".into()],
+                medidas: vec![crate::descargador::TODAS_LAS_MEDIDAS.into()],
+                fechas,
+                ..Default::default()
+            };
+            catalogo.planificar(Edicion::Integral, &seleccion).unwrap()
+        };
+
+        // 1) Rango correcto: ejecuta prepare y search
+        let mut pasos_ok = Vec::new();
+        for p in pasos_base {
+            let mut copia = p.clone();
+            if copia["comando"] == "prepare" {
+                copia["respuesta"]["pairs"] = pares_con_fechas(
+                    &prepare_base["respuesta"]["pairs"],
+                    Some("1"),
+                    Some("on"),
+                    Some("01/03/2099"),
+                    Some("31/03/2099"),
+                );
+            }
+            pasos_ok.push(copia);
+            if p["comando"] == "unlock" {
+                break;
+            }
+        }
+        // Si el escenario base tenía >1 consulta, construimos una corrida limpia de 1 consulta con search vacío o existente
+        let pasos_uno = if pasos_base.iter().filter(|p| p["comando"] == "prepare").count() == 1 {
+            pasos_ok
+        } else {
+            vec![
+                json!({"comando": "lock", "respuesta": {"ok": true}}),
+                json!({
+                    "comando": "prepare",
+                    "respuesta": {"pairs": pares_con_fechas(&prepare_base["respuesta"]["pairs"], Some("1"), Some("on"), Some("01/03/2099"), Some("31/03/2099"))}
+                }),
+                search_base.clone(),
+                json!({"comando": "unlock", "respuesta": {"restored": true}}),
+            ]
+        };
+        let guion_ok = Guion { pasos: pasos_uno, pedidos: RefCell::default() };
+        let destino_ok = std::env::temp_dir().join(format!("flow-lote-fechas-ok-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&destino_ok);
+        let res_ok = ejecutar(
+            &guion_ok,
+            &catalogo,
+            Edicion::Integral,
+            &hacer_plan(Some((d1, d2))),
+            &destino_ok,
+            &Opciones { evidencia: false, ..Default::default() },
+            &AtomicBool::new(false),
+            &mut |_| {},
+        );
+        // Puede terminar en search (y pedir download si tenía registros); lo crucial es que alcanzó `search` con las fechas válidas
+        assert!(
+            guion_ok.pedidos.borrow().iter().any(|p| p["comando"] == "search"),
+            "el rango válido debió avanzar hasta search: res={res_ok:?}"
+        );
+        let _ = fs::remove_dir_all(&destino_ok);
+
+        // 2) Cada discrepancia detiene ANTES de search y nombra el campo
+        let casos_malos: [(&str, Option<(NaiveDate, NaiveDate)>, Option<&str>, Option<&str>, Option<&str>, Option<&str>, &str); 6] = [
+            ("flg_malo", Some((d1, d2)), Some("0"), Some("on"), Some("01/03/2099"), Some("31/03/2099"), "FLG_Consulta"),
+            ("chk_inactiva", Some((d1, d2)), Some("1"), None, Some("01/03/2099"), Some("31/03/2099"), "CHK_Consulta"),
+            ("ini_distinta", Some((d1, d2)), Some("1"), Some("on"), Some("02/03/2099"), Some("31/03/2099"), "FEC_Inicio"),
+            ("fin_distinta", Some((d1, d2)), Some("1"), Some("on"), Some("01/03/2099"), Some("30/03/2099"), "FEC_Fin"),
+            ("todas_flg_activo", None, Some("1"), None, None, None, "FLG_Consulta"),
+            ("todas_chk_activo", None, Some("0"), Some("on"), None, None, "CHK_Consulta"),
+        ];
+        for (etiqueta, fechas, flg, chk, ini, fin, campo_esperado) in casos_malos {
+            let guion = Guion {
+                pasos: vec![
+                    json!({"comando": "lock", "respuesta": {"ok": true}}),
+                    json!({
+                        "comando": "prepare",
+                        "respuesta": {"pairs": pares_con_fechas(&prepare_base["respuesta"]["pairs"], flg, chk, ini, fin)}
+                    }),
+                    json!({"comando": "unlock", "respuesta": {"restored": true}}),
+                ],
+                pedidos: RefCell::default(),
+            };
+            let destino = std::env::temp_dir().join(format!("flow-lote-fechas-{etiqueta}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&destino);
+            let err = ejecutar(
+                &guion,
+                &catalogo,
+                Edicion::Integral,
+                &hacer_plan(fechas),
+                &destino,
+                &Opciones::default(),
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap_err();
+            let _ = fs::remove_dir_all(&destino);
+            assert!(err.contains(campo_esperado), "{etiqueta}: esperaba {campo_esperado}, obtuvo {err}");
+            assert!(
+                guion.pedidos.borrow().iter().all(|p| p["comando"] != "search"),
+                "{etiqueta}: no debía iniciar search"
+            );
+        }
+
+        // 3) Rango invertido se rechaza antes de tocar el puente (0 comandos)
+        let mut plan_inv = hacer_plan(Some((d1, d2)));
+        plan_inv.fechas = Some((d2, d1));
+        let guion_inv = Guion { pasos: vec![], pedidos: RefCell::default() };
+        let destino_inv = std::env::temp_dir().join(format!("flow-lote-fechas-inv-{}", std::process::id()));
+        let err_inv = ejecutar(
+            &guion_inv,
+            &catalogo,
+            Edicion::Integral,
+            &plan_inv,
+            &destino_inv,
+            &Opciones::default(),
+            &AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(err_inv.contains("invertido"), "{err_inv}");
+        assert!(guion_inv.pedidos.borrow().is_empty());
     }
 }

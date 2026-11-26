@@ -1225,7 +1225,7 @@ impl App {
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut elegida, None, "Automática");
                             for m in Mode::ALL {
-                                let ok = self.work.as_ref().map_or(true, |w| w.modos_posibles.contains(&m));
+                                let ok = self.work.as_ref().is_none_or(|w| w.modos_posibles.contains(&m));
                                 ui.add_enabled_ui(ok, |ui| {
                                     ui.selectable_value(&mut elegida, Some(m), m.label());
                                 });
@@ -1305,7 +1305,7 @@ impl App {
             .registros
             .iter()
             .enumerate()
-            .filter(|(_, r)| self.filtro_estado.map_or(true, |e| r.estado() == e))
+            .filter(|(_, r)| self.filtro_estado.is_none_or(|e| r.estado() == e))
             .filter(|(_, r)| self.filtro_trib.is_empty() || w.tribunal_clave(r) == self.filtro_trib)
             .filter(|(_, r)| !self.solo_marcadas || r.seleccionada)
             .filter(|(_, r)| {
@@ -2643,6 +2643,13 @@ impl App {
                                 .collect();
                             if !faltan.is_empty() {
                                 ui.label(RichText::new(format!("Falta: {}", faltan.join(", "))).size(11.5).color(p.amber));
+                            }
+                            if !crate::productos::tiene_matriz(&pr.tribunal_clave, &pr.tipo) {
+                                ui.label(
+                                    RichText::new("Sin matriz Word configurada para este tribunal (importa la matriz en Ajustes o revisa el formato genérico).")
+                                        .size(11.5)
+                                        .color(p.amber),
+                                );
                             }
                         }));
                         if r.response.clicked() {
