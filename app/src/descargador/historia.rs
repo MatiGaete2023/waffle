@@ -5,6 +5,7 @@
 
 use super::lecturas;
 use super::lote::{self, Conexion};
+use super::preferencias::{self, PausaAdaptativa, Rapido};
 use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
 use serde_json::{json, Map, Value};
@@ -265,6 +266,10 @@ fn json_objeto_python(pares: &[(&str, &str)]) -> String {
 pub struct LectorHistoria {
     pub meses: u32,
     pub pausa: Duration,
+    control_pausa: PausaAdaptativa,
+    version_extension: &'static str,
+    rapido: bool,
+    prefetched: BTreeMap<String, Result<Value, String>>,
     pub anterior: Option<PathBuf>,
     pub estado: Value,
     carpeta: PathBuf,
@@ -288,6 +293,10 @@ impl LectorHistoria {
         Ok(Self {
             meses,
             pausa,
+            control_pausa: PausaAdaptativa::nueva(pausa, Rapido::default()),
+            version_extension: "2.9.0",
+            rapido: false,
+            prefetched: BTreeMap::new(),
             anterior,
             estado: Value::Null,
             carpeta: PathBuf::new(),
@@ -299,6 +308,30 @@ impl LectorHistoria {
             excel: None,
             desfase,
         })
+    }
+
+    pub(super) fn configurar_rapido(&mut self, config: Rapido, propia: bool) {
+        self.version_extension = if propia { "2.10.0" } else { "2.9.0" };
+        self.control_pausa = PausaAdaptativa::nueva(self.pausa, config);
+        self.rapido = config.activado;
+    }
+
+    fn parametros(&self, clave: &str) -> Value {
+        let causa = &self.estado["causas"][clave];
+        json!({"tribunal": causa["tribunal"], "rit": causa["rit_enlace"].as_str().filter(|r| !r.is_empty()).or(causa["rit"].as_str()).unwrap_or(""), "causa": causa["causa_id"]})
+    }
+
+    fn preparar_siguientes(&mut self, conexion: &dyn Conexion, cancelar: &std::sync::atomic::AtomicBool, siguientes: &[String]) {
+        if !self.rapido || !self.prefetched.is_empty() || siguientes.is_empty() { return; }
+        let restantes = MAX_HISTORIAS_POR_LOTE.saturating_sub(self.estado["lecturas"].as_u64().unwrap_or(0) as usize);
+        let n = siguientes.len().min(self.control_pausa.tope()).min(restantes);
+        if n == 0 || !preferencias::esperar(self.control_pausa.pausa(), cancelar) { return; }
+        let cargas: Vec<_> = siguientes[..n].iter().map(|c| json!({"params": self.parametros(c), "timeout": 60000})).collect();
+        self.estado["lecturas"] = json!(self.estado["lecturas"].as_u64().unwrap_or(0) + n as u64);
+        let inicio = std::time::Instant::now();
+        let respuestas = preferencias::pedir_grupo(conexion, "history_open", &cargas, lote::PLAZO);
+        self.control_pausa.observar(inicio.elapsed(), respuestas.iter().all(Result::is_ok));
+        self.prefetched.extend(siguientes[..n].iter().cloned().zip(respuestas));
     }
 
     fn persistir(&mut self) {
@@ -324,10 +357,12 @@ impl LectorHistoria {
             "version": 1, "tipo": "HISTORIA_LECTURA", "estado": "EN_CURSO",
             "criterio_temporal": format!("ventana_{}_meses", self.meses), "meses": self.meses, "causas": {},
             "vinculos": [], "lecturas": 0, "errores_listado": [],
-            "descargador": {"version": super::extension::version(super::Edicion::Integral), "commit": "desarrollo"},
-            "extension_version": super::extension::version(super::Edicion::Integral),
+            "descargador": {"version": self.version_extension, "commit": "desarrollo"},
+            "extension_version": self.version_extension,
         });
         std::fs::create_dir_all(&self.carpeta).map_err(|e| format!("No se pudo crear la carpeta de la historia: {e}"))?;
+        // No se acepta una historia de otra corrida. La ruta debe ser el manifiesto del propio lote.
+        if self.anterior.as_ref().is_some_and(|r| r.canonicalize().ok() != self.carpeta.join(MANIFIESTO).canonicalize().ok()) { self.anterior = None; }
         self.cargar_anterior();
         self.persistir();
         Ok(())
@@ -381,6 +416,7 @@ impl LectorHistoria {
         let seleccion = super::vinculos::Seleccion { tribunal: tribunal.into(), screen: "seguimiento".into(), tab: pestana.into() };
         let resultado = (|| -> Result<(), String> {
             let filas = super::vinculos::extraer(listado, &seleccion)?;
+            let mut pendientes = Vec::new();
             for v in filas.iter().filter(|v| !v.rit_enlace.is_empty()) {
                 let fila = v.historia_python();
                 let clave = format!("RUS|{tribunal}|{}", fila["causa_id"].as_str().unwrap_or(""));
@@ -429,9 +465,18 @@ impl LectorHistoria {
                     && !cancelar.load(std::sync::atomic::Ordering::SeqCst)
                     && !self.fallo_persistencia
                 {
-                    self.leer(conexion, cancelar, &clave);
+                    if self.rapido {
+                        if !pendientes.contains(&clave) { pendientes.push(clave); }
+                    } else { self.leer(conexion, cancelar, &clave, &[]); }
                 }
             }
+            // En modo rápido se resuelven primero los conflictos de identidad de la página.
+            pendientes.retain(|c| self.estado["causas"][c]["estado"] == "PENDIENTE");
+            for (i, clave) in pendientes.iter().enumerate() {
+                if cancelar.load(std::sync::atomic::Ordering::SeqCst) || self.fallo_persistencia { break; }
+                self.leer(conexion, cancelar, clave, &pendientes[i + 1..]);
+            }
+            self.prefetched.clear();
             Ok(())
         })();
         if let Err(e) = resultado {
@@ -442,14 +487,13 @@ impl LectorHistoria {
     }
 
     /// `_leer`: una ventana de historia, con cotejo de huella, parámetros, RIT y tribunal visibles.
-    fn leer(&mut self, conexion: &dyn Conexion, cancelar: &std::sync::atomic::AtomicBool, clave: &str) {
-        if self.estado["lecturas"].as_u64().unwrap_or(0) as usize >= MAX_HISTORIAS_POR_LOTE {
+    fn leer(&mut self, conexion: &dyn Conexion, cancelar: &std::sync::atomic::AtomicBool, clave: &str, siguientes: &[String]) {
+        if !self.prefetched.contains_key(clave) && self.estado["lecturas"].as_u64().unwrap_or(0) as usize >= MAX_HISTORIAS_POR_LOTE {
             self.estado["causas"][clave]["estado"] = json!("PENDIENTE");
             self.estado["causas"][clave]["error"] = json!("HISTORIA_TOPE");
             self.estado["tope_alcanzado"] = json!(true);
             return;
         }
-        self.estado["lecturas"] = json!(self.estado["lecturas"].as_u64().unwrap_or(0) + 1);
         let causa = self.estado["causas"][clave].clone();
         let tribunal = causa["tribunal"].as_str().unwrap_or("").to_string();
         let rit_pedido = causa["rit_enlace"].as_str().filter(|r| !r.is_empty()).or(causa["rit"].as_str()).unwrap_or("").to_string();
@@ -457,8 +501,16 @@ impl LectorHistoria {
         let params = json!({"tribunal": tribunal, "rit": rit_pedido, "causa": causa_id});
         let carpeta = self.carpeta.clone();
         let (meses, desfase) = (self.meses, self.desfase);
-        let resultado = (|| -> Result<Map<String, Value>, String> {
-            let respuesta = conexion.llamar("history_open", json!({"params": params, "timeout": 60000}), lote::PLAZO)?;
+        let respuesta = if let Some(r) = self.prefetched.remove(clave) { r } else {
+            self.estado["lecturas"] = json!(self.estado["lecturas"].as_u64().unwrap_or(0) + 1);
+            let inicio = std::time::Instant::now();
+            let r = conexion.llamar("history_open", json!({"params": params, "timeout": 60000}), lote::PLAZO);
+            self.control_pausa.observar(inicio.elapsed(), r.is_ok());
+            r
+        };
+        let sana = respuesta.is_ok();
+        let procesar = move || -> Result<Map<String, Value>, String> {
+            let respuesta = respuesta?;
             let datos = lote::cuerpo(&respuesta, false)?;
             let huella = sha256(&datos);
             if datos.len() > MAX_BYTES || respuesta["digest"].as_str() != Some(huella.as_str()) || respuesta["params"] != params {
@@ -522,7 +574,14 @@ impl LectorHistoria {
                 m.insert(k.into(), v);
             }
             Ok(m)
-        })();
+        };
+        let resultado = if self.rapido && sana && self.prefetched.is_empty() && !siguientes.is_empty() {
+            std::thread::scope(|scope| {
+                let trabajo = scope.spawn(procesar);
+                self.preparar_siguientes(conexion, cancelar, siguientes);
+                trabajo.join().unwrap_or_else(|_| Err("HISTORIA_LECTURA_ERROR".into()))
+            })
+        } else { procesar() };
         let resultado = resultado.map(|mut m| {
             if let Some(p) = m.remove("_pestanas") {
                 self.pestanas.push(p);
@@ -536,15 +595,13 @@ impl LectorHistoria {
                 destino.extend(m);
             }
             Err(e) => {
+                if sana { self.control_pausa.observar(Duration::ZERO, false); }
                 destino.insert("estado".into(), json!("FALLIDA"));
                 destino.insert("error".into(), json!(codigo_error(&e, "HISTORIA_LECTURA_ERROR")));
             }
         }
-        if !self.pausa.is_zero() {
-            let fin = std::time::Instant::now() + self.pausa;
-            while std::time::Instant::now() < fin && !cancelar.load(std::sync::atomic::Ordering::SeqCst) {
-                std::thread::sleep((fin - std::time::Instant::now()).min(Duration::from_millis(20)));
-            }
+        if self.prefetched.is_empty() {
+            preferencias::esperar(self.control_pausa.pausa(), cancelar);
         }
     }
 

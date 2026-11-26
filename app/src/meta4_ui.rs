@@ -376,7 +376,8 @@ impl Meta4Vista {
         });
         ui.add_space(8.0);
         theme::card(p).show(ui, |ui| {
-            theme::seccion(ui, p, "Alcance de ingresos del lote");
+            theme::seccion(ui, p, "Alcance de ingresos acreditado del lote (Descargador)");
+            ui.label("Este alcance describe los ingresos consultados; no es el período de observaciones de Meta 4.");
             if !self.lotes.is_empty() {
                 for alcance in &self.alcance_ingresos {
                     ui.label(RichText::new(format!("{} · {}", etiqueta_alcance(alcance), alcance.carpeta.display()))
@@ -402,7 +403,8 @@ impl Meta4Vista {
                 }
             });
             let desde_sugerido = dia(&self.corte, "Hasta").ok().map(|hasta| flow_meta4::periodo(hasta).0.to_string());
-            ui.label("Período de observaciones (Desde / Hasta; DD/MM/AAAA o AAAA-MM-DD)");
+            theme::seccion(ui, p, "Período de observaciones (Meta 4)");
+            ui.label("Desde / Hasta (DD/MM/AAAA o AAAA-MM-DD)");
             ui.horizontal_wrapped(|ui| {
                 ui.label("Desde");
                 ui.add_enabled(!self.ocupado, egui::TextEdit::singleline(&mut self.desde)

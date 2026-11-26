@@ -5,6 +5,7 @@ use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Consulta favorita (`Preferences.favorite`): el alcance sin filtros privados ni fechas fijas. Las fechas se
 /// recalculan al aplicarla (últimos 30 días) y los calendarios guardan el mes relativo (actual o siguiente).
@@ -39,12 +40,100 @@ pub fn limitar_pausa(valor: f64) -> f64 {
     valor.clamp(PAUSA_MINIMA_S, PAUSA_MAXIMA_S)
 }
 
+/// Configuración opt-in. Por omisión se conserva la pausa fija y un único fetch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Rapido {
+    pub activado: bool,
+    pub pausa_ms: u64,
+    pub concurrencia: usize,
+}
+impl Default for Rapido {
+    fn default() -> Self { Self { activado: false, pausa_ms: 350, concurrencia: 2 } }
+}
+impl Rapido {
+    pub fn limitado(mut self) -> Self {
+        self.pausa_ms = self.pausa_ms.clamp(200, 350);
+        self.concurrencia = self.concurrencia.clamp(1, 3);
+        self
+    }
+    pub fn tope(self) -> usize { if self.activado { self.limitado().concurrencia } else { 1 } }
+}
+
+/// Control de la sesión de lectura, sin almacenamiento entre corridas.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PausaAdaptativa {
+    config: Rapido,
+    fija: Duration,
+    ms: u64,
+    sanas: usize,
+    fallas: usize,
+    degradada: bool,
+}
+impl PausaAdaptativa {
+    pub(super) fn nueva(fija: Duration, config: Rapido) -> Self {
+        Self { config: config.limitado(), fija, ms: 1000, sanas: 0, fallas: 0, degradada: false }
+    }
+    pub(super) fn observar(&mut self, latencia: Duration, sana: bool) {
+        if !self.config.activado { return; }
+        if !sana {
+            self.ms = 2000;
+            self.sanas = 0;
+            self.fallas = self.fallas.saturating_add(1);
+            if self.fallas >= 2 { self.degradada = true; }
+        } else if latencia >= Duration::from_millis(400) {
+            self.ms = if latencia >= Duration::from_secs(1) { 2000 } else { 1000.max(self.ms) };
+            self.sanas = 0;
+            self.fallas = 0;
+        } else {
+            self.fallas = 0;
+            self.sanas += 1;
+            if self.sanas >= 2 {
+                self.ms = self.ms.saturating_sub(250).max(self.config.pausa_ms);
+                self.sanas = 0;
+            }
+        }
+    }
+    pub(super) fn pausa(self) -> Duration {
+        if self.config.activado { Duration::from_millis(self.ms) } else { self.fija }
+    }
+    pub(super) fn tope(self) -> usize {
+        if self.degradada || self.ms >= 1000 { 1 } else { self.config.tope() }
+    }
+}
+
+/// Espera cancelable común a las ventanas; no se acumulan pausas en un pipeline.
+pub(super) fn esperar(pausa: Duration, cancelar: &std::sync::atomic::AtomicBool) -> bool {
+    let inicio = std::time::Instant::now();
+    loop {
+        if cancelar.load(std::sync::atomic::Ordering::SeqCst) { return false; }
+        let restante = pausa.saturating_sub(inicio.elapsed());
+        if restante.is_zero() { return true; }
+        std::thread::sleep(restante.min(Duration::from_millis(20)));
+    }
+}
+
+/// Despacho local por grupo: la orden especial nunca llega a Chrome ni a SITFA. La extensión
+/// anterior no anuncia la capacidad y el llamador conserva entonces el transporte secuencial.
+pub(super) fn pedir_grupo(conexion: &dyn super::lote::Conexion, comando: &str, cargas: &[serde_json::Value], plazo: Duration) -> Vec<Result<serde_json::Value, String>> {
+    if cargas.len() == 1 { return vec![conexion.llamar(comando, cargas[0].clone(), plazo)]; }
+    let respuesta = conexion.llamar("context_batch", serde_json::json!({"command": comando, "payloads": cargas}), plazo);
+    match respuesta {
+        Ok(v) => match v.as_array().filter(|a| a.len() == cargas.len()) {
+            Some(a) => a.iter().map(|r| if r["ok"] == true { Ok(r["result"].clone()) } else { Err(r["error"].as_str().unwrap_or("Lectura no completada.").to_string()) }).collect(),
+            None => (0..cargas.len()).map(|_| Err("Respuesta de grupo inválida.".into())).collect(),
+        },
+        Err(e) => (0..cargas.len()).map(|_| Err(e.clone())).collect(),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferencias {
     pub destino: String,
     pub pdf_sin_registros: bool,
     pub pausa_consultas: f64,
+    pub rapido: Rapido,
     pub favoritos: BTreeMap<String, Favorito>,
     /// Lecturas de contexto del lote de bitácoras (`preferencias.py`, mismas claves y valores por omisión).
     pub reutilizar_bitacoras: bool,
@@ -65,8 +154,9 @@ impl Default for Preferencias {
             destino: String::new(),
             pdf_sin_registros: true,
             pausa_consultas: PAUSA_DEFECTO_S,
+            rapido: Rapido::default(),
             favoritos: BTreeMap::new(),
-            reutilizar_bitacoras: true,
+            reutilizar_bitacoras: false,
             leer_calendarios: false,
             leer_historia: false,
             leer_historico: false,
@@ -92,6 +182,8 @@ impl Preferencias {
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
         p.pausa_consultas = limitar_pausa(p.pausa_consultas);
+        p.rapido = p.rapido.limitado();
+        p.reutilizar_bitacoras = false; // No se reutilizan lecturas de lotes distintos.
         if !(1..=4).contains(&p.meses_atras) {
             p.meses_atras = 4;
         }
@@ -196,6 +288,26 @@ impl Preferencias {
 mod tests {
     use super::*;
     use crate::descargador::{lote, Edicion};
+
+    #[test]
+    fn pausa_adaptativa_reacciona_y_desciende_gradualmente() {
+        let mut p = PausaAdaptativa::nueva(Duration::from_secs(1), Rapido { activado: true, pausa_ms: 250, concurrencia: 99 });
+        assert_eq!(p.tope(), 1);
+        for _ in 0..6 { p.observar(Duration::from_millis(150), true); }
+        assert_eq!(p.pausa(), Duration::from_millis(250));
+        assert_eq!(p.tope(), 3);
+        p.observar(Duration::from_millis(500), true);
+        assert_eq!(p.pausa(), Duration::from_secs(1));
+        p.observar(Duration::from_secs(2), false);
+        p.observar(Duration::from_millis(1), false);
+        assert_eq!(p.pausa(), Duration::from_secs(2));
+        for _ in 0..20 { p.observar(Duration::from_millis(150), true); }
+        assert_eq!(p.pausa(), Duration::from_millis(250));
+        assert_eq!(p.tope(), 1);
+        let mut fijo = PausaAdaptativa::nueva(Duration::from_millis(750), Rapido::default());
+        fijo.observar(Duration::from_secs(20), false);
+        assert_eq!(fijo.pausa(), Duration::from_millis(750));
+    }
 
     #[test]
     fn a3_preferencias_descargador_limites_y_persistencia() {
@@ -389,7 +501,7 @@ mod tests {
         assert_eq!(
             (d.reutilizar_bitacoras, d.leer_calendarios, d.leer_historia, d.leer_historico, d.historia_en_paquete, d.meses_atras,
              d.paquete_consolidado),
-            (true, false, false, false, true, 4, true)
+            (false, false, false, false, true, 4, true)
         );
         let carpeta = std::env::temp_dir().join(format!("flow-eq6-prefs-{}", std::process::id()));
         std::fs::create_dir_all(&carpeta).unwrap();

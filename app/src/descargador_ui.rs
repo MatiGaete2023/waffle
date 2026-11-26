@@ -43,6 +43,7 @@ pub struct Descargador {
     favorito_mensaje: Option<Result<String, String>>,
     resultados: Resultados,
     conjunta: FlujoConjunto,
+    estaba_ejecutando: bool,
 }
 
 #[derive(Default)]
@@ -50,6 +51,22 @@ struct FlujoConjunto {
     recepcion: Option<mpsc::Receiver<Result<String, String>>>,
     cancelar: Option<Arc<AtomicBool>>,
     mensajes: Vec<String>,
+}
+
+fn evento_conjunto(evento: Evento) -> String {
+    match evento {
+        Evento::Carpeta(r) => format!("Carpeta de trabajo: {}", r.display()),
+        Evento::Plan(n) => format!("Consultas planificadas: {n}"),
+        Evento::Consulta { indice, total, etiqueta } => format!("Consulta {indice} de {total}: {etiqueta}"),
+        Evento::Estado(t) => format!("Estado: {t}"),
+        Evento::Total(n) => format!("Registros encontrados: {n}"),
+        Evento::Pagina { consulta, pagina, total } => format!("{consulta}: página {pagina} de {total}"),
+        Evento::Vacia { consulta } => format!("{consulta}: sin registros"),
+        Evento::Evidencia { archivo } => format!("Evidencia guardada: {archivo}"),
+        Evento::ConsultaLista { consulta, estado } => format!("Consulta {consulta}: {estado}"),
+        Evento::Aviso(t) => format!("Aviso: {t}"),
+        Evento::Fin(f) => format!("Fase terminada: {} consultas, {} registros y {} archivos", f.consultas, f.registros, f.archivos),
+    }
 }
 
 impl FlujoConjunto {
@@ -63,7 +80,7 @@ impl FlujoConjunto {
         std::thread::spawn(move || {
             let opciones = lote::Opciones { pausa: Duration::from_secs_f64(preferencias::limitar_pausa(f64::from(pausa))), ..Default::default() };
             let resultado = puente.verificar(Edicion::Integral).and_then(|_| flow_rust::descargador::flujo_csmp::ejecutar(puente.as_ref(), &tribunales, &modalidades, &modo, &destino, fecha, dias, recuperar.as_deref(), &opciones, &cancelar, &mut |evento| {
-                let _ = envio.send(Ok(format!("{evento:?}")));
+                let _ = envio.send(Ok(evento_conjunto(evento)));
                 ctx.request_repaint();
             }));
             let _ = envio.send(resultado.map(|ruta| format!("Conjunto preparado: {}", ruta.display())));
@@ -397,7 +414,7 @@ impl Flujo {
         conexion: Option<Arc<dyn lote::Conexion + Send + Sync>>,
     ) {
         self.recibir();
-        theme::seccion(ui, p, "Paquete en una acción");
+        theme::seccion(ui, p, "2. Ejecución y progreso · Consultar y crear paquete");
         ui.label(
             RichText::new(
                 "Consulta SITFA, lee bitácoras, calendarios, historia e histórico y crea el paquete en una sola \
@@ -550,6 +567,7 @@ enum Trabajo {
 /// `create_package` de Flow Python. Lee con la sesión del usuario a través de la extensión; nada se escribe en SITFA.
 struct Contexto {
     reutilizar: bool,
+    rapido: preferencias::Rapido,
     calendarios: bool,
     historia: bool,
     historia_en_paquete: bool,
@@ -572,7 +590,8 @@ struct Contexto {
 impl Contexto {
     fn desde(p: &Preferencias) -> Self {
         Self {
-            reutilizar: p.reutilizar_bitacoras,
+            reutilizar: false,
+            rapido: p.rapido.limitado(),
             calendarios: p.leer_calendarios,
             historia: p.leer_historia,
             historia_en_paquete: p.historia_en_paquete,
@@ -598,7 +617,8 @@ impl Contexto {
     fn guardar_preferencias(&self) -> Option<String> {
         let ruta = Preferencias::ruta();
         let mut p = Preferencias::cargar(&ruta);
-        p.reutilizar_bitacoras = self.reutilizar;
+        p.reutilizar_bitacoras = false;
+        p.rapido = self.rapido.limitado();
         p.leer_calendarios = self.calendarios;
         p.leer_historia = self.historia;
         p.historia_en_paquete = self.historia_en_paquete;
@@ -672,10 +692,12 @@ impl Contexto {
         self.paquete = None;
         self.filas.clear();
         self.avisos.clear();
+        puente.configurar_concurrencia(self.rapido.tope());
         let historia_anterior = retomar.as_ref().map(|r| r.join("historia").join("historias.json")).filter(|h| self.historia && h.is_file());
         let opciones = bitacoras::Opciones {
             pausa: Duration::from_secs_f64(pausa),
-            reutilizar_base: (self.reutilizar && retomar.is_none()).then(|| destino.clone()),
+            reutilizar_base: None,
+            rapido: self.rapido.limitado(),
             retomar,
             calendarios: self.calendarios,
             historico: self.historico,
@@ -755,8 +777,7 @@ impl Contexto {
         let activa = self.activa();
         ui.add_enabled_ui(!activa && !ocupado, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.checkbox(&mut self.reutilizar, "Reutilizar bitácoras de hoy")
-                    .on_hover_text("Solo lecturas del mismo día y de menos de 12 h, con su huella comprobada");
+                ui.label("Cada lote realiza lecturas frescas; solo se retoma su propia evidencia.");
                 ui.checkbox(&mut self.calendarios, "Calendario de informes")
                     .on_hover_text("Calendario de cada ingreso de Cumplimiento e Informes; cuenta en el máximo de lecturas del lote");
                 ui.checkbox(&mut self.historia, "Historia de la causa (prueba)");
@@ -1394,45 +1415,28 @@ impl Descargador {
             self.usar_catalogo(Some(catalogo), true);
         }
         let ejecutando = self.ejecucion.activa() || self.ejecucion.contexto.activa() || self.ejecucion.flujo.activa() || self.conjunta.recepcion.is_some();
+        if self.estaba_ejecutando && !ejecutando { self.resultados.invalidar_indice(); }
+        self.estaba_ejecutando = ejecutando;
         theme::titulo(
             ui,
             p,
             "Descargador",
             "Perfiles de consulta desde Chrome o un catálogo JSON",
         );
+        theme::seccion(ui, p, "1. Alcance y filtros");
         theme::card(p).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.add_enabled_ui(!ejecutando, |ui| self.mostrar_perfiles(ui, p));
         });
         let conectado = self.edicion == Edicion::Integral && self.conexion.puente.as_ref().is_some_and(|p| p.conectado());
         let seguimiento = self.catalogo.as_ref().is_some_and(|c| c.pantalla == Pantalla::Seguimiento) && self.catalogo_remoto;
-        ui.horizontal_wrapped(|ui| {
-            if ui.add_enabled(!ejecutando && conectado && seguimiento && !self.lote.tribunales.is_empty(), egui::Button::new("Descarga conjunta CSMP")).clicked() {
-                if self.lote.pestanas.len() != 1 || !matches!(self.lote.pestanas[0].as_str(), "Espera" | "Cumplimiento") {
-                    self.conjunta.mensajes.push("Selecciona Espera o Cumplimiento para la descarga conjunta.".into());
-                } else if !matches!(rango_visible(Pantalla::Seguimiento, &self.lote_desde, &self.lote_hasta, self.todas_las_fechas), Ok(None)) {
-                    self.conjunta.mensajes.push("La descarga conjunta CSMP usa todas las fechas. Marca esa opción expresamente o utiliza Consultar y crear paquete para un rango de ingresos.".into());
-                } else if let Some(puente) = self.conexion.puente.clone() {
-                    self.conjunta.lanzar(ui.ctx(), puente, PathBuf::from(&self.ejecucion.destino), self.lote.tribunales.clone(), self.lote.modalidades.clone(), self.lote.pestanas[0].clone(), chrono::Local::now().date_naive(), 60, None, self.ejecucion.pausa);
-                }
-            }
-            if ui.add_enabled(!ejecutando && conectado, egui::Button::new("Retomar flujo…")).clicked() {
-                if let (Some(carpeta), Some(puente)) = (rfd::FileDialog::new().set_title("Elegir carpeta de descarga conjunta").pick_folder(), self.conexion.puente.clone()) {
-                    if let Err(error) = self.conjunta.retomar(ui.ctx(), puente, carpeta, self.ejecucion.pausa) { self.conjunta.mensajes.push(error); }
-                }
-            }
-            if let Some(cancelar) = &self.conjunta.cancelar {
-                if ui.button("Cancelar descarga conjunta").clicked() { cancelar.store(true, Ordering::Relaxed); }
-            }
-        });
-        for mensaje in self.conjunta.mensajes.iter().rev().take(5).rev() { ui.label(mensaje); }
         if let Some(catalogo) = &self.catalogo {
             if catalogo.pantalla != Pantalla::Carga || self.edicion == Edicion::Integral {
                 ui.add_space(8.0);
                 theme::card(p).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     egui::CollapsingHeader::new("Planificar lote")
-                        .default_open(self.plan.is_some())
+                        .default_open(true)
                         .show(ui, |ui| {
                             ui.add_enabled_ui(!ejecutando, |ui| {
                                 if mostrar_lote(
@@ -1541,6 +1545,27 @@ impl Descargador {
                                 Some(_) => None,
                                 None => plan_visible,
                             };
+                            let previo = self.ejecucion.contexto.rapido;
+                            ui.add_enabled_ui(!ejecutando && self.edicion == Edicion::Integral, |ui| {
+                                let rapido = &mut self.ejecucion.contexto.rapido;
+                                ui.checkbox(&mut rapido.activado, "Modo Rápido Seguro (pausa adaptativa + tope 2–3)");
+                                if rapido.activado {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("Pausa sana (ms)");
+                                        ui.add(egui::DragValue::new(&mut rapido.pausa_ms).range(200..=350));
+                                        ui.label("Máximo de lecturas simultáneas");
+                                        for n in 1..=3 { ui.selectable_value(&mut rapido.concurrencia, n, n.to_string()); }
+                                    });
+                                }
+                                ui.label("Protección de sesión SITFA: aumenta la pausa ante lentitud y reduce a una lectura ante fallas. Requiere recargar la extensión Integral actualizada.");
+                            });
+                            if previo != self.ejecucion.contexto.rapido {
+                                self.ejecucion.contexto.rapido = self.ejecucion.contexto.rapido.limitado();
+                                if let Some(e) = self.ejecucion.contexto.guardar_preferencias() { ui.label(e); }
+                            }
+                            if !ejecutando {
+                                if let Some(puente) = &self.conexion.puente { puente.configurar_concurrencia(self.ejecucion.contexto.rapido.tope()); }
+                            }
                             let opciones_paquete = flujo_paquete::Opciones {
                                 consolidado: self.ejecucion.contexto.consolidado,
                                 calendarios: self.ejecucion.contexto.calendarios,
@@ -1552,7 +1577,8 @@ impl Descargador {
                                 fecha_informes: chrono::Local::now().date_naive(),
                                 pdf_vacias: self.ejecucion.evidencia,
                                 pausa: Duration::from_secs_f64(preferencias::limitar_pausa(f64::from(self.ejecucion.pausa))),
-                                reutilizar: self.ejecucion.contexto.reutilizar,
+                                reutilizar: false,
+                                rapido: self.ejecucion.contexto.rapido,
                             };
                             self.ejecucion.mostrar(
                                 ui,
@@ -1570,6 +1596,29 @@ impl Descargador {
                 });
             }
         }
+        theme::seccion(ui, p, "Descarga conjunta · todas las fechas");
+        ui.horizontal_wrapped(|ui| {
+            if ui.add_enabled(!ejecutando && conectado && seguimiento && !self.lote.tribunales.is_empty(), egui::Button::new("Descarga conjunta CSMP")).clicked() {
+                if self.lote.pestanas.len() != 1 || !matches!(self.lote.pestanas[0].as_str(), "Espera" | "Cumplimiento") {
+                    self.conjunta.mensajes.push("Selecciona Espera o Cumplimiento para la descarga conjunta.".into());
+                } else if !matches!(rango_visible(Pantalla::Seguimiento, &self.lote_desde, &self.lote_hasta, self.todas_las_fechas), Ok(None)) {
+                    self.conjunta.mensajes.push("La descarga conjunta CSMP usa todas las fechas. Marca esa opción expresamente o utiliza Consultar y crear paquete para un rango de ingresos.".into());
+                } else if let Some(puente) = self.conexion.puente.clone() {
+                    self.conjunta.lanzar(ui.ctx(), puente, PathBuf::from(&self.ejecucion.destino), self.lote.tribunales.clone(), self.lote.modalidades.clone(), self.lote.pestanas[0].clone(), chrono::Local::now().date_naive(), 60, None, self.ejecucion.pausa);
+                }
+            }
+            if ui.add_enabled(!ejecutando && conectado, egui::Button::new("Retomar flujo…")).clicked() {
+                if let (Some(carpeta), Some(puente)) = (rfd::FileDialog::new().set_title("Elegir carpeta de descarga conjunta").pick_folder(), self.conexion.puente.clone()) {
+                    if let Err(error) = self.conjunta.retomar(ui.ctx(), puente, carpeta, self.ejecucion.pausa) { self.conjunta.mensajes.push(error); }
+                }
+            }
+            if let Some(cancelar) = &self.conjunta.cancelar {
+                if ui.button("Cancelar descarga conjunta").clicked() { cancelar.store(true, Ordering::Relaxed); }
+            }
+        });
+        for mensaje in self.conjunta.mensajes.iter().rev().take(5).rev() { ui.label(mensaje); }
+        theme::seccion(ui, p, "3. Paquete y resultados");
+        self.estaba_ejecutando |= self.ejecucion.activa() || self.ejecucion.contexto.activa() || self.ejecucion.flujo.activa() || self.conjunta.recepcion.is_some();
         let terminada = self.ejecucion.terminada();
         self.resultados.ofrecer(ui.ctx(), terminada);
         ui.add_space(8.0);
@@ -1838,6 +1887,7 @@ fn mostrar_lote(
     let mut descartar_pendientes = cambio;
     if !matches!(catalogo.pantalla, Pantalla::CalendarioInformes | Pantalla::CalendarioMedidas) {
         ui.label("Alcance de ingresos del lote");
+        ui.label(RichText::new("Alcance de ingresos (Descargador)").strong());
         let edito = ui.horizontal_wrapped(|ui| fecha(ui, "Desde", desde) | fecha(ui, "Hasta", hasta)).inner;
         if edito { *todas = false; }
         descartar_pendientes |= edito;
@@ -2069,10 +2119,10 @@ mod pruebas_interfaz {
             vista,
         );
         h.run();
-        // Valores por omisión de `preferencias.py`: reutilizar sí; calendario, historia e histórico no; 4 meses.
+        // Flow Rust exige lecturas frescas por lote; calendario, historia e histórico no; 4 meses.
         let c = &h.state().contexto;
         assert_eq!((c.reutilizar, c.calendarios, c.historia, c.historico, c.historia_en_paquete, c.meses, c.consolidado),
-                   (true, false, false, false, true, 4, true));
+                   (false, false, false, false, true, 4, true));
         assert!(h.query_by_label("Historia en el paquete").is_none(), "«Historia en el paquete» solo con la historia elegida");
         h.get_by_label("Historia de la causa (prueba)").click();
         h.run();
@@ -2136,7 +2186,9 @@ mod pruebas_interfaz {
         let aviso = resultado.as_object_mut().unwrap().remove("aviso_cobertura").unwrap();
         assert_eq!(resultado, esperado, "resultado distinto de package_current_lot");
         let mut zip = zip::ZipArchive::new(std::fs::File::open(&destino).unwrap()).unwrap();
-        let manifiesto: Value = serde_json::from_reader(zip.by_name("manifest.json").unwrap()).unwrap();
+        let mut manifiesto: Value = serde_json::from_reader(zip.by_name("manifest.json").unwrap()).unwrap();
+        assert_eq!(manifiesto["downloader"]["version"], flow_rust::descargador::extension::version(Edicion::Integral));
+        manifiesto["downloader"]["version"] = e["paquete"]["manifest.json"]["downloader"]["version"].clone();
         assert_eq!(manifiesto, e["paquete"]["manifest.json"], "el paquete de la interfaz difiere del de Flow Python");
         assert!(h.query_by_label(&format!("Paquete creado: {}", destino.display())).is_some());
         assert!(h.query_by_label(e["resultado"]["reuse"].as_str().unwrap()).is_some());
@@ -2335,4 +2387,11 @@ mod pruebas_interfaz {
         assert!(h.state().resultado.is_none());
         let _ = std::fs::remove_dir_all(&destino);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn evento_conjunto_legible() {
+    assert_eq!(evento_conjunto(Evento::Plan(3)), "Consultas planificadas: 3");
+    assert_eq!(evento_conjunto(Evento::Pagina { consulta: "Sintética".into(), pagina: 2, total: 4 }), "Sintética: página 2 de 4");
 }
