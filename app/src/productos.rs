@@ -9,7 +9,7 @@ use chrono::NaiveDate;
 use regex::Regex;
 use rust_xlsxwriter::{Format, Workbook};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -176,6 +176,9 @@ pub struct Borrador {
     pub kind: String,
     pub titulo: String,
     pub para: String,
+    /// Valor de Contactos al preparar; None indica edición manual o borrador antiguo.
+    #[serde(default)]
+    pub para_automatico: Option<String>,
     pub cc: String,
     pub asunto: String,
     pub cuerpo: String,
@@ -306,6 +309,7 @@ pub fn preparar_borradores(w: &Trabajo, cfg: &Config, o: &OpcionesCorreo) -> Vec
             out.push(Borrador {
                 kind: kind.into(),
                 titulo: if programa.is_empty() { format!("{} · {}", tpl.nombre, trib_nombre) } else { format!("{} · {}", programa, trib_nombre) },
+                para_automatico: Some(para.clone()),
                 para,
                 cc: cfg.cc(),
                 asunto: render_vars(&tpl.asunto, &vars),
@@ -341,6 +345,7 @@ pub fn preparar_borradores(w: &Trabajo, cfg: &Config, o: &OpcionesCorreo) -> Vec
             out.push(Borrador {
                 kind: w.mode().key().into(),
                 titulo: format!("{} · {}", tpl.nombre, trib_nombre),
+                para_automatico: Some(cfg.tribunales.get(&trib).map(|t| t.para.clone()).unwrap_or_default()),
                 para: cfg.tribunales.get(&trib).map(|t| t.para.clone()).unwrap_or_default(),
                 cc: cfg.cc(),
                 asunto: render_vars(&tpl.asunto, &vars),
@@ -386,6 +391,7 @@ pub fn borrador_plantilla(w: Option<&Trabajo>, cfg: &Config, kind: &str, filas: 
     Some(Borrador {
         kind: kind.into(),
         titulo: format!("{} · {}", tpl.nombre, trib_nombre),
+        para_automatico: Some(cfg.tribunales.get(&trib).map(|t| t.para.clone()).unwrap_or_default()),
         para: cfg.tribunales.get(&trib).map(|t| t.para.clone()).unwrap_or_default(),
         cc: cfg.cc(),
         asunto: render_vars(&tpl.asunto, &vars),
@@ -407,7 +413,8 @@ fn con_firma(cuerpo: &str, cfg: &Config) -> String {
 }
 
 fn enc_word(s: &str) -> String {
-    if s.is_ascii() { s.to_string() } else { format!("=?utf-8?B?{}?=", base64::engine::general_purpose::STANDARD.encode(s.as_bytes())) }
+    let s = config::sanitizar_cabecera(s);
+    if s.is_ascii() { s } else { format!("=?utf-8?B?{}?=", base64::engine::general_purpose::STANDARD.encode(s.as_bytes())) }
 }
 
 fn b64_lines(data: &[u8]) -> String {
@@ -422,15 +429,12 @@ pub fn guardar_eml(b: &Borrador, dir: &Path) -> Result<PathBuf, String> {
         return Err(format!("«{}» necesita una nómina con al menos una fila.", b.titulo));
     }
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let mut cc = b.cc.clone();
-    if !cc.to_lowercase().contains(config::CC_OBLIGATORIO) {
-        cc = if cc.trim().is_empty() { config::CC_OBLIGATORIO.into() } else { format!("{}; {cc}", config::CC_OBLIGATORIO) };
-    }
+    let cc = config::cc_obligatorio(&b.cc);
     let boundary = format!("flow-{}", chrono::Local::now().timestamp_nanos_opt().unwrap_or(0));
     let mut out = String::new();
     out.push_str("X-Unsent: 1\r\n");
-    out.push_str(&format!("To: {}\r\n", b.para.replace('\n', " ")));
-    out.push_str(&format!("Cc: {}\r\n", cc.replace('\n', " ")));
+    out.push_str(&format!("To: {}\r\n", config::sanitizar_cabecera(&b.para)));
+    out.push_str(&format!("Cc: {}\r\n", cc));
     out.push_str(&format!("Subject: {}\r\n", enc_word(&b.asunto)));
     out.push_str("MIME-Version: 1.0\r\n");
     out.push_str(&format!("Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n"));
@@ -506,11 +510,10 @@ pub struct Proyecto {
 
 pub fn res_tipo(txt: &str) -> Option<&'static str> {
     let t = normalizar(txt).replace('_', " ");
-    let t = t.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
     match t.as_str() {
-        x if x.starts_with("pc ie") => Some("PC_IE"),
-        x if x.starts_with("pc info") => Some("PC_INFO"),
-        x if x.starts_with("nomencl") => Some("NOMENCL"),
+        "pc ie" => Some("PC_IE"),
+        "pc info" => Some("PC_INFO"),
+        "nomencl" | "nomenclatura" => Some("NOMENCL"),
         _ => None,
     }
 }
@@ -553,21 +556,82 @@ fn nomenclatura(regs: &[&Registro]) -> String {
     String::new()
 }
 
-/// Un proyecto por tribunal, RIT y tipo con todas las personas de la causa. Si el Excel trae RES, solo esas causas.
+const TIPOS_PROYECTO: [&str; 3] = ["PC_IE", "PC_INFO", "NOMENCL"];
+const RESUELTAS_POR_EVIDENCIA: [&str; 3] = ["HISTORIA.INFORME_AVANCE_PENDIENTE", "HISTORIA.INFORME_REVISAR_ASOCIACION", "HISTORIA.C10_ESCRITO"];
+
+fn res_marcada(raw: &str) -> bool {
+    res_tipo(raw).is_some() || matches!(raw.trim().replace(',', ".").as_str(), "1" | "1.0")
+        || matches!(normalizar(raw).as_str(), "si" | "s" | "x" | "true" | "verdadero" | "res" | "resolucion" | "con resolucion")
+}
+
+/// Las sesiones antiguas y el selector actual de RES solo guardaban la celda.
+/// Una elección estructurada distinta de auto siempre tiene precedencia.
+pub(crate) fn modo_resolucion(r: &Registro) -> &str {
+    if !r.resolucion.is_empty() && r.resolucion != "auto" { return &r.resolucion; }
+    // Un auto estructurado importado no debe convertirse en una selección por una sugerencia visible.
+    if r.sync_decisiones.as_deref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .is_some_and(|v| v["decisions"]["structured"].as_bool() == Some(true)
+            && v["decisions"]["resolution"].as_str() == Some("auto")
+            && v["resolution_cell"].as_str() == Some(r.res.as_str())) { return "auto"; }
+    if let Some(tipo) = res_tipo(&r.res) { return tipo; }
+    if !r.res.trim().is_empty() { return "review"; }
+    "auto"
+}
+
+fn tiene_decision_estructurada(r: &Registro) -> bool {
+    (!r.resolucion.is_empty() && r.resolucion != "auto")
+        || r.sync_decisiones.as_deref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .is_some_and(|v| v["decisions"]["structured"].as_bool() == Some(true))
+}
+
+fn tipo_observado(r: &Registro) -> Option<&'static str> {
+    let t = normalizar(r.observacion());
+    if t.contains("nomencl") { Some("NOMENCL") }
+    else if t.contains("pc info") { Some("PC_INFO") }
+    else if t.contains("pc ie") { Some("PC_IE") }
+    else if ["informe", "diagnostico", "diagnostico clinico"].iter().any(|x| t.contains(*x)) { Some("PC_INFO") }
+    else if ["ingreso efectivo", "fecha estimada de ingreso", "ingreso al programa"].iter().any(|x| t.contains(*x)) { Some("PC_IE") }
+    else { None }
+}
+
+fn tipos_efectivos(r: &Registro) -> Vec<&'static str> {
+    let acciones: Vec<_> = r.acciones.iter().copied().filter(|a| TIPOS_PROYECTO.contains(a)).collect();
+    match modo_resolucion(r) {
+        "auto" => acciones,
+        "review" if res_marcada(&r.res) => vec![res_tipo(&r.res).or_else(|| acciones.first().copied()).unwrap_or("PC_IE")],
+        modo => TIPOS_PROYECTO.iter().copied().filter(|t| *t == modo).collect(),
+    }
+}
+
+/// Un proyecto por tribunal, RIT y tipo. La decisión expresa de una fila no elimina proyectos de otras.
 pub fn preparar_proyectos(w: &Trabajo, cfg: &Config, solo_seleccionadas: bool) -> Vec<Proyecto> {
-    let con_res = w.registros.iter().any(|r| res_tipo(&r.res).is_some());
+    let caso = |r: &Registro| (w.tribunal_clave(r), clave(&w.value(r, "rit")));
+    let elegible = |r: &Registro| !r.excluido && (!solo_seleccionadas || r.seleccionada);
+    let tiene_res_origen = match &w.paquete {
+        Some(p) => p.columnas_por_fila.get(w.sheet).is_some_and(|fs| fs.iter().any(|c| c.contains_key("res"))),
+        None => w.cols.contains_key("res"),
+    };
+    let heredada = |r: &Registro| tiene_res_origen && !tiene_decision_estructurada(r);
+    let efectivos = |r: &Registro| -> Vec<&'static str> {
+        if !heredada(r) { return tipos_efectivos(r); }
+        let marcada = res_marcada(&r.res) || w.cols.get("res").and_then(|&c| r.values.get(c)).is_some_and(|c| matches!(c, Cell::Number(n) if *n != 0.0));
+        if !marcada { return Vec::new(); }
+        if let Some(t) = res_tipo(&r.res).or_else(|| tipo_observado(r)) { return vec![t]; }
+        let tipos: Vec<_> = r.acciones.iter().copied().filter(|a| TIPOS_PROYECTO.contains(a)).collect();
+        if tipos.is_empty() { vec!["PC_IE"] } else { tipos }
+    };
+    let evidencia: BTreeSet<_> = w.registros.iter().filter(|r| r.eventos.iter().any(|e| RESUELTAS_POR_EVIDENCIA.contains(&e.as_str()))).map(caso).collect();
     let mut grupos: BTreeMap<(String, String, &'static str), Vec<usize>> = BTreeMap::new();
-    for (i, r) in w.registros.iter().enumerate() {
-        if r.excluido || (solo_seleccionadas && !r.seleccionada) {
-            continue;
-        }
-        let tipos: Vec<&'static str> = if con_res {
-            res_tipo(&r.res).into_iter().collect()
-        } else {
-            r.acciones.iter().copied().filter(|a| ["PC_IE", "PC_INFO", "NOMENCL"].contains(a)).collect()
-        };
-        for t in tipos {
-            grupos.entry((w.tribunal_clave(r), clave(&w.value(r, "rit")), t)).or_default().push(i);
+    for r in w.registros.iter().filter(|r| elegible(r)) {
+        let (trib, rit) = caso(r);
+        for t in efectivos(r) { grupos.entry((trib.clone(), rit.clone(), t)).or_default(); }
+    }
+    for (i, r) in w.registros.iter().enumerate().filter(|(_, r)| elegible(r)) {
+        let (trib, rit) = caso(r);
+        let tipos = efectivos(r);
+        for t in TIPOS_PROYECTO {
+            if ((!heredada(r) && modo_resolucion(r) != "auto") || evidencia.contains(&(trib.clone(), rit.clone()))) && !tipos.contains(&t) { continue; }
+            if let Some(ids) = grupos.get_mut(&(trib.clone(), rit.clone(), t)) { ids.push(i); }
         }
     }
     grupos
@@ -1369,23 +1433,31 @@ impl DocumentoCombinado {
         src_ct: Option<&str>,
         ruta_origen_zip: &str,
         rel_tipo: &str,
-    ) -> String {
+        visitados: &mut HashMap<String, String>,
+        profundidad: usize,
+    ) -> Result<String, String> {
+        const MAX_PROFUNDIDAD: usize = 32;
         let origen = normalizar_ruta_zip(ruta_origen_zip);
+        if let Some(dest) = visitados.get(&origen) { return Ok(dest.clone()); }
+        if profundidad >= MAX_PROFUNDIDAD { return Err("La plantilla Word excede la profundidad máxima de relaciones (32).".into()); }
         if rel_tipo.ends_with("/image") {
             if let Some(bytes) = src_partes.get(&origen) {
                 let hash = sha256_hex(bytes);
                 if let Some(existente) = self.media_por_sha256.get(&hash) {
                     asegurar_content_type(&mut self.content_types, existente, src_ct);
-                    return existente.clone();
+                    visitados.insert(origen.clone(), existente.clone());
+                    return Ok(existente.clone());
                 }
                 let dest = ruta_unica_parte(&self.partes, &origen);
                 self.media_por_sha256.insert(hash, dest.clone());
                 self.partes.insert(dest.clone(), bytes.clone());
                 asegurar_content_type(&mut self.content_types, &dest, src_ct);
-                return dest;
+                visitados.insert(origen.clone(), dest.clone());
+                return Ok(dest);
             }
         }
         let dest = ruta_unica_parte(&self.partes, &origen);
+        visitados.insert(origen.clone(), dest.clone());
         if let Some(raw) = src_partes.get(&origen) {
             let mut bytes = raw.clone();
             if dest.starts_with("word/header") || dest.starts_with("word/footer") {
@@ -1405,7 +1477,7 @@ impl DocumentoCombinado {
                     for mut r in parsear_rels(src_rels_str) {
                         if !r.externa {
                             let child_src = resolver_target_zip(src_dir, &r.destino);
-                            let child_dst = self.copiar_parte_recursiva(src_partes, src_ct, &child_src, &r.tipo);
+                            let child_dst = self.copiar_parte_recursiva(src_partes, src_ct, &child_src, &r.tipo, visitados, profundidad + 1)?;
                             r.destino = target_relativo_desde(dst_dir, &child_dst);
                         }
                         nuevas.push(r);
@@ -1415,7 +1487,7 @@ impl DocumentoCombinado {
                 }
             }
         }
-        dest
+        Ok(dest)
     }
 
     fn registrar_relacion_cuerpo(
@@ -1423,26 +1495,27 @@ impl DocumentoCombinado {
         src_partes: &BTreeMap<String, Vec<u8>>,
         src_ct: Option<&str>,
         rel: &RelOoxml,
-    ) -> String {
+        visitados: &mut HashMap<String, String>,
+    ) -> Result<String, String> {
         if rel.externa {
             if let Some(ex) = self.doc_rels.iter().find(|r| r.externa && r.tipo == rel.tipo && r.destino == rel.destino) {
-                return ex.id.clone();
+                return Ok(ex.id.clone());
             }
             let rid = siguiente_rid(&self.doc_rels);
             self.doc_rels.push(RelOoxml { id: rid.clone(), tipo: rel.tipo.clone(), destino: rel.destino.clone(), externa: true });
-            return rid;
+            return Ok(rid);
         }
         let src_zip = resolver_target_zip("word", &rel.destino);
-        let dst_zip = self.copiar_parte_recursiva(src_partes, src_ct, &src_zip, &rel.tipo);
+        let dst_zip = self.copiar_parte_recursiva(src_partes, src_ct, &src_zip, &rel.tipo, visitados, 0)?;
         let target = target_relativo_desde("word", &dst_zip);
         if rel.tipo.ends_with("/image") {
             if let Some(ex) = self.doc_rels.iter().find(|r| !r.externa && r.tipo == rel.tipo && r.destino == target) {
-                return ex.id.clone();
+                return Ok(ex.id.clone());
             }
         }
         let rid = siguiente_rid(&self.doc_rels);
         self.doc_rels.push(RelOoxml { id: rid.clone(), tipo: rel.tipo.clone(), destino: target, externa: false });
-        rid
+        Ok(rid)
     }
 
     fn renumerar_relaciones_elemento(
@@ -1452,7 +1525,8 @@ impl DocumentoCombinado {
         src_rels: &[RelOoxml],
         src_ct: Option<&str>,
         rid_map: &mut BTreeMap<String, String>,
-    ) -> String {
+        visitados: &mut HashMap<String, String>,
+    ) -> Result<String, String> {
         static RE_ATTR_RID: OnceLock<Regex> = OnceLock::new();
         let re_rid = RE_ATTR_RID.get_or_init(|| Regex::new(r#"(r:(?:embed|id|link|dm|lo|qs|cs)=")([^"]+)(")"#).unwrap());
         let mut necesarios = Vec::new();
@@ -1464,19 +1538,19 @@ impl DocumentoCombinado {
                 continue;
             }
             if let Some(rel) = src_rels.iter().find(|r| r.id == old_rid) {
-                let new_rid = self.registrar_relacion_cuerpo(src_partes, src_ct, rel);
+                let new_rid = self.registrar_relacion_cuerpo(src_partes, src_ct, rel, visitados)?;
                 rid_map.insert(old_rid, new_rid);
             }
         }
         if rid_map.is_empty() {
-            return elem.to_string();
+            return Ok(elem.to_string());
         }
-        re_rid
+        Ok(re_rid
             .replace_all(elem, |cap: &regex::Captures| {
                 let new_id = rid_map.get(&cap[2]).map(String::as_str).unwrap_or(&cap[2]);
                 format!("{}{}{}", &cap[1], new_id, &cap[3])
             })
-            .into_owned()
+            .into_owned())
     }
 
     fn insertar_abstract_num(&mut self, bloque: &str) {
@@ -1753,6 +1827,7 @@ impl DocumentoCombinado {
             .map(str::to_string);
 
         let mut rid_map = BTreeMap::new();
+        let mut visitados = HashMap::new();
         let mut num_map = BTreeMap::new();
         let mut anum_map = BTreeMap::new();
         let mut restarted_styles = BTreeSet::new();
@@ -1761,7 +1836,7 @@ impl DocumentoCombinado {
 
         let mut unido = String::new();
         for elem in extraer_top_level_elementos(body_xml) {
-            let elem = self.renumerar_relaciones_elemento(&elem, &src_partes, &src_rels, src_ct.as_deref(), &mut rid_map);
+            let elem = self.renumerar_relaciones_elemento(&elem, &src_partes, &src_rels, src_ct.as_deref(), &mut rid_map, &mut visitados)?;
             let elem = self.fusionar_numeracion_y_reinicio(
                 &elem,
                 src_num.as_deref(),
@@ -1959,6 +2034,78 @@ pub fn escribir_xlsx(hojas: &[(&str, Vec<String>, Vec<Vec<String>>)], path: &Pat
 #[cfg(test)]
 mod pruebas_word {
     use super::*;
+
+    #[test]
+    fn proyectos_mezclados_precedencia_por_fila_y_evidencia() {
+        // Escenario de automatic_project_selections de Python: un caso con fechas resueltas por evidencia,
+        // una exclusión, una decisión none y una selección review sin tipo de respaldo explícito.
+        let registro = |i, rit: &str, acciones: Vec<&'static str>, modo: &str, res: &str, excluido| Registro {
+            fila_excel: i, values: vec![Cell::Text(rit.into()), Cell::Text("LAJA".into())],
+            acciones, resolucion: modo.into(), res: res.into(), excluido, ..Default::default()
+        };
+        let mut w = Trabajo { cols: HashMap::from([("rit",0),("tribunal",1)]), registros: vec![
+            registro(2,"X-1-2099",vec!["PC_INFO"],"auto","",false),
+            registro(3,"X-1-2099",vec!["PC_INFO"],"none","",false),
+            registro(4,"X-1-2099",vec![],"review","NOMENCL",false),
+            registro(5,"X-1-2099",vec!["PC_IE"],"review","PC_IE",true),
+            registro(6,"X-2-2099",vec!["PC_IE"],"auto","",false),
+            registro(7,"X-1-2099",vec![],"auto","",false),
+            registro(8,"X-3-2099",vec!["PC_INFO"],"review","1",false),
+            registro(9,"X-2-2099",vec![],"auto","",false),
+        ], ..Default::default() };
+        w.registros[0].eventos.push("HISTORIA.INFORME_AVANCE_PENDIENTE".into());
+        let proyectos = preparar_proyectos(&w,&Config::default(),false);
+        let obtenidos: BTreeMap<_,_> = proyectos.into_iter().map(|p| ((p.rit,p.tipo),p.registros)).collect();
+        let esperado: BTreeMap<(String, String), Vec<usize>> = BTreeMap::from([
+            (("X-1-2099".into(),"PC_INFO".into()),vec![0]),
+            (("X-1-2099".into(),"NOMENCL".into()),vec![2]),
+            (("X-2-2099".into(),"PC_IE".into()),vec![4,7]),
+            (("X-3-2099".into(),"PC_INFO".into()),vec![6]),
+        ]);
+        assert_eq!(obtenidos,esperado);
+    }
+
+    #[test]
+    fn partes_word_ciclicas_se_reutilizan_y_profundidad_se_limita() {
+        let base = docx_generico(&proyecto("LAJA", "PC_IE", false)).unwrap();
+        let mut combinado = DocumentoCombinado::desde_base(&base).unwrap();
+        let mut partes = BTreeMap::new();
+        let tipo = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml";
+        let rel = |destino: &str| serializar_rels(&[RelOoxml { id: "rId1".into(), tipo: tipo.into(), destino: destino.into(), externa: false }]).into_bytes();
+        for (a,b) in [("a.xml","b.xml"),("b.xml","a.xml")] {
+            let ruta = format!("word/{a}");
+            partes.insert(ruta_rels_de_parte(&ruta), rel(b));
+            partes.insert(ruta,b"<part/>".to_vec());
+        }
+        let mut visitados = HashMap::new();
+        let a = combinado.copiar_parte_recursiva(&partes,None,"word/a.xml",tipo,&mut visitados,0).unwrap();
+        assert_eq!(visitados.len(),2);
+        let b = &visitados["word/b.xml"];
+        let vuelta = parsear_rels(std::str::from_utf8(&combinado.partes[&ruta_rels_de_parte(b)]).unwrap());
+        assert_eq!(resolver_target_zip(carpeta_parte(b),&vuelta[0].destino),a);
+        let mut cadena = BTreeMap::new();
+        for i in 0..33 {
+            let ruta = format!("word/n{i}.xml");
+            if i < 32 { cadena.insert(ruta_rels_de_parte(&ruta), rel(&format!("n{}.xml", i+1))); }
+            cadena.insert(ruta,b"<part/>".to_vec());
+        }
+        assert!(combinado.copiar_parte_recursiva(&cadena,None,"word/n0.xml",tipo,&mut HashMap::new(),0).is_err());
+    }
+
+    #[test]
+    fn eml_cabeceras_no_admiten_inyeccion_y_cc_es_exacto() {
+        let (_candado, perfil) = crate::prueba_entorno::perfil_aislado();
+        let b = Borrador { para: "a@example.test\r\nBcc: b@example.test".into(),
+            cc: format!("otro_{}",config::CC_OBLIGATORIO), asunto: "Asunto\r\nBcc: \"b@example.test\"".into(),
+            cuerpo: "Sintético".into(), ..Default::default() };
+        let ruta = guardar_eml(&b,&perfil.join("mime-seguro")).unwrap();
+        let eml = std::fs::read_to_string(ruta).unwrap();
+        assert!(!eml.contains("\r\nBcc:"));
+        let cc = eml.lines().find_map(|l| l.strip_prefix("Cc: ")).unwrap();
+        assert!(cc.split([';',',']).any(|a| a.trim().eq_ignore_ascii_case(config::CC_OBLIGATORIO)));
+        let nombre = enc_word("a\r\n\".txt");
+        assert!(!nombre.contains(['\r','\n','"']));
+    }
 
     fn proyecto(trib: &str, tipo: &str, plural: bool) -> Proyecto {
         let mut vars = BTreeMap::new();

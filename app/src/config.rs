@@ -213,6 +213,8 @@ pub struct Config {
     /// Programa → correos (separados por «;»).
     pub contactos: BTreeMap<String, String>,
     pub contactos_python_migrados: bool,
+    pub catastro_python_migrado: bool,
+    pub configuracion_python_migrada: bool,
     pub tribunales: BTreeMap<String, Tribunal>,
     pub cc_adicional: String,
     pub firma: String,
@@ -248,6 +250,8 @@ impl Default for Config {
             desactivadas: BTreeSet::new(),
             contactos: BTreeMap::new(),
             contactos_python_migrados: false,
+            catastro_python_migrado: false,
+            configuracion_python_migrada: false,
             tribunales,
             cc_adicional: String::new(),
             firma: String::new(),
@@ -318,8 +322,20 @@ impl Config {
                 v.push(e);
             }
         }
-        v.join("; ")
+        cc_obligatorio(&v.join("; "))
     }
+}
+
+/// Normaliza separadores y garantiza la dirección institucional completa, no una subcadena.
+pub(crate) fn cc_obligatorio(txt: &str) -> String {
+    let limpio = sanitizar_cabecera(txt);
+    let mut partes: Vec<&str> = limpio.split([';', ',']).map(str::trim).filter(|s| !s.is_empty()).collect();
+    if !partes.iter().any(|s| s.eq_ignore_ascii_case(CC_OBLIGATORIO)) { partes.insert(0, CC_OBLIGATORIO); }
+    partes.join("; ")
+}
+
+pub(crate) fn sanitizar_cabecera(txt: &str) -> String {
+    txt.replace(['\r', '\n', '"'], " ")
 }
 
 pub fn emails(txt: &str) -> Vec<String> {
@@ -357,13 +373,14 @@ pub fn load() -> (Config, Option<String>) {
         },
         Err(e) => (Config::default(), None, e.kind() == std::io::ErrorKind::NotFound),
     };
-    if !c.contactos_python_migrados {
+    if !c.catastro_python_migrado || !c.configuracion_python_migrada {
         if let Some(base) = std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("HOME")) {
             let base = PathBuf::from(base).join("CSMP_Personal");
             let catastro = std::fs::read_to_string(base.join("contactos.json")).ok();
             let configuracion = std::fs::read_to_string(base.join("configuracion.json")).ok();
+            let antes = (c.catastro_python_migrado, c.configuracion_python_migrada);
             let n = c.migrar_contactos_python(catastro.as_deref(), configuracion.as_deref());
-            if persistir && c.contactos_python_migrados {
+            if persistir && antes != (c.catastro_python_migrado, c.configuracion_python_migrada) {
                 aviso = match save(&c) {
                     Ok(()) if n > 0 => Some(format!("Se incorporaron {n} contactos y alias de Flow Python. Revísalos en Contactos.")),
                     Ok(()) => aviso,
@@ -379,11 +396,8 @@ impl Config {
     /// Completa los contactos de Rust con la configuración efectiva de Python y después con su catastro.
     fn migrar_contactos_python(&mut self, catastro: Option<&str>, configuracion: Option<&str>) -> usize {
         use crate::util::clave;
-        if self.contactos_python_migrados {
-            return 0;
-        }
-        let catastro = catastro.and_then(|s| crate::personalizar::parse_contactos(s.trim_start_matches('\u{feff}')).ok());
-        let cfg = configuracion.and_then(|s| serde_json::from_str::<serde_json::Value>(s.trim_start_matches('\u{feff}')).ok());
+        let catastro = catastro.filter(|_| !self.catastro_python_migrado).and_then(|s| crate::personalizar::parse_contactos(s.trim_start_matches('\u{feff}')).ok());
+        let cfg = configuracion.filter(|_| !self.configuracion_python_migrada).and_then(|s| serde_json::from_str::<serde_json::Value>(s.trim_start_matches('\u{feff}')).ok());
         let mut n = 0;
         if let Some(cfg) = &cfg {
             let programas = cfg["contactos"].as_object().into_iter().flatten()
@@ -399,6 +413,7 @@ impl Config {
                 });
             n += self.completar_contactos_python(programas.chain(tribunales));
         }
+        let catastro_valido = catastro.is_some();
         if let Some(lista) = catastro {
             n += self.completar_contactos_python(lista);
         }
@@ -414,9 +429,9 @@ impl Config {
                 }
             }
         }
-        if n > 0 {
-            self.contactos_python_migrados = true;
-        }
+        self.catastro_python_migrado |= catastro_valido;
+        self.configuracion_python_migrada |= cfg.as_ref().is_some_and(serde_json::Value::is_object);
+        self.contactos_python_migrados |= self.catastro_python_migrado || self.configuracion_python_migrada;
         n
     }
 
@@ -481,6 +496,34 @@ pub fn save(c: &Config) -> Result<(), String> {
 #[cfg(test)]
 mod pruebas_contactos {
     use super::*;
+
+    #[test]
+    fn migracion_independiente_y_local_prevalece() {
+        let mut c = Config::default();
+        let catastro = r#"[{"Nombre":"Programa Uno","Mail":"uno@example.test"}]"#;
+        assert_eq!(c.migrar_contactos_python(Some(catastro),None),1);
+        assert!(c.catastro_python_migrado && !c.configuracion_python_migrada);
+        c.contactos.insert("Programa Uno".into(),"local@example.test".into());
+        let cfg = r#"{"contactos":{"Programa Uno":"otro@example.test","Programa Dos":"dos@example.test"}}"#;
+        let mut c: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(c.migrar_contactos_python(Some(catastro),Some(cfg)),1);
+        assert_eq!(c.contacto_programa("Programa Uno"),"local@example.test");
+        assert_eq!(c.contacto_programa("Programa Dos"),"dos@example.test");
+        assert!(c.catastro_python_migrado && c.configuracion_python_migrada);
+        c.contactos.remove("Programa Dos");
+        assert_eq!(c.migrar_contactos_python(Some(catastro),Some(cfg)),0);
+        let anterior: Config = serde_json::from_str(r#"{"contactos_python_migrados":true}"#).unwrap();
+        assert!(anterior.contactos_python_migrados && !anterior.configuracion_python_migrada);
+    }
+
+    #[test]
+    fn cc_obligatorio_es_direccion_completa() {
+        let falso = format!("otro_{CC_OBLIGATORIO}");
+        let real = cc_obligatorio(&falso);
+        assert_eq!(real, format!("{CC_OBLIGATORIO}; {falso}"));
+        let existente = format!("a@example.test, {}",CC_OBLIGATORIO.to_uppercase());
+        assert_eq!(cc_obligatorio(&existente).split(';').filter(|s| s.trim().eq_ignore_ascii_case(CC_OBLIGATORIO)).count(),1);
+    }
 
     #[test]
     fn importa_contactos_de_flow_python_y_descarta_ambiguos_e_invalidos() {

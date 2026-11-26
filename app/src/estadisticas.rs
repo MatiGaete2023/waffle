@@ -45,8 +45,8 @@ pub fn filas_de(w: &Trabajo) -> Vec<FilaEstadistica> {
             let campo = |k: &str| r.campos.get(k).cloned().unwrap_or_default();
             FilaEstadistica {
                 excluida: r.excluido,
-                con_revision: r.editada.is_some() || !r.campos.is_empty() || !r.res.is_empty(),
-                observacion: r.editada.clone().unwrap_or_default(),
+                con_revision: r.revisada || r.editada.is_some() || !r.campos.is_empty() || !r.res.is_empty(),
+                observacion: r.observacion().to_string(),
                 fecha: campo("FECHA_OBS"),
                 tt: campo("TT"),
                 cc: campo("CC"),
@@ -236,6 +236,17 @@ pub fn resumen_metricas(dir: &Path) -> Value {
 #[cfg(test)]
 mod pruebas {
     use super::*;
+
+    #[test]
+    fn propuesta_aprobada_sin_editar_es_constancia() {
+        let w = Trabajo { registros: vec![crate::trabajo::Registro {
+            propuesta: "Constancia sintética".into(), revisada: true,
+            campos: BTreeMap::from([("FECHA_OBS".into(),"01/11/2099".into()),("TT".into(),"1".into()),("CC".into(),"0".into())]),
+            ..Default::default()
+        }], ..Default::default() };
+        let m = resumir(&filas_de(&w),&[]);
+        assert_eq!((m["constancias"],m["datos_incompletos"],m["sin_carga"]),(1,0,1));
+    }
     use crate::conciliar::CambioFila;
 
     fn texto(v: &Value) -> String {

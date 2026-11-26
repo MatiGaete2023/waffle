@@ -208,21 +208,7 @@ pub(crate) fn identificadores(w: &Trabajo, hoja: &str) -> Vec<String> {
 
 /// `record_edits.encode` (versión 1): decisiones legibles por Flow Python al reimportar la copia.
 pub(crate) fn decisiones(r: &Registro) -> String {
-    let resolucion = if TIPOS_RES.contains(&r.res.as_str()) { r.res.as_str() } else { "auto" };
-    let mut decisions = json!({"resolution": resolucion});
-    if !r.gestiones_correo.is_empty() {
-        decisions["mail"] = json!(r.gestiones_correo);
-    }
-    json!({
-        "version": 1,
-        "decisions": decisions,
-        "overrides": r.anulaciones,
-        "word_overrides": {},
-        "excluded": r.excluido,
-        "resolution_cell": r.res,
-        "proposal": r.propuesta,
-    })
-    .to_string()
+    crate::sincronizar::codificar_decisiones(r)
 }
 
 /// `_safe_cell`: un texto que Excel leería como fórmula se escribe literal.
@@ -299,6 +285,9 @@ fn plan_excel(
         }
         if !r.res.is_empty() && !(etapa_revisada && aprobada) && TIPOS_RES.contains(&r.res.as_str()) {
             res_sugerida.push(json!({"f": fila, "v": r.res}));
+        }
+        for campo in ["FECHA_OBS", "TT", "CC"] {
+            if let Some(v) = r.campos.get(campo) { poner(campo, literal(v)); }
         }
         if r.excluido {
             excluidas.push(json!(fila));
@@ -497,6 +486,7 @@ pub fn nombre_salida(w: &Trabajo, base: &Base) -> String {
 
 #[cfg(target_os = "windows")]
 pub fn exportar(w: &Trabajo, dir: &Path) -> Result<PathBuf, String> {
+    crate::sincronizar::validar_longitud_decisiones(w)?;
     let base = base(w)?;
     std::fs::create_dir_all(dir).map_err(|e| format!("No se pudo crear la carpeta de productos: {e}"))?;
     let destino = dir.join(nombre_salida(w, &base));
@@ -509,6 +499,7 @@ pub fn exportar_bitacoras(
     destino: &Path,
     filas: &[FilaBitacora<'_>],
 ) -> Result<PathBuf, String> {
+    crate::sincronizar::validar_longitud_decisiones(w)?;
     let elegidas = filas_bitacora(base, filas)?;
     guardar_copia(base, destino, |o, d| plan_excel(w, base, o, d, &elegidas))
 }

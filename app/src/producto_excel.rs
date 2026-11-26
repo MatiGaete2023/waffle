@@ -271,7 +271,7 @@ pub fn filas(w: &Trabajo) -> Vec<Vec<Cell>> {
             if !etapa_revisada || aprobada {
                 poner("OBSERVACION", literal(r.observacion()));
             }
-            if !r.res.is_empty() && TIPOS_RES.contains(&r.res.as_str()) {
+            if !r.res.is_empty() {
                 poner("RES", r.res.clone());
             }
             if let Some(k) = clave_ingreso(&w.headers, &r.values) {
@@ -353,6 +353,7 @@ pub fn hoja_datos(nombre: &str, h: &[String], datos: &[Vec<Cell>], excluidas: &[
 
 /// Escribe el producto y devuelve su ruta (nueva: nunca reemplaza un archivo).
 pub fn exportar(w: &Trabajo, dir: &Path, motivo: Option<&str>) -> Result<PathBuf, String> {
+    crate::sincronizar::validar_longitud_decisiones(w)?;
     std::fs::create_dir_all(dir).map_err(|e| format!("No se pudo crear la carpeta de productos: {e}"))?;
     let fecha = w.corte.map(|c| c.format("%Y-%m-%d").to_string()).unwrap_or_default();
     let ruta = nueva_ruta(dir, &format!("Observaciones_{}_{}", w.mode().label().to_uppercase(), fecha), "xlsx");
@@ -408,6 +409,7 @@ pub fn exportar(w: &Trabajo, dir: &Path, motivo: Option<&str>) -> Result<PathBuf
 /// Excel de la revisión de bitácoras sin libro base: las filas elegidas del producto general, con la misma hoja de datos,
 /// y al final las columnas de la revisión.
 pub fn exportar_subconjunto(w: &Trabajo, indices: &[usize], extras: &[&str], valores: &[Vec<String>], ruta: &Path) -> Result<(), String> {
+    crate::sincronizar::validar_longitud_decisiones(w)?;
     let mut h = encabezados(w);
     h.extend(extras.iter().map(|t| t.to_string()));
     let todas = filas(w);

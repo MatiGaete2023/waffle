@@ -91,13 +91,7 @@ pub fn codificar_decisiones(r: &Registro) -> String {
     decisions.insert("structured".into(), serde_json::Value::Bool(true));
     let mail_val: serde_json::Value = serde_json::to_value(&r.gestiones_correo).unwrap_or_else(|_| serde_json::json!({}));
     decisions.insert("mail".into(), mail_val);
-    let resolucion = if !r.res.is_empty() {
-        "review"
-    } else if !r.resolucion.is_empty() {
-        &r.resolucion
-    } else {
-        "auto"
-    };
+    let resolucion = crate::productos::modo_resolucion(r);
     decisions.insert("resolution".into(), serde_json::Value::String(resolucion.into()));
 
     let mut obj = serde_json::Map::new();
@@ -108,6 +102,7 @@ pub fn codificar_decisiones(r: &Registro) -> String {
     obj.insert("proposal".into(), serde_json::Value::String(r.propuesta.clone()));
     obj.insert("resolution_cell".into(), serde_json::Value::String(r.res.clone()));
     obj.insert("version".into(), serde_json::Value::Number(1.into()));
+    obj.insert("encoder".into(), serde_json::json!("flow-rust-v1"));
     obj.insert("word_overrides".into(), serde_json::json!({}));
 
     serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or_default()
@@ -121,6 +116,7 @@ pub fn decodificar_decisiones(texto: &str) -> Result<Option<serde_json::Value>, 
     if t.is_empty() {
         return Ok(None);
     }
+    if t.encode_utf16().count() > 32_000 { return Err(invalida()); }
     let datos: serde_json::Value = serde_json::from_str(t).map_err(|_| invalida())?;
     let Some(obj) = datos.as_object() else { return Err(invalida()); };
     if datos["version"] != 1 {
@@ -150,6 +146,49 @@ pub fn decodificar_decisiones(texto: &str) -> Result<Option<serde_json::Value>, 
     Ok(Some(datos))
 }
 
+/// Compara libros v1 previos: el codificador antiguo omitía `structured` y `mail`,
+/// y representaba RES tipado como tipo en vez de review.
+fn equivalente(a: &Option<serde_json::Value>, b: &Option<serde_json::Value>) -> bool {
+    fn normalizado(v: &serde_json::Value, compat: bool) -> serde_json::Value {
+        let mut v = v.clone();
+        let tipo = v["resolution_cell"].as_str().and_then(crate::productos::res_tipo);
+        let con_celda = v["resolution_cell"].as_str().is_some_and(|s| !s.trim().is_empty());
+        v.as_object_mut().expect("objeto validado").remove("encoder");
+        let d = v["decisions"].as_object_mut().expect("decisiones validadas");
+        let heredado = d.get("structured").and_then(serde_json::Value::as_bool) != Some(true);
+        d.insert("structured".into(), serde_json::json!(true));
+        let modo = d.get("resolution").and_then(serde_json::Value::as_str).unwrap_or("auto");
+        let modo = if compat && modo == "review" { tipo.unwrap_or("review") }
+            else if compat && heredado && modo == "auto" && con_celda { tipo.unwrap_or("review") }
+            else { modo }.to_string();
+        d.insert("resolution".into(), serde_json::json!(modo));
+        let mail = d.entry("mail").or_insert_with(|| serde_json::json!({}));
+        if let Some(m) = mail.as_object_mut() { m.retain(|_, v| v.as_str() != Some("auto")); }
+        v
+    }
+    let es_canonico = |v: &Option<serde_json::Value>| v.as_ref().is_some_and(|d| d["encoder"] == "flow-rust-v1");
+    let compat = !es_canonico(a) || !es_canonico(b);
+    a.as_ref().map(|v| normalizado(v, compat)) == b.as_ref().map(|v| normalizado(v, compat))
+}
+
+pub(crate) fn validar_longitud_decisiones(w: &Trabajo) -> Result<(), String> {
+    for r in &w.registros {
+        if codificar_decisiones(r).encode_utf16().count() > 32_000 {
+            return Err(format!("NURUS_DECISIONES supera 32.000 caracteres en fila {}. No se exportó el libro.", r.fila_excel));
+        }
+    }
+    Ok(())
+}
+
+fn validar_anulaciones(w: &Trabajo, datos: &Option<serde_json::Value>) -> Result<(), Error> {
+    if let Some(d) = datos {
+        if d["overrides"].as_object().is_some_and(|m| m.keys().any(|k| !w.cols.contains_key(k.as_str()))) {
+            return Err(rechazo("NURUS_DECISIONES contiene una columna de origen desconocida. No se importaron cambios."));
+        }
+    }
+    Ok(())
+}
+
 /// `record_edits.restore`: restaura las decisiones, anulaciones y estado de la fila desde el JSON decodificado.
 pub fn restaurar_decisiones(r: &mut Registro, data: &serde_json::Value) {
     if let Some(decisions) = data.get("decisions").and_then(serde_json::Value::as_object) {
@@ -161,6 +200,8 @@ pub fn restaurar_decisiones(r: &mut Registro, data: &serde_json::Value) {
                 .iter()
                 .filter_map(|(k, v)| v.as_str().filter(|v| *v != "auto").map(|v| (k.clone(), v.to_string())))
                 .collect();
+        } else {
+            r.gestiones_correo.clear();
         }
     }
     if let Some(overrides) = data.get("overrides").and_then(serde_json::Value::as_object) {
@@ -196,15 +237,43 @@ fn columnas(headers: &[String]) -> HashMap<&'static str, usize> {
     CAMPOS.iter().filter_map(|c| pos(headers, c).map(|i| (*c, i))).collect()
 }
 
+/// Proyecta las celdas de revisión de la copia preservada según las mismas instrucciones que recibe Excel.
+/// Las escrituras con `conservar` respetan la celda preexistente, incluida una revisión de un libro anterior.
+fn revision_preservada(w: &Trabajo, base: &crate::copia_excel::Base) -> Option<Vec<BTreeMap<String, String>>> {
+    let hojas = lectura::read_sheets(&base.bytes).ok()?;
+    let hoja = hojas.iter().find(|h| h.name == base.hoja)?;
+    let h = lectura::headers_of(hoja.rows.get(base.encabezado.checked_sub(1)?)?);
+    let cols = columnas(&h);
+    let plan = crate::copia_excel::instrucciones(w, base, std::path::Path::new("origen"), std::path::Path::new("destino"));
+    let mut revisiones: Vec<_> = base.filas.iter().map(|&f| hoja.rows.get(f.checked_sub(1)?).map(|fila| revision_excel(&cols, fila))).collect::<Option<_>>()?;
+    let indices: HashMap<usize, usize> = base.filas.iter().enumerate().map(|(i, &f)| (f, i)).collect();
+    let aplicar = |revisiones: &mut Vec<BTreeMap<String, String>>, campo: &str, lista: &serde_json::Value, conservar: bool| {
+        for celda in lista.as_array().into_iter().flatten() {
+            let Some(i) = celda["f"].as_u64().and_then(|f| indices.get(&(f as usize))) else { continue };
+            let Some(valor) = celda["v"].as_str() else { continue };
+            let entrada = revisiones[*i].entry(campo.to_string()).or_default();
+            if !conservar || entrada.is_empty() { *entrada = valor.trim().to_string(); }
+        }
+    };
+    for e in plan["escrituras"].as_array()? {
+        let campo = e["titulo"].as_str()?;
+        if CAMPOS.contains(&campo) { aplicar(&mut revisiones, campo, &e["celdas"], e["conservar"].as_bool().unwrap_or(false)); }
+    }
+    aplicar(&mut revisiones, "RES", &plan["res_sugerida"], true);
+    Some(revisiones)
+}
+
 /// Deja anotado qué tenía la copia que se acaba de guardar: el identificador de cada fila y su revisión.
 pub fn recordar_exportacion(w: &mut Trabajo, hoja: &str) {
     let h = producto_excel::encabezados(w);
     let cols = columnas(&h);
-    let datos = producto_excel::filas(w);
+    let bases = crate::copia_excel::base(w).ok().filter(|b| b.hoja == hoja)
+        .and_then(|b| revision_preservada(w, &b))
+        .unwrap_or_else(|| producto_excel::filas(w).iter().map(|f| revision_excel(&cols, f)).collect());
     let ids = identificadores(w, hoja);
-    for ((r, fila), id) in w.registros.iter_mut().zip(datos).zip(ids) {
-        let base = revision_excel(&cols, &fila);
-        r.sync_local = Some(base.clone());
+    for ((r, base), id) in w.registros.iter_mut().zip(bases).zip(ids) {
+        let local = revision_local(r).into_iter().map(|(k, v)| (k.to_string(), v.unwrap_or_else(|| base.get(k).cloned().unwrap_or_default()))).collect();
+        r.sync_local = Some(local);
         r.sync_base = Some(base);
         r.sync_correo = Some(serde_json::to_string(&r.gestiones_correo).unwrap_or_default());
         r.sync_anulaciones = Some(serde_json::to_string(&r.anulaciones).unwrap_or_default());
@@ -303,6 +372,10 @@ pub fn actualizar(w: &mut Trabajo, cfg: &Config, headers: &[String], filas: &[Ve
     let mut cambios: Vec<Cambio> = Vec::new();
     for (&i, fila) in asociadas.iter().zip(filas) {
         let r = &w.registros[i];
+        let fila_hoja = r.fila_excel.checked_sub(1).ok_or_else(|| rechazo("Fila de origen inválida."))?;
+        if w.sheets.get(w.sheet).and_then(|h| h.rows.get(fila_hoja)).is_none() {
+            return Err(rechazo("Fila de origen inexistente."));
+        }
         let excel = revision_excel(&cols, fila);
         let local = revision_local(r);
         let mut fusion = BTreeMap::new();
@@ -334,15 +407,17 @@ pub fn actualizar(w: &mut Trabajo, cfg: &Config, headers: &[String], filas: &[Ve
             raw_entrante = Some(technical_raw.clone());
             let technical_data = decodificar_decisiones(&technical_raw)?;
             let baseline_data = r.sync_decisiones.as_deref().and_then(|s| decodificar_decisiones(s).ok().flatten());
-            if technical_data.is_some() && technical_data != baseline_data {
+            validar_anulaciones(w, &technical_data)?;
+            if technical_data.is_some() && !equivalente(&technical_data, &baseline_data) {
                 let local_raw = codificar_decisiones(r);
                 let local_data = decodificar_decisiones(&local_raw)?;
-                let conflict = local_data != baseline_data && local_data != technical_data;
+                let conflict = !equivalente(&local_data, &baseline_data) && !equivalente(&local_data, &technical_data);
                 let mut data_to_restore = technical_data;
                 if conflict {
                     match resoluciones.get(&(i, "NURUS_DECISIONES".to_string())) {
                         Some(res_str) => {
                             data_to_restore = decodificar_decisiones(res_str)?;
+                            validar_anulaciones(w, &data_to_restore)?;
                         }
                         None => {
                             let base_str = r.sync_decisiones.clone().unwrap_or_default();
@@ -365,7 +440,7 @@ pub fn actualizar(w: &mut Trabajo, cfg: &Config, headers: &[String], filas: &[Ve
         return Err(Error::Conflictos(conflictos));
     }
     let mut resumen = Resumen::default();
-    let mut origen_editado = 0;
+    let mut recalculadas = HashSet::new();
     let mut nuevos_valores: Vec<(usize, Vec<(usize, Cell)>)> = Vec::new();
     for (c, fila) in cambios.into_iter().zip(filas) {
         let i = c.fila;
@@ -377,6 +452,7 @@ pub fn actualizar(w: &mut Trabajo, cfg: &Config, headers: &[String], filas: &[Ve
             r.gestiones_correo.clone(),
             r.anulaciones.clone(),
             r.resolucion.clone(),
+            r.excluido,
         );
         for (campo, v) in c.fusion {
             match campo {
@@ -399,7 +475,7 @@ pub fn actualizar(w: &mut Trabajo, cfg: &Config, headers: &[String], filas: &[Ve
         if r.sync_base.is_some() {
             let base_res = r.sync_base.as_ref().and_then(|b| b.get("RES")).map_or("", String::as_str);
             let remote_res = c.excel.get("RES").map_or("", String::as_str);
-            if normalizar(remote_res.trim()) != normalizar(base_res.trim()) {
+            if remote_res.trim() != base_res.trim() && r.res.trim() == remote_res.trim() {
                 r.resolucion = "review".to_string();
             }
         }
@@ -425,6 +501,7 @@ pub fn actualizar(w: &mut Trabajo, cfg: &Config, headers: &[String], filas: &[Ve
             r.gestiones_correo.clone(),
             r.anulaciones.clone(),
             r.resolucion.clone(),
+            r.excluido,
         ) {
             resumen.filas_cambiadas += 1;
         }
@@ -436,7 +513,7 @@ pub fn actualizar(w: &mut Trabajo, cfg: &Config, headers: &[String], filas: &[Ve
         let editadas: Vec<(usize, usize)> = w_ref
             .cols
             .iter()
-            .filter(|(k, _)| !IDENTIDAD.contains(k))
+            .filter(|(k, _)| !IDENTIDAD.contains(k) && **k != "res")
             .filter_map(|(k, &c)| {
                 let j = *mapa.get(k)?;
                 let en_trabajo = w_ref.registros[i].values.get(c).map(Cell::display).unwrap_or_default();
@@ -445,22 +522,29 @@ pub fn actualizar(w: &mut Trabajo, cfg: &Config, headers: &[String], filas: &[Ve
             })
             .collect();
         if !editadas.is_empty() {
-            origen_editado += 1;
+            recalculadas.insert(i);
             nuevos_valores.push((i, editadas.into_iter().map(|(c, j)| (c, fila.get(j).cloned().unwrap_or(Cell::Empty))).collect()));
         }
     }
-    if origen_editado > 0 {
+    if !recalculadas.is_empty() {
         let hoja = w.sheet;
         for (i, valores) in nuevos_valores {
-            let fila_hoja = w.registros[i].fila_excel - 1;
+            let fila_hoja = w.registros[i].fila_excel.checked_sub(1).expect("fila validada");
+            let row = &mut w.sheets[hoja].rows[fila_hoja];
             for (c, v) in valores {
-                if let Some(celda) = w.sheets[hoja].rows[fila_hoja].get_mut(c) {
-                    *celda = v;
-                }
+                if c >= row.len() { row.resize(c + 1, Cell::Empty); }
+                row[c] = v;
             }
+            recalculadas.insert(i);
         }
+        let exclusiones: HashMap<usize, bool> = w.registros.iter().filter(|r| crate::conciliar::exclusion_manual(r)).map(|r| (r.fila_excel, r.excluido)).collect();
+        let res: HashMap<usize, String> = w.registros.iter().map(|r| (r.fila_excel, r.res.clone())).collect();
         w.analizar(cfg);
-        resumen.recalculadas = origen_editado;
+        for r in &mut w.registros {
+            if let Some(excluido) = exclusiones.get(&r.fila_excel) { r.excluido = *excluido; }
+            if let Some(v) = res.get(&r.fila_excel) { r.res = v.clone(); }
+        }
+        resumen.recalculadas = recalculadas.len();
     }
     Ok(resumen)
 }
@@ -499,6 +583,115 @@ mod pruebas {
     use chrono::NaiveDate;
     use serde_json::Value;
     use std::path::PathBuf;
+
+    #[test]
+    fn decisiones_v1_compatibles_y_modos_canonicos_distintos() {
+        let mut r = Registro { res: "PC_IE".into(), ..Default::default() };
+        let canon = decodificar_decisiones(&codificar_decisiones(&r)).unwrap();
+        let mut viejo = canon.clone().unwrap();
+        viejo.as_object_mut().unwrap().remove("encoder");
+        viejo["decisions"].as_object_mut().unwrap().remove("structured");
+        viejo["decisions"].as_object_mut().unwrap().remove("mail");
+        assert!(equivalente(&canon, &Some(viejo.clone())));
+        viejo["decisions"]["structured"] = serde_json::json!(true);
+        viejo["decisions"]["resolution"] = serde_json::json!("review");
+        assert!(equivalente(&canon, &Some(viejo)));
+        r.resolucion = "review".into();
+        assert!(!equivalente(&canon, &decodificar_decisiones(&codificar_decisiones(&r)).unwrap()));
+        r.resolucion = "none".into();
+        let none = decodificar_decisiones(&codificar_decisiones(&r)).unwrap().unwrap();
+        assert_eq!(none["decisions"]["resolution"], "none");
+    }
+
+    #[test]
+    fn copia_preservada_plan_intacto_y_conflicto_real() {
+        let datos: Value = serde_json::from_str(include_str!("../tests/datos/sync.json")).unwrap();
+        let mut w = trabajo(&datos);
+        w.registros[0].revisada = true;
+        w.registros[0].editada = Some("Constancia sintética".into());
+        w.registros[0].campos.insert("TT".into(), "1".into());
+        w.registros[1].resolucion = "none".into();
+        w.registros[2].res = "PC_IE".into();
+        let base = crate::copia_excel::base(&w).unwrap();
+        let plan = crate::copia_excel::instrucciones(&w, &base, std::path::Path::new("origen"), std::path::Path::new("destino"));
+        let h = producto_excel::encabezados(&w);
+        let mut filas: Vec<Vec<Cell>> = w.registros.iter().map(|r| {
+            let mut f = vec![Cell::Empty; h.len()];
+            for (t, v) in w.headers.iter().zip(&r.values) { if let Some(c) = pos(&h, t) { f[c] = v.clone(); } }
+            f
+        }).collect();
+        // Simula Escribir de PowerShell sobre los datos originales; no ejecuta Excel/COM.
+        for e in plan["escrituras"].as_array().unwrap() {
+            let c = pos(&h, e["titulo"].as_str().unwrap()).unwrap();
+            for v in e["celdas"].as_array().unwrap() {
+                let i = base.filas.iter().position(|f| *f == v["f"].as_u64().unwrap() as usize).unwrap();
+                if e["conservar"] == false || filas[i][c].is_empty() { filas[i][c] = Cell::Text(v["v"].as_str().unwrap().into()); }
+            }
+        }
+        for v in plan["res_sugerida"].as_array().unwrap() {
+            let i = base.filas.iter().position(|f| *f == v["f"].as_u64().unwrap() as usize).unwrap();
+            let c = pos(&h, "RES").unwrap();
+            if filas[i][c].is_empty() { filas[i][c] = Cell::Text(v["v"].as_str().unwrap().into()); }
+        }
+        recordar_exportacion(&mut w, &base.hoja);
+        let r = actualizar(&mut w, &Config::default(), &h, &filas, &Resoluciones::new()).unwrap();
+        assert_eq!((r.filas_cambiadas, r.recalculadas), (0, 0));
+        w.registros[0].editada = Some("Local sintético".into());
+        filas[0][pos(&h, "OBSERVACION").unwrap()] = Cell::Text("Remoto sintético".into());
+        assert!(matches!(actualizar(&mut w, &Config::default(), &h, &filas, &Resoluciones::new()), Err(Error::Conflictos(c)) if c.iter().any(|c| c.campo == "OBSERVACION")));
+    }
+
+    #[test]
+    fn overrides_remotos_se_restauran_y_clave_invalida_no_muta() {
+        let datos: Value = serde_json::from_str(include_str!("../tests/datos/sync.json")).unwrap();
+        let mut w = trabajo(&datos);
+        recordar_exportacion(&mut w, "ESPERA");
+        let h = producto_excel::encabezados(&w);
+        let mut filas = producto_excel::filas(&w);
+        let c = pos(&h, "NURUS_DECISIONES").unwrap();
+        let mut d = decodificar_decisiones(&codificar_decisiones(&w.registros[0])).unwrap().unwrap();
+        d["overrides"]["desconocida"] = serde_json::json!("5");
+        filas[0][c] = Cell::Text(d.to_string());
+        assert!(matches!(actualizar(&mut w, &Config::default(), &h, &filas, &Resoluciones::new()), Err(Error::Rechazo(_))));
+        assert!(w.registros[0].anulaciones.is_empty());
+        d["overrides"] = serde_json::json!({"espera":"5"});
+        filas[0][c] = Cell::Text(d.to_string());
+        let r = actualizar(&mut w, &Config::default(), &h, &filas, &Resoluciones::new()).unwrap();
+        assert_eq!(r.recalculadas, 0);
+        assert_eq!(w.registros[0].anulaciones["espera"], "5");
+        // Al editar además una columna de origen, el recálculo respeta el override restaurado.
+        filas[0][pos(&h, "T ESPERA").unwrap()] = Cell::Text("200".into());
+        let antes = w.registros[0].propuesta.clone();
+        let r = actualizar(&mut w, &Config::default(), &h, &filas, &Resoluciones::new()).unwrap();
+        assert_eq!(r.recalculadas, 1);
+        assert_ne!(w.registros[0].propuesta, antes);
+    }
+
+    #[test]
+    fn decisiones_demasiado_largas_rechazadas() {
+        let w = Trabajo { registros: vec![Registro { propuesta: "a".repeat(32_001), ..Default::default() }], ..Default::default() };
+        assert!(validar_longitud_decisiones(&w).is_err());
+        assert!(decodificar_decisiones(&codificar_decisiones(&w.registros[0])).is_err());
+    }
+
+    #[test]
+    fn fila_corta_se_amplia_y_fila_cero_se_rechaza() {
+        let datos: Value = serde_json::from_str(include_str!("../tests/datos/sync.json")).unwrap();
+        let mut w = trabajo(&datos);
+        let col = w.cols["espera"];
+        let f = w.registros[0].fila_excel - 1;
+        w.sheets[w.sheet].rows[f].truncate(col);
+        w.registros[0].values.truncate(col);
+        recordar_exportacion(&mut w, "ESPERA");
+        let h = producto_excel::encabezados(&w);
+        let mut filas = producto_excel::filas(&w);
+        filas[0][pos(&h, "T ESPERA").unwrap()] = Cell::Text("150".into());
+        let r = actualizar(&mut w, &Config::default(), &h, &filas, &Resoluciones::new()).unwrap();
+        assert_eq!(r.recalculadas, 1);
+        assert_eq!(w.sheets[w.sheet].rows[f][col].display(), "150");
+        w.registros[0].fila_excel = 0;
+        assert!(matches!(actualizar(&mut w, &Config::default(), &h, &filas, &Resoluciones::new()), Err(Error::Rechazo(_))));
+    }
 
     /// El libro de origen que armó Python (título, fila vacía, encabezado y tres filas), escrito aquí con los mismos datos.
     fn trabajo(datos: &Value) -> Trabajo {

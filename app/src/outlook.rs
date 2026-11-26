@@ -83,10 +83,7 @@ try {
 
 /// Lo que se le entrega al script: destinatarios, CC con el fijo, texto y la nómina ya escrita como Excel.
 pub fn datos(b: &Borrador, cuenta: &str, adjuntos: &[String]) -> serde_json::Value {
-    let mut cc = b.cc.clone();
-    if !cc.to_lowercase().contains(CC_OBLIGATORIO) {
-        cc = if cc.trim().is_empty() { CC_OBLIGATORIO.into() } else { format!("{CC_OBLIGATORIO}; {cc}") };
-    }
+    let cc = crate::config::cc_obligatorio(&b.cc);
     json!({"cuenta": cuenta.trim(), "to": b.para, "cc": cc, "subject": b.asunto, "body": b.cuerpo, "attachments": adjuntos})
 }
 

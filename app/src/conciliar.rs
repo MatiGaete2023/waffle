@@ -127,6 +127,11 @@ fn clave(f: &Fila<'_>) -> Vec<String> {
         .collect()
 }
 
+/// La exclusión del motor se deriva de su regla; una diferencia expresa es decisión humana.
+pub(crate) fn exclusion_manual(r: &Registro) -> bool {
+    r.excluido != r.eventos.iter().any(|e| e == "COMUN.NO_SEGUIMIENTO")
+}
+
 /// `_edited`: la persona tomó alguna decisión sobre la fila.
 pub(crate) fn editada(r: &Registro) -> bool {
     r.editada.is_some()
@@ -135,6 +140,8 @@ pub(crate) fn editada(r: &Registro) -> bool {
         || !r.campos.is_empty()
         || !r.gestiones_correo.is_empty()
         || !r.anulaciones.is_empty()
+        || exclusion_manual(r)
+        || (!r.resolucion.is_empty() && r.resolucion != "auto")
 }
 
 /// Filas del trabajo con su registro de paquete.
@@ -195,6 +202,19 @@ pub fn conciliar(nuevo: &mut Trabajo, previo: &Trabajo, respuestas: &Respuestas,
                     antes.insert(c.clone(), v.get(c).cloned().unwrap_or(Value::Null));
                     despues.insert(c.clone(), nn.get(c).cloned().unwrap_or(Value::Null));
                 }
+            }
+        }
+        // Una elección expresa sobre Word o inclusión también depende de la evidencia de la captura,
+        // incluso si no cambió el JSON de columnas de origen (p. ej. historia incorporada posteriormente).
+        if unica {
+            let anterior = viejas.filas[previos[0]].0;
+            let entrante = nuevas.filas[n].0;
+            if (exclusion_manual(anterior) || (!anterior.resolucion.is_empty() && anterior.resolucion != "auto"))
+                && (anterior.eventos != entrante.eventos || anterior.acciones != entrante.acciones) {
+                let campo = "evidencia_resolucion".to_string();
+                cambiados.push(campo.clone());
+                antes.insert(campo.clone(), serde_json::json!({"reglas": anterior.eventos, "acciones": anterior.acciones}));
+                despues.insert(campo, serde_json::json!({"reglas": entrante.eventos, "acciones": entrante.acciones}));
             }
         }
         campos_distintos.insert(n, cambiados.clone());
@@ -276,6 +296,9 @@ pub fn conciliar(nuevo: &mut Trabajo, previo: &Trabajo, respuestas: &Respuestas,
         r.revisada = anterior.revisada;
         r.seleccionada = anterior.seleccionada;
         r.res = anterior.res.clone();
+        r.resolucion = anterior.resolucion.clone();
+        r.sync_decisiones = anterior.sync_decisiones.clone();
+        if exclusion_manual(anterior) { r.excluido = anterior.excluido; }
         r.campos = anterior.campos.clone();
         r.gestiones_correo = anterior.gestiones_correo.clone();
         r.anulaciones = anterior.anulaciones.clone();
@@ -289,6 +312,11 @@ pub fn conciliar(nuevo: &mut Trabajo, previo: &Trabajo, respuestas: &Respuestas,
     }
     if continuada && nuevo.registros.iter().any(|r| !r.anulaciones.is_empty()) {
         nuevo.analizar(cfg);
+    }
+    for (&n, &i) in &mapa {
+        let anterior = &previo.registros[i];
+        if exclusion_manual(anterior) { nuevo.registros[n].excluido = anterior.excluido; }
+        nuevo.registros[n].res = anterior.res.clone();
     }
     if mismos_bytes {
         nuevo.copia = previo.copia.clone();
@@ -372,6 +400,17 @@ pub fn conciliar(nuevo: &mut Trabajo, previo: &Trabajo, respuestas: &Respuestas,
 #[cfg(test)]
 mod pruebas {
     use super::*;
+
+    #[test]
+    fn decision_de_word_y_exclusion_manual_son_ediciones() {
+        let mut r = Registro { resolucion: "none".into(), ..Default::default() };
+        assert!(editada(&r));
+        r.resolucion = "auto".into();
+        r.excluido = true;
+        assert!(editada(&r));
+        r.eventos.push("COMUN.NO_SEGUIMIENTO".into());
+        assert!(!editada(&r));
+    }
     use crate::motor::Mode;
     use base64::Engine;
     use chrono::NaiveDate;

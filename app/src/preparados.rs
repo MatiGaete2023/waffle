@@ -2,7 +2,7 @@
 //! `outputs.draft_fingerprint` de Flow Python). Un producto sabe de qué registros y configuración depende; si eso cambia
 //! queda desactualizado y no se guarda. Un borrador con el mismo contenido que otro ya guardado no se guarda dos veces.
 
-use crate::config::{Config, CC_OBLIGATORIO};
+use crate::config::{self, Config};
 use crate::productos::{Borrador, Proyecto};
 use crate::trabajo::Trabajo;
 use serde::{Deserialize, Serialize};
@@ -38,10 +38,7 @@ fn sha(v: &serde_json::Value) -> String {
 
 /// `draft_fingerprint`: identidad del borrador realmente revisado (destinatarios, texto y adjunto), sin rutas temporales.
 pub fn huella_borrador(b: &Borrador) -> String {
-    let cc = {
-        let c = b.cc.to_lowercase();
-        if c.contains(CC_OBLIGATORIO) { b.cc.clone() } else { format!("{CC_OBLIGATORIO}; {}", b.cc) }
-    };
+    let cc = config::cc_obligatorio(&b.cc);
     let adjunto = b.nomina.as_ref().map(|n| {
         let filas: Vec<&Vec<String>> = n.rows.iter().zip(&n.incluir).filter(|(_, i)| **i).map(|(r, _)| r).collect();
         json!({"encabezados": n.headers, "filas": filas})
