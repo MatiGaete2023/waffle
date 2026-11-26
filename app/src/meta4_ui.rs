@@ -5,7 +5,8 @@
 use crate::theme::{self, Pal};
 use chrono::NaiveDate;
 use egui::{RichText, Ui};
-use flow_rust::descargador::meta4;
+use flow_rust::descargador::{flujo_paquete, meta4};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
@@ -18,7 +19,7 @@ pub struct Salida {
 }
 
 enum Mensaje {
-    Tribunales(Result<Vec<&'static str>, String>),
+    Tribunales(Result<Vec<&'static str>, String>, Vec<AlcanceLote>),
     Resultado(Result<Salida, String>),
 }
 
@@ -29,6 +30,8 @@ pub struct Meta4Vista {
     desde: String,
     pub corte: String,
     corte_editado: bool,
+    alcance_ingresos: Vec<AlcanceLote>,
+    aceptar_sin_acreditar: bool,
     pub mes: String,
     pub tribunales: Vec<(&'static str, bool)>,
     pub plantilla: Option<PathBuf>,
@@ -54,6 +57,8 @@ impl Default for Meta4Vista {
             desde: String::new(),
             corte: hoy.to_string(),
             corte_editado: false,
+            alcance_ingresos: Vec::new(),
+            aceptar_sin_acreditar: false,
             mes: hoy.format("%Y-%m").to_string(),
             tribunales: Vec::new(),
             plantilla: None,
@@ -85,6 +90,64 @@ fn periodo_elegido(desde: &str, hasta: &str) -> Result<(NaiveDate, NaiveDate), S
         return Err("Desde debe ser anterior o igual a Hasta.".into());
     }
     Ok((desde, hasta))
+}
+
+/// `Some(None)` significa todas las fechas acreditadas; `None` significa origen sin acreditar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AlcanceLote {
+    carpeta: PathBuf,
+    acreditado: Option<Option<(NaiveDate, NaiveDate)>>,
+}
+
+fn json_local(ruta: &Path) -> Option<Value> {
+    serde_json::from_slice(&std::fs::read(ruta).ok()?).ok()
+}
+
+fn alcance_de_lote(carpeta: &Path, resumen: &Value) -> Option<Option<(NaiveDate, NaiveDate)>> {
+    let rango = flujo_paquete::rango_comprobado_lote(carpeta, resumen).ok()?;
+    // Un control de paquete solo acredita SU propia carpeta de consultas, no otros lotes cercanos.
+    let canonica = carpeta.canonicalize().ok()?;
+    for raiz in carpeta.ancestors().take(9) {
+        let ruta = raiz.join("respaldo").join(flujo_paquete::PROCESO);
+        let Some(control) = json_local(&ruta) else { continue };
+        let Some(relativa) = control["carpetas"]["consultas"].as_str() else { continue };
+        if raiz.join(relativa.replace('\\', "/")).canonicalize().ok().as_ref() != Some(&canonica) { continue; }
+        let solicitado = flujo_paquete::leer_alcance_ingresos(&control["alcance_ingresos"]["solicitado"]);
+        let aplicado = flujo_paquete::leer_alcance_ingresos(&control["alcance_ingresos"]["aplicado"]);
+        if control.get("alcance_ingresos").is_some() {
+            return (solicitado.ok() == Some(rango) && aplicado.ok() == Some(rango)).then_some(rango);
+        }
+        break; // control antiguo: solo se puede acreditar un rango no nulo por comprobantes.
+    }
+    rango.map(Some)
+}
+
+fn alcances_de_lotes(carpetas: &[PathBuf]) -> Vec<AlcanceLote> {
+    match flow_meta4::expandir_lotes(carpetas) {
+        Ok(lotes) => lotes.into_iter().filter_map(|carpeta| {
+            let resumen = json_local(&carpeta.join("resumen.json"));
+            // Los calendarios de informes usan mes/año, no un rango de ingresos.
+            if resumen.as_ref().and_then(|r| r["plan"].as_array()).is_some_and(|p| !p.is_empty()
+                && p.iter().all(|q| matches!(q["screen"].as_str(), Some("calendario_informes" | "calendario_medidas")))) {
+                return None;
+            }
+            let acreditado = resumen.as_ref().and_then(|r| alcance_de_lote(&carpeta, r));
+            Some(AlcanceLote { carpeta, acreditado })
+        }).collect(),
+        Err(_) => carpetas.iter().cloned().map(|carpeta| AlcanceLote { carpeta, acreditado: None }).collect(),
+    }
+}
+
+fn sin_acreditar(alcances: &[AlcanceLote]) -> bool {
+    alcances.is_empty() || alcances.iter().any(|a| a.acreditado.is_none())
+}
+
+fn etiqueta_alcance(alcance: &AlcanceLote) -> String {
+    match alcance.acreditado {
+        Some(Some((a, b))) => format!("Origen acreditado: ingresos {} – {}", a.format("%d/%m/%Y"), b.format("%d/%m/%Y")),
+        Some(None) => "Origen acreditado: todas las fechas de ingreso".into(),
+        None => "Alcance de ingresos sin acreditar".into(),
+    }
 }
 
 /// `--month AAAA-MM`: el primer día del mes de emisión de la planilla.
@@ -153,12 +216,14 @@ impl Meta4Vista {
 
     /// Tribunales de los lotes agregados y, si las bitácoras están dentro, el corte propuesto.
     fn refrescar(&mut self, ctx: &egui::Context) {
+        self.aceptar_sin_acreditar = false;
+        self.alcance_ingresos.clear();
         if self.lotes.is_empty() {
             self.tribunales.clear();
             return;
         }
         let lotes = self.lotes.clone();
-        self.en_hilo(ctx, move || Mensaje::Tribunales(meta4::tribunales_disponibles(&lotes)));
+        self.en_hilo(ctx, move || Mensaje::Tribunales(meta4::tribunales_disponibles(&lotes), alcances_de_lotes(&lotes)));
     }
 
     fn rutas_bitacoras(&self) -> Vec<PathBuf> {
@@ -191,6 +256,14 @@ impl Meta4Vista {
         };
         if self.lotes.is_empty() {
             return self.estado = Some(Err("Agrega al menos un lote de registros.".into()));
+        }
+        let vigentes = alcances_de_lotes(&self.lotes);
+        if vigentes != self.alcance_ingresos {
+            self.alcance_ingresos = vigentes;
+            self.aceptar_sin_acreditar = false;
+        }
+        if sin_acreditar(&self.alcance_ingresos) && !self.aceptar_sin_acreditar {
+            return self.estado = Some(Err("Alcance de ingresos sin acreditar. Confirma expresamente que deseas continuar o vuelve al Descargador.".into()));
         }
         let (lotes, bitacoras) = (self.lotes.clone(), self.rutas_bitacoras());
         let elegidos: Vec<String> = if self.tribunales.iter().all(|(_, s)| *s) {
@@ -230,11 +303,16 @@ impl Meta4Vista {
         self.ocupado = false;
         self.recepcion = None;
         match mensaje {
-            Mensaje::Tribunales(Ok(t)) => {
+            Mensaje::Tribunales(Ok(t), alcances) => {
+                self.alcance_ingresos = alcances;
                 let previos = std::mem::take(&mut self.tribunales);
                 self.tribunales = t.into_iter().map(|t| (t, previos.iter().find(|(p, _)| *p == t).is_none_or(|(_, s)| *s))).collect();
             }
-            Mensaje::Tribunales(Err(e)) | Mensaje::Resultado(Err(e)) => self.estado = Some(Err(e)),
+            Mensaje::Tribunales(Err(e), alcances) => {
+                self.alcance_ingresos = alcances;
+                self.estado = Some(Err(e));
+            }
+            Mensaje::Resultado(Err(e)) => self.estado = Some(Err(e)),
             Mensaje::Resultado(Ok(s)) => {
                 self.estado = Some(Ok(format!(
                     "{} generado en {} ({} archivos{}).",
@@ -298,6 +376,20 @@ impl Meta4Vista {
         });
         ui.add_space(8.0);
         theme::card(p).show(ui, |ui| {
+            theme::seccion(ui, p, "Alcance de ingresos del lote");
+            if !self.lotes.is_empty() {
+                for alcance in &self.alcance_ingresos {
+                    ui.label(RichText::new(format!("{} · {}", etiqueta_alcance(alcance), alcance.carpeta.display()))
+                        .color(if alcance.acreditado.is_some() { p.green } else { p.amber }));
+                }
+                if !self.ocupado && sin_acreditar(&self.alcance_ingresos) {
+                    ui.label(RichText::new("Alcance de ingresos sin acreditar. Puedes volver a la sección Descargador y crear un lote con el alcance explícito.").color(p.amber));
+                    ui.checkbox(&mut self.aceptar_sin_acreditar, "Continuar expresamente sin acreditar el alcance de ingresos");
+                }
+            } else {
+                ui.label("Agrega un lote para consultar su alcance de ingresos.");
+            }
+            ui.separator();
             theme::seccion(ui, p, "Bitácoras, período y tribunales");
             ui.horizontal_wrapped(|ui| {
                 ui.label("Carpeta de bitácoras");
@@ -310,7 +402,7 @@ impl Meta4Vista {
                 }
             });
             let desde_sugerido = dia(&self.corte, "Hasta").ok().map(|hasta| flow_meta4::periodo(hasta).0.to_string());
-            ui.label("Fechas de búsqueda de observaciones (DD/MM/AAAA o AAAA-MM-DD)");
+            ui.label("Período de observaciones (Desde / Hasta; DD/MM/AAAA o AAAA-MM-DD)");
             ui.horizontal_wrapped(|ui| {
                 ui.label("Desde");
                 ui.add_enabled(!self.ocupado, egui::TextEdit::singleline(&mut self.desde)
@@ -367,7 +459,7 @@ impl Meta4Vista {
                 }
             });
             ui.horizontal_wrapped(|ui| {
-                let listo = !self.ocupado && !self.lotes.is_empty();
+                let listo = !self.ocupado && !self.lotes.is_empty() && (!sin_acreditar(&self.alcance_ingresos) || self.aceptar_sin_acreditar);
                 if ui
                     .add_enabled(listo, egui::Button::new(RichText::new("Generar Meta 4").color(egui::Color32::WHITE).strong()).fill(p.accent))
                     .clicked()
@@ -416,6 +508,44 @@ impl Meta4Vista {
 #[cfg(test)]
 mod pruebas {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn meta4_distingue_alcance_acreditado_y_ausente() {
+        let base = std::env::temp_dir().join(format!("flow-meta4-alcance-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let lote = base.join("respaldo").join("lote");
+        std::fs::create_dir_all(&lote).unwrap();
+        let resumen = json!({"estado": "VALIDADA", "filtro_fecha": {"desde": "01/11/2026", "hasta": "26/11/2026"},
+            "consultas": [{"estado": "VALIDADA", "verificacion": "verificacion 001.json"}]});
+        let comprobante = json!({"estado": "VALIDADA", "filtro_fecha": {"start": "01/11/2026", "end": "26/11/2026"}});
+        std::fs::write(lote.join("resumen.json"), serde_json::to_vec(&resumen).unwrap()).unwrap();
+        std::fs::write(lote.join("verificacion 001.json"), serde_json::to_vec(&comprobante).unwrap()).unwrap();
+        let leer = || alcances_de_lotes(std::slice::from_ref(&base));
+        let a = leer();
+        assert!(!sin_acreditar(&a));
+        assert_eq!(etiqueta_alcance(&a[0]), "Origen acreditado: ingresos 01/11/2026 – 26/11/2026");
+        let mut control = json!({"carpetas": {"consultas": "respaldo/lote"}, "alcance_ingresos": {
+            "solicitado": {"modo": "rango", "desde": "2026-11-01", "hasta": "2026-11-26"},
+            "aplicado": {"modo": "rango", "desde": "2026-11-01", "hasta": "2026-11-26"}}});
+        let ruta = base.join("respaldo").join(flujo_paquete::PROCESO);
+        std::fs::write(&ruta, serde_json::to_vec(&control).unwrap()).unwrap();
+        assert_eq!(leer(), a);
+        control["alcance_ingresos"]["aplicado"]["hasta"] = json!("2026-11-25");
+        std::fs::write(&ruta, serde_json::to_vec(&control).unwrap()).unwrap();
+        assert!(sin_acreditar(&leer()));
+        std::fs::remove_file(&ruta).unwrap();
+        std::fs::write(lote.join("verificacion 001.json"), b"{\"estado\":\"VALIDADA\",\"filtro_fecha\":null}").unwrap();
+        assert_eq!(etiqueta_alcance(&leer()[0]), "Alcance de ingresos sin acreditar");
+        let mut resumen = resumen;
+        resumen["filtro_fecha"] = Value::Null;
+        std::fs::write(lote.join("resumen.json"), serde_json::to_vec(&resumen).unwrap()).unwrap();
+        assert!(sin_acreditar(&leer())); // null histórico no demuestra intención.
+        control["alcance_ingresos"] = json!({"solicitado": {"modo": "todas_las_fechas"}, "aplicado": {"modo": "todas_las_fechas"}});
+        std::fs::write(&ruta, serde_json::to_vec(&control).unwrap()).unwrap();
+        assert_eq!(etiqueta_alcance(&leer()[0]), "Origen acreditado: todas las fechas de ingreso");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn fechas_y_carpetas_de_la_vista() {
