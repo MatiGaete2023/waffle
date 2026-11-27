@@ -138,6 +138,44 @@ impl<T: Send + 'static> BackgroundJob<T> {
     }
 }
 
+fn estado_vigencia_borradores(w: Option<&Trabajo>, cfg: &Config, borradores: &[Borrador]) -> Vec<(bool, String)> {
+    match w {
+        Some(w) => borradores
+            .iter()
+            .map(|b| (crate::preparados::borrador_obsoleto(w, cfg, b), productos::destinatario_borrador(cfg, b)))
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+fn resellar_borradores_vigentes(w: Option<&Trabajo>, cfg: &Config, borradores: &mut [Borrador], antes: &[(bool, String)]) {
+    let Some(w) = w else { return };
+    for (b, (estaba_obsoleto, prev_dest)) in borradores.iter_mut().zip(antes) {
+        if *estaba_obsoleto || b.dependencia.is_empty() {
+            continue;
+        }
+        if b.guardado.is_some() {
+            crate::preparados::sellar_borrador(w, cfg, b);
+            continue;
+        }
+        let nuevo_dest = productos::destinatario_borrador(cfg, b);
+        if b.para.trim().is_empty() {
+            if !nuevo_dest.is_empty() {
+                b.para = nuevo_dest.clone();
+                b.para_automatico = Some(nuevo_dest);
+            }
+            crate::preparados::sellar_borrador(w, cfg, b);
+        } else {
+            let coincide_nuevo = !nuevo_dest.is_empty()
+                && (b.para.trim() == nuevo_dest.trim()
+                    || crate::personalizar::correos(&b.para).is_ok_and(|v| v.join("; ") == nuevo_dest));
+            if prev_dest == &nuevo_dest || coincide_nuevo {
+                crate::preparados::sellar_borrador(w, cfg, b);
+            }
+        }
+    }
+}
+
 // La operación de escritura tiene posesión exclusiva de Trabajo y preparados hasta entregar sus recibos.
 // Se conserva una referencia al estado para recuperar incluso ante un panic. El trabajador no accede a widgets.
 struct OperacionProductos {
@@ -199,6 +237,7 @@ impl OperacionProductos {
         };
         let outlook = self.cfg.destino_outlook;
         let total = idx.len();
+        let mut recien_guardados: Vec<Borrador> = Vec::new();
         for (paso, j) in idx.into_iter().enumerate() {
             progreso.emitir(format!("Borrador {} de {total}", paso + 1));
             let huella = crate::preparados::huella_borrador(&self.borradores[j]);
@@ -257,7 +296,27 @@ impl OperacionProductos {
                     let ids = crate::preparados::ids_registros(w, &self.borradores[j].registros);
                     w.preparados.anotar("borrador", "creado", ids, &huella, &ruta);
                 }
+                if self.borradores[j].guardado.is_some() {
+                    recien_guardados.push(self.borradores[j].clone());
+                }
                 self.marcar_sucio();
+            }
+        }
+        if !recien_guardados.is_empty() {
+            let aprendidos = productos::contactos_aprendidos(&self.cfg, &recien_guardados);
+            if !aprendidos.is_empty() {
+                let antes = estado_vigencia_borradores(self.work.as_ref(), &self.cfg, &self.borradores);
+                productos::aplicar_contactos_aprendidos(&mut self.cfg, &aprendidos);
+                resellar_borradores_vigentes(self.work.as_ref(), &self.cfg, &mut self.borradores, &antes);
+                match config::save(&self.cfg) {
+                    Ok(()) => {
+                        let lista: Vec<String> = aprendidos.iter().map(|(k, v)| format!("{k} → {v}")).collect();
+                        self.aviso(format!("Contacto guardado para el próximo lote: {}.", lista.join("; ")), false);
+                    }
+                    Err(e) => {
+                        self.aviso(format!("Se aprendieron contactos pero no se pudo guardar config.json: {e}"), true);
+                    }
+                }
             }
         }
         let sin_destinatario = (0..self.borradores.len())
@@ -533,7 +592,12 @@ impl App {
     }
 
     fn recuperar_operacion(&mut self, op: OperacionProductos) {
-        self.work = op.work; self.borradores = op.borradores; self.proyectos = op.proyectos;
+        self.work = op.work;
+        self.cfg = op.cfg;
+        self.contacto_buf.clear();
+        self.contactos_pendientes.clear();
+        self.borradores = op.borradores;
+        self.proyectos = op.proyectos;
         for (ruta, tipo) in op.productos { self.registrar(ruta, &tipo); }
         for (aviso, error) in op.avisos { self.aviso(aviso, error); }
         if let Some(inf) = op.anon_inf { self.anon_inf = Some(inf); }
@@ -2458,14 +2522,23 @@ impl App {
                 }
                 ui.separator();
                 theme::seccion(ui, p, "Tribunales");
-                for t in ["LAJA", "MULCHEN", "TOME"] {
+                let mut tribs_vista: Vec<String> = ["LAJA", "MULCHEN", "TOME"].iter().map(|s| s.to_string()).collect();
+                if let Some(w) = &self.work {
+                    for r in &w.registros {
+                        let tk = w.tribunal_clave(r);
+                        if !tk.is_empty() && crate::util::perfil_tribunal(&tk).is_some() && !tribs_vista.contains(&tk) {
+                            tribs_vista.push(tk);
+                        }
+                    }
+                }
+                for t in &tribs_vista {
                     let mut on = self.tribunales_sel.is_empty() || self.tribunales_sel.contains(t);
-                    if ui.checkbox(&mut on, t).changed() {
+                    if ui.checkbox(&mut on, t.as_str()).changed() {
                         if self.tribunales_sel.is_empty() {
-                            self.tribunales_sel = ["LAJA", "MULCHEN", "TOME"].iter().map(|s| s.to_string()).collect();
+                            self.tribunales_sel = tribs_vista.iter().cloned().collect();
                         }
                         if on {
-                            self.tribunales_sel.insert(t.into());
+                            self.tribunales_sel.insert(t.clone());
                         } else {
                             self.tribunales_sel.remove(t);
                         }
@@ -2554,6 +2627,7 @@ impl App {
         let mut guardar_uno = None;
         let mut guardar_nomina = None;
         let mut conciliar_incierto: Option<String> = None;
+        let mut usar_sugerencia: Option<(usize, String, String)> = None;
         let mut correo_editado = false;
         egui::SidePanel::left("correos_lista")
             .resizable(true)
@@ -2622,6 +2696,23 @@ impl App {
                         });
                         let procedencia = if b.para.trim().is_empty() { "Falta destinatario" } else if b.para_automatico.as_deref() == Some(b.para.as_str()) { "Desde Contactos" } else { "Editado aquí" };
                         ui.label(RichText::new(procedencia).color(p.muted));
+                        if b.para.trim().is_empty() && !b.programa.trim().is_empty() {
+                            let sugerencias = self.cfg.sugerir_contactos(&b.programa, 3);
+                            if !sugerencias.is_empty() {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new("Sugerencias:").size(12.0).color(p.muted));
+                                    for (nombre, correo) in sugerencias {
+                                        if ui
+                                            .small_button(format!("Usar: {nombre} (guardar alias)"))
+                                            .on_hover_text(format!("Asigna {correo} y guarda alias para «{}»", b.programa))
+                                            .clicked()
+                                        {
+                                            usar_sugerencia = Some((j, nombre, correo));
+                                        }
+                                    }
+                                });
+                            }
+                        }
                         if !b.cc.split([';', ',']).any(|s| s.trim().eq_ignore_ascii_case(CC_OBLIGATORIO)) {
                             ui.label(RichText::new(format!("El CC {CC_OBLIGATORIO} se agrega siempre al guardar.")).color(p.amber).size(12.0));
                         }
@@ -2690,6 +2781,9 @@ impl App {
             });
         });
         if correo_editado { self.marcar_sucio(); }
+        if let Some((idx, nombre_contacto, correo)) = usar_sugerencia {
+            self.aplicar_sugerencia_alias(idx, &nombre_contacto, &correo);
+        }
         if let Some(huella) = conciliar_incierto {
             if let Some(w) = self.work.as_mut() {
                 let n = w.preparados.conciliar_incierto(&huella);
@@ -2712,6 +2806,41 @@ impl App {
                     Err(e) => self.aviso(e, true),
                 }
             }
+        }
+    }
+
+    fn aplicar_sugerencia_alias(&mut self, idx: usize, nombre_contacto: &str, correo: &str) {
+        let Some(prog) = self
+            .borradores
+            .get(idx)
+            .map(|b| b.programa.trim().to_string())
+            .filter(|s| !s.is_empty())
+        else {
+            return;
+        };
+        let antes = estado_vigencia_borradores(self.work.as_ref(), &self.cfg, &self.borradores);
+        if let Some(b) = self.borradores.get_mut(idx) {
+            b.para = correo.to_string();
+            b.para_automatico = Some(correo.to_string());
+        }
+        let k_prog = clave(&prog);
+        let tiene_contacto = self.cfg.contactos.keys().any(|k| clave(k) == k_prog);
+        let tiene_alias = self.cfg.aliases.keys().any(|a| clave(a) == k_prog);
+        let mut alias_guardado = false;
+        if k_prog != clave(nombre_contacto) && !tiene_contacto && !tiene_alias {
+            self.cfg.aliases.insert(prog.clone(), nombre_contacto.to_string());
+            alias_guardado = true;
+        }
+        resellar_borradores_vigentes(self.work.as_ref(), &self.cfg, &mut self.borradores, &antes);
+        self.marcar_sucio();
+        if alias_guardado {
+            self.guardar_cfg();
+            self.aviso(format!("Alias guardado para «{prog}» → «{nombre_contacto}»."), false);
+        } else if tiene_alias {
+            self.aviso(
+                format!("Destinatario aplicado solo a este borrador; se conservó el alias existente para «{prog}»."),
+                false,
+            );
         }
     }
 
@@ -3079,6 +3208,7 @@ impl App {
         let mut guardar = false;
         let mut importar = false;
         let mut exportar = false;
+        let mut reimportar = false;
         let faltan: Vec<String> = match &self.work {
             Some(w) => {
                 let mut f: Vec<String> = w.registros.iter().map(|r| w.value(r, "programa")).filter(|pr| !pr.is_empty() && self.cfg.contacto_programa(pr).is_empty()).collect();
@@ -3113,7 +3243,7 @@ impl App {
             ui.add_space(8.0);
             theme::card(p).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     theme::seccion(ui, p, &format!("Programas ({})", self.cfg.contactos.len()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Importar CSV/Excel…").on_hover_text("Columnas Nombre y Mail (como el original)").clicked() {
@@ -3121,6 +3251,13 @@ impl App {
                         }
                         if ui.button("Exportar…").clicked() {
                             exportar = true;
+                        }
+                        if ui
+                            .button("Reimportar contactos desde Flow Python")
+                            .on_hover_text("Vuelve a leer contactos.json y configuracion.json de Flow Python sin sobrescribir contactos locales")
+                            .clicked()
+                        {
+                            reimportar = true;
                         }
                         ui.add(egui::TextEdit::singleline(&mut self.filtro_contactos).hint_text("🔍 Buscar").desired_width(180.0));
                     });
@@ -3210,6 +3347,20 @@ impl App {
         }
         if exportar {
             self.exportar_contactos();
+        }
+        if reimportar {
+            let n = self.cfg.reimportar_contactos_python();
+            self.contacto_buf.clear();
+            self.contactos_pendientes.clear();
+            self.guardar_cfg();
+            self.aviso(
+                if n > 0 {
+                    format!("Se incorporaron {n} contactos o alias desde Flow Python (sin sobrescribir los locales).")
+                } else {
+                    "No se encontraron contactos nuevos para incorporar desde Flow Python.".to_string()
+                },
+                false,
+            );
         }
         if guardar {
             self.marcar_cfg_sucia();
@@ -4568,5 +4719,194 @@ mod pruebas_worker_a2 {
         assert_eq!(w.corte, Some(previo));
         assert_eq!(w.analisis_ms, 123);
         assert_eq!(w.registros[0].propuesta, "propuesta sintética");
+    }
+}
+
+#[cfg(test)]
+mod pruebas_correos_d2a {
+    use super::*;
+
+    fn crear_trabajo_prueba(programa: &str, tribunal: &str) -> Trabajo {
+        let mut cfg = Config::default();
+        cfg.umbrales.insert("espera_tome".into(), 50);
+        cfg.umbrales.insert("espera_laja".into(), 30);
+        let corte = NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
+        let mut libro = rust_xlsxwriter::Workbook::new();
+        let hoja = libro.add_worksheet();
+        let _ = hoja.set_name("Espera");
+        for (c, h) in ["RIT", "TRIBUNAL", "NOMBRE", "RUT", "NOMBRE CENTRO", "T ESPERA"].iter().enumerate() {
+            hoja.write_string(0, c as u16, *h).unwrap();
+        }
+        hoja.write_string(1, 0, "X-88-2099").unwrap();
+        hoja.write_string(1, 1, tribunal).unwrap();
+        hoja.write_string(1, 2, "Uno Ejemplo").unwrap();
+        hoja.write_string(1, 3, "11111111-1").unwrap();
+        hoja.write_string(1, 4, programa).unwrap();
+        hoja.write_number(1, 5, 80.0).unwrap();
+        Trabajo::abrir(PathBuf::from("d2a.xlsx"), libro.save_to_buffer().unwrap(), Some(Mode::Espera), corte, &cfg).unwrap()
+    }
+
+    fn crear_trabajo_lote_prueba(filas: &[(&str, &str, &str)]) -> Trabajo {
+        let mut cfg = Config::default();
+        cfg.umbrales.insert("espera_tome".into(), 50);
+        cfg.umbrales.insert("espera_laja".into(), 30);
+        let corte = NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
+        let mut libro = rust_xlsxwriter::Workbook::new();
+        let hoja = libro.add_worksheet();
+        let _ = hoja.set_name("Espera");
+        for (c, h) in ["RIT", "TRIBUNAL", "NOMBRE", "RUT", "NOMBRE CENTRO", "T ESPERA"].iter().enumerate() {
+            hoja.write_string(0, c as u16, *h).unwrap();
+        }
+        for (i, (rit, tribunal, programa)) in filas.iter().enumerate() {
+            let r = i as u32 + 1;
+            hoja.write_string(r, 0, *rit).unwrap();
+            hoja.write_string(r, 1, *tribunal).unwrap();
+            hoja.write_string(r, 2, "Uno Ejemplo").unwrap();
+            hoja.write_string(r, 3, "11111111-1").unwrap();
+            hoja.write_string(r, 4, *programa).unwrap();
+            hoja.write_number(r, 5, 80.0).unwrap();
+        }
+        Trabajo::abrir(PathBuf::from("d2a_lote.xlsx"), libro.save_to_buffer().unwrap(), Some(Mode::Espera), corte, &cfg).unwrap()
+    }
+
+    #[test]
+    fn guardar_borrador_aprende_contacto_sincroniza_cfg_y_sugerencia_guarda_alias() {
+        let (_candado, perfil) = crate::prueba_entorno::perfil_aislado();
+        let base = perfil.join("d2a-ui");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut app = App::new(None);
+        app.cfg = Config::default();
+        app.cfg.carpeta_productos = base.join("productos").display().to_string();
+        app.work = Some(crear_trabajo_prueba("PRM Nuevo D2A", "LAJA"));
+        app.preparar_correos();
+
+        let idx_prog = app.borradores.iter().position(|b| b.kind == "programa_espera").unwrap();
+        assert!(app.borradores[idx_prog].para.is_empty());
+        app.borradores[idx_prog].para = "nuevo.d2a@example.test".into();
+        app.guardar_borradores(Some(idx_prog));
+
+        assert_eq!(app.cfg.contacto_programa("PRM Nuevo D2A"), "nuevo.d2a@example.test");
+        assert!(
+            app.avisos.iter().any(|(t, err, _)| !*err && t.contains("Contacto guardado para el próximo lote:")),
+            "{:?}",
+            app.avisos
+        );
+        let (cargada, _) = config::load();
+        assert_eq!(cargada.contacto_programa("PRM Nuevo D2A"), "nuevo.d2a@example.test");
+
+        // En el siguiente lote, el destinatario aparece completado automáticamente.
+        app.borradores.clear();
+        app.preparar_correos();
+        let idx_prog2 = app.borradores.iter().position(|b| b.kind == "programa_espera").unwrap();
+        assert_eq!(app.borradores[idx_prog2].para, "nuevo.d2a@example.test");
+
+        // Sugerencia en 1 clic: aplica el correo, guarda el alias y mantiene vigente el borrador para guardarlo.
+        app.cfg.contactos.insert("PRM Coronel Centro".into(), "coronel@example.test".into());
+        app.work = Some(crear_trabajo_prueba("PRM Coronel Norte", "LAJA"));
+        app.borradores.clear();
+        app.preparar_correos();
+        let idx_sug = app.borradores.iter().position(|b| b.kind == "programa_espera").unwrap();
+        assert!(app.borradores[idx_sug].para.is_empty());
+        let sugerencias = app.cfg.sugerir_contactos(&app.borradores[idx_sug].programa, 3);
+        assert_eq!(sugerencias[0], ("PRM Coronel Centro".into(), "coronel@example.test".into()));
+
+        app.aplicar_sugerencia_alias(idx_sug, &sugerencias[0].0, &sugerencias[0].1);
+        assert_eq!(app.borradores[idx_sug].para, "coronel@example.test");
+        assert_eq!(app.cfg.aliases.get("PRM Coronel Norte").map(String::as_str), Some("PRM Coronel Centro"));
+        assert!(!crate::preparados::borrador_obsoleto(app.work.as_ref().unwrap(), &app.cfg, &app.borradores[idx_sug]));
+
+        app.guardar_borradores(Some(idx_sug));
+        assert!(app.borradores[idx_sug].guardado.is_some());
+        let (cargada2, _) = config::load();
+        assert_eq!(cargada2.contacto_programa("PRM Coronel Norte"), "coronel@example.test");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn guardar_borrador_no_obsoleta_hermano_vacio_y_respeta_alias_existente() {
+        let (_candado, perfil) = crate::prueba_entorno::perfil_aislado();
+        let base = perfil.join("d2a-ui-hermanos");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut app = App::new(None);
+        app.cfg = Config::default();
+        app.cfg.carpeta_productos = base.join("productos").display().to_string();
+        app.work = Some(crear_trabajo_lote_prueba(&[
+            ("C-101-2099", "LAJA", "PRM Alpha Prueba"),
+            ("C-102-2099", "LAJA", "PRM Beta Prueba"),
+            ("C-103-2099", "LAJA", "PRM Gamma Prueba"),
+        ]));
+        app.preparar_correos();
+
+        let idx_alpha = app.borradores.iter().position(|b| b.kind == "programa_espera" && b.programa == "PRM Alpha Prueba").unwrap();
+        let idx_beta = app.borradores.iter().position(|b| b.kind == "programa_espera" && b.programa == "PRM Beta Prueba").unwrap();
+        let idx_gamma = app.borradores.iter().position(|b| b.kind == "programa_espera" && b.programa == "PRM Gamma Prueba").unwrap();
+        assert!(app.borradores[idx_beta].para.is_empty());
+
+        // Simula obsolescencia genuina previa en Gamma por cambio de un registro en work.
+        let reg_gamma = app.borradores[idx_gamma].registros[0];
+        app.work.as_mut().unwrap().registros[reg_gamma].editada = Some("Observación modificada con correo".into());
+        assert!(crate::preparados::borrador_obsoleto(app.work.as_ref().unwrap(), &app.cfg, &app.borradores[idx_gamma]));
+
+        // Guardar Alpha individualmente aprende su contacto sin marcar OBSOLETO a Beta (hermano sin `para`),
+        // mientras Gamma conserva su obsolescencia genuina previa.
+        app.borradores[idx_alpha].para = "alpha@example.test".into();
+        app.guardar_borradores(Some(idx_alpha));
+        assert!(app.borradores[idx_alpha].guardado.is_some());
+        assert_eq!(app.cfg.contacto_programa("PRM Alpha Prueba"), "alpha@example.test");
+        assert!(!crate::preparados::borrador_obsoleto(app.work.as_ref().unwrap(), &app.cfg, &app.borradores[idx_beta]));
+        assert!(crate::preparados::borrador_obsoleto(app.work.as_ref().unwrap(), &app.cfg, &app.borradores[idx_gamma]));
+
+        // Beta se completa después y se guarda sin aviso OBSOLETO.
+        app.borradores[idx_beta].para = "beta@example.test".into();
+        app.guardar_borradores(Some(idx_beta));
+        assert!(app.borradores[idx_beta].guardado.is_some());
+        assert_eq!(app.cfg.contacto_programa("PRM Beta Prueba"), "beta@example.test");
+        assert!(!app.avisos.iter().any(|(t, _, _)| t.contains("PRM Beta Prueba") && t.contains("actualizarse")));
+
+        // `aplicar_sugerencia_alias` no sobrescribe un alias previo distinto para el mismo programa,
+        // pero completa `b.para` y mantiene vigentes los borradores hermanos sin `para`.
+        app.cfg.contactos.insert("PRM Antiguo Vacio".into(), String::new());
+        app.cfg.aliases.insert("PRM Coronel Norte".into(), "PRM Antiguo Vacio".into());
+        app.cfg.contactos.insert("PRM Coronel Centro".into(), "coronel.centro@example.test".into());
+        config::save(&app.cfg).unwrap();
+
+        app.work = Some(crear_trabajo_lote_prueba(&[
+            ("C-201-2099", "LAJA", "PRM Coronel Norte"),
+            ("C-202-2099", "LAJA", "PRM Delta Vacio"),
+        ]));
+        app.borradores.clear();
+        app.preparar_correos();
+        let idx_norte = app.borradores.iter().position(|b| b.kind == "programa_espera" && b.programa == "PRM Coronel Norte").unwrap();
+        let idx_delta = app.borradores.iter().position(|b| b.kind == "programa_espera" && b.programa == "PRM Delta Vacio").unwrap();
+        assert!(app.borradores[idx_norte].para.is_empty());
+        assert!(app.borradores[idx_delta].para.is_empty());
+
+        app.aplicar_sugerencia_alias(idx_norte, "PRM Coronel Centro", "coronel.centro@example.test");
+        assert_eq!(app.borradores[idx_norte].para, "coronel.centro@example.test");
+        assert_eq!(app.cfg.aliases.get("PRM Coronel Norte").map(String::as_str), Some("PRM Antiguo Vacio"));
+        let (cargada, _) = config::load();
+        assert_eq!(cargada.aliases.get("PRM Coronel Norte").map(String::as_str), Some("PRM Antiguo Vacio"));
+        assert!(!crate::preparados::borrador_obsoleto(app.work.as_ref().unwrap(), &app.cfg, &app.borradores[idx_norte]));
+        assert!(!crate::preparados::borrador_obsoleto(app.work.as_ref().unwrap(), &app.cfg, &app.borradores[idx_delta]));
+
+        // También cuando `aplicar_sugerencia_alias` sí guarda un alias nuevo, un hermano sin `para` no queda OBSOLETO.
+        app.work = Some(crear_trabajo_lote_prueba(&[
+            ("C-301-2099", "LAJA", "PRM Coronel Sur"),
+            ("C-302-2099", "LAJA", "PRM Epsilon Vacio"),
+        ]));
+        app.borradores.clear();
+        app.preparar_correos();
+        let idx_sur = app.borradores.iter().position(|b| b.kind == "programa_espera" && b.programa == "PRM Coronel Sur").unwrap();
+        let idx_eps = app.borradores.iter().position(|b| b.kind == "programa_espera" && b.programa == "PRM Epsilon Vacio").unwrap();
+        app.aplicar_sugerencia_alias(idx_sur, "PRM Coronel Centro", "coronel.centro@example.test");
+        assert_eq!(app.cfg.aliases.get("PRM Coronel Sur").map(String::as_str), Some("PRM Coronel Centro"));
+        assert!(!crate::preparados::borrador_obsoleto(app.work.as_ref().unwrap(), &app.cfg, &app.borradores[idx_eps]));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

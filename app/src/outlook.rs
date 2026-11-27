@@ -79,6 +79,7 @@ try {
   [void]$inicio.InsertBefore($cuerpo + $salto + $salto)
   $adjuntos = Tomar $m.Attachments
   foreach ($a in $d.attachments) { $adjunto = Tomar ($adjuntos.Add([string]$a)) }
+  try { [void]$m.Recipients.ResolveAll() } catch {}
   Write-Output 'PREPARADO'
   $m.Save()
   $id = [string]$m.EntryID
@@ -274,5 +275,28 @@ mod pruebas {
         assert!(d["cc"].as_str().unwrap().contains(CC_OBLIGATORIO));
         assert!(SCRIPT.contains(".Save()"));
         assert!(!SCRIPT.to_lowercase().contains(".send("));
+    }
+
+    #[test]
+    fn outlook_script_resuelve_destinatarios_y_nunca_envia() {
+        let to = SCRIPT.find("$m.To =").unwrap();
+        let cc = SCRIPT.find("$m.CC =").unwrap();
+        let resolve = SCRIPT.find("try { [void]$m.Recipients.ResolveAll() } catch {}").unwrap();
+        let preparado = SCRIPT.find("Write-Output 'PREPARADO'").unwrap();
+        let save = SCRIPT.find("$m.Save()").unwrap();
+        assert!(to < cc && cc < resolve && resolve < preparado && preparado < save);
+        assert!(!SCRIPT.to_lowercase().contains(".send("));
+
+        let b = Borrador {
+            titulo: "Prueba resolución".into(),
+            para: "destinatario@example.test".into(),
+            cc: "copia@example.test".into(),
+            asunto: "Asunto sintético".into(),
+            cuerpo: "Cuerpo sintético".into(),
+            ..Default::default()
+        };
+        let d = datos(&b, "", &[]);
+        assert_eq!(d["to"], "destinatario@example.test");
+        assert!(d["cc"].as_str().unwrap().contains(CC_OBLIGATORIO));
     }
 }
