@@ -8,7 +8,9 @@
 - Base: `a34eddb9cdc4bf25e00098d97a2e5cd2118520f2` (`estudio/paridad-python-rust-20261119`)
 - Commits de esta sesión:
   - `2e3bd2ecbb9710792c0a1e828fbc3f619678dbb9`: E-P3-A1 (D2-A): destinatarios inteligentes, tribunales dinámicos, sugerencias y ResolveAll
-  - *(el commit siguiente en esta rama incorpora únicamente este informe firmado)*
+  - `2997734a7281364da36d286e3819913b5f22841d`: docs: informe firmado Agente A E-P3-A1 (correos)
+  - `9b9f3b9418d5f5878832084e75feabd4f4a56e9e`: E-P3-A1 (D2-A): corrige hallazgos de revisión en UTF-8, borradores hermanos, alias y tribunales
+  - *(el commit siguiente en esta rama incorpora únicamente la actualización de este informe firmado)*
 - Estado: **HECHO, pendiente de integración**
 
 ---
@@ -49,24 +51,31 @@
 ### 1.4 Outlook COM `ResolveAll()` (`app/src/outlook.rs`)
 - En `SCRIPT`, después de `$m.To` y `$m.CC` y antes de `Write-Output 'PREPARADO'` / `$m.Save()`, se incorporó `try { [void]$m.Recipients.ResolveAll() } catch {}`. Se mantiene `$m.Save()`, el CC obligatorio `ucc_concepcion@pjud.cl` y cero `.Send(` en producción.
 
+### 1.5 Endurecimiento posterior a revisión adversa (`9b9f3b9`)
+- **UTF-8 seguro en prefijo `Tribunal:` (`app/src/personalizar.rs` + `app/src/config.rs`):** `extraer_tribunal` y `completar_contactos_python` reemplazan el corte directo `[..9]` por `.get(..9).is_some_and(|p| p.eq_ignore_ascii_case("tribunal:"))` para evitar *panic* en nombres con caracteres multibyte en el byte 9 (p. ej. `"PRM Biobío"`, `"Fae Biobío"`, `"Tríbunal: ..."`).
+- **Re-sellado limpio de borradores hermanos (`app/src/ui.rs` + `app/src/productos.rs`):** `OperacionProductos::guardar_borradores` y `aplicar_sugerencia_alias` usan `productos::destinatario_borrador` y `resellar_borradores_vigentes` para autocompletar hermanos sin `para` que coincidan con un contacto/alias recién aprendido y re-sellar borradores vigentes no obsoletos cuyo destinatario no fue invalidado, sin marcar `OBSOLETO` a hermanos no relacionados ni ocultar obsolescencias genuinas.
+- **Protección de alias previos (`app/src/ui.rs`):** `aplicar_sugerencia_alias` protege `!self.cfg.aliases.keys().any(|a| clave(a) == k_prog)` además de `contactos`; si ya existe un alias previo para `k_prog`, aplica el correo únicamente al borrador actual sin sobrescribir `self.cfg.aliases`.
+- **Importación de tribunales sin borrar correos ni pisar conflictos (`app/src/personalizar.rs`):** en `importar_contactos_archivo` (`.xlsx`/`.xls`/`.csv`/`.html`/`.json`), una celda `Mail` vacía preserva el `t.para` existente y una dirección distinta a la ya configurada registra conflicto en `conflictos` preservando el correo previo.
+- **Claves de tribunal en minúscula sin duplicación (`app/src/productos.rs` + `app/src/personalizar.rs` + `app/src/config.rs`):** `aplicar_contactos_aprendidos`, `clave_tribunal_existente` y `completar_contactos_python` resuelven la clave existente por `clave(k)` / `clave(&t.nombre)` antes de actualizar, evitando crear duplicados en mayúsculas.
+
 ---
 
 ## 2. Pruebas permanentes y verificación
 
 ### Pruebas permanentes agregadas (solo `@example.test` y RIT año `2099`)
-- `productos.rs`: `aprendizaje_guarda_nuevo_y_no_pisa_existente_ni_ambiguo`
-- `personalizar.rs`: `guardar_e_importar_tribunal_adicional_desde_excel_y_json`
-- `config.rs`: `contacto_programa_resuelve_sin_parentesis_y_sugiere_candidatos`
+- `productos.rs`: `aprendizaje_guarda_nuevo_y_no_pisa_existente_ni_ambiguo`, `aprendizaje_actualiza_clave_tribunal_en_minuscula_sin_duplicar`
+- `personalizar.rs`: `guardar_e_importar_tribunal_adicional_desde_excel_y_json`, `nombres_utf8_en_borde_nueve_no_paniquean_e_importacion_vacia_preserva_tribunal`
+- `config.rs`: `contacto_programa_resuelve_sin_parentesis_y_sugiere_candidatos` (incluye clave en minúscula y prefijo UTF-8 con tilde en `migrar_contactos_python`)
 - `outlook.rs`: `outlook_script_resuelve_destinatarios_y_nunca_envia`
-- `ui.rs`: `guardar_borrador_aprende_contacto_sincroniza_cfg_y_sugerencia_guarda_alias`
+- `ui.rs`: `guardar_borrador_aprende_contacto_sincroniza_cfg_y_sugerencia_guarda_alias`, `guardar_borrador_no_obsoleta_hermano_vacio_y_respeta_alias_existente`
 
 ### Resultados ejecutados en `waffle_a`
 - `tools/probar_app.sh rapido config`: `6 passed; 0 failed` (bin)
-- `tools/probar_app.sh todo personalizar`: `8 passed; 0 failed` (`AJUSTES: 43/44, fallos 0, aceptadas 1`; `CATASTRO: 35/36, fallos 0, aceptadas 1`)
-- `tools/probar_app.sh rapido productos`: `2 passed` (lib) + `14 passed` (bin), `0 failed`
+- `tools/probar_app.sh todo personalizar`: `9 passed; 0 failed` (`AJUSTES: 43/44, fallos 0, aceptadas 1`; `CATASTRO: 35/36, fallos 0, aceptadas 1`)
+- `tools/probar_app.sh rapido productos`: `2 passed` (lib) + `15 passed` (bin), `0 failed`
 - `tools/probar_app.sh rapido outlook`: `7 passed; 0 failed` (bin)
-- `tools/probar_app.sh rapido pruebas_correos_d2a`: `1 passed; 0 failed` (bin)
-- `tools/probar_app.sh todo`: `115 passed` (lib) + `156 passed; 10 ignored` (bin, sin `FLOW_E3_PAQUETE`) + `4 passed` (`instalador`), `0 failed`
+- `tools/probar_app.sh rapido pruebas_correos_d2a`: `2 passed; 0 failed` (bin)
+- `tools/probar_app.sh todo`: `115 passed` (lib) + `159 passed; 10 filtered out` (bin, sin `FLOW_E3_PAQUETE`) + `4 passed` (`instalador`), `0 failed`
 - `cargo clippy --manifest-path app/Cargo.toml --locked --lib -- -D warnings`: falla únicamente por un hallazgo preexistente fuera de territorio en `app/src/descargador/puente.rs:240` (`clippy::needless_option_as_deref` bajo `rustc 1.100.0`); con `-A clippy::needless_option_as_deref` pasa con **0 advertencias** en todo `--lib`.
 - Verificadores estáticos:
   - `python tools/inventario_escrituras.py`: `ESCRITURAS: 120 en 24 archivos; RESULTADO: PASA (0 discrepancias)`
@@ -84,14 +93,14 @@
 - **F11 / F12 / F13 (`E-P3-A1`, `D2-A`):** aprendizaje automático de destinatarios válidos al guardar borradores (`productos::contactos_aprendidos` + sincronía `op.cfg` en `recuperar_operacion`), creación/importación dinámica de tribunales válidos (`guardar_contacto`, `.xlsx`/`.xls`/`.json`), cascada `sin_parentesis`, sugerencias en 1 clic con guardado de alias, botón de reimportación desde Flow Python y `ResolveAll()` seguro antes de `Save()` en `outlook.rs`.
 
 ### Para `docs/migracion_python_rust/PLAN.md`
-- **E-P3-A1 (`D2-A`) · Destinatarios inteligentes en Correos — `HECHO` (`2e3bd2e`).** Aprendizaje al guardar borradores, tribunales dinámicos en Contactos/Excel/JSON, cascada `sin_parentesis`, sugerencias en 1 clic, reimportación Python y `ResolveAll()` en Outlook COM.
+- **E-P3-A1 (`D2-A`) · Destinatarios inteligentes en Correos — `HECHO` (`2e3bd2e`, `9b9f3b9`).** Aprendizaje al guardar borradores, tribunales dinámicos en Contactos/Excel/JSON, cascada `sin_parentesis`, sugerencias en 1 clic, reimportación Python y `ResolveAll()` en Outlook COM.
 
 ### Para `docs/migracion_python_rust/REGISTRO_IMPLEMENTACION.md`
 ```markdown
 ### 2026-11-27 · E-P3-A1 (D2-A): Destinatarios inteligentes en Correos · Agente A
-- productos.rs/ui.rs: `contactos_aprendidos` al guardar borradores y sincronía `self.cfg = op.cfg` en `recuperar_operacion`.
-- personalizar.rs/config.rs/productos.rs: tribunales dinámicos en guardar/importar (.xlsx/.xls/.json) y `tribunal_para` normalizado (2 diferencias D2-A aceptadas en oráculo).
-- config.rs/ui.rs: cascada `sin_parentesis`, `sugerir_contactos` en 1 clic con alias y botón de reimportación desde Flow Python.
+- productos.rs/ui.rs: `contactos_aprendidos` al guardar borradores, re-sellado limpio de borradores hermanos y sincronía `self.cfg = op.cfg`.
+- personalizar.rs/config.rs/productos.rs: tribunales dinámicos en guardar/importar (.xlsx/.xls/.json), protección UTF-8/Mail vacío/conflictos y `tribunal_para` normalizado (2 diferencias D2-A aceptadas en oráculo).
+- config.rs/ui.rs: cascada `sin_parentesis`, `sugerir_contactos` en 1 clic sin pisar alias previos y botón de reimportación desde Flow Python.
 - outlook.rs: `try { [void]$m.Recipients.ResolveAll() } catch {}` antes de `$m.Save()`.
-- Commit: 2e3bd2e (y cierre de informe en rama `estudio/agente-a-correos-20261127`).
+- Commits: 2e3bd2e, 9b9f3b9 (y cierre de informe en rama `estudio/agente-a-correos-20261127`).
 ```
