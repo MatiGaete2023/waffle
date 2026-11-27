@@ -16,6 +16,12 @@ Una entrada por encargo, de diez líneas como máximo, la más reciente arriba:
 
 No se copian salidas completas ni listas de mutaciones: la prueba afirma sus conteos y la CI del commit es la evidencia.
 
+## 2026-11-27 · Integración de la Tanda 3
+- Cambió: se integraron las ramas B (`cefcd77`), C (`b8ed66e`) y A (`358fed1`). El puente registra la búsqueda y descarga conjunta al validar la versión y los protocolos de la extensión.
+- Evidencia: [informe A](informes/AGENTE_A_20261127_correos.md), [informe B](informes/AGENTE_B_20261127_meta4_lite.md), [informe C](informes/AGENTE_C_20261127_descargador.md) y [plan técnico](PLAN_TANDA_3_20261127.md).
+- Diferencias declaradas: comprobante JSON para consultas vacías, extensiones Integral 2.11.0 y Lite 1.2.0, destinatarios aprendidos al guardar borradores.
+- Pendiente: CI del conjunto y prueba operativa.
+
 ## 2026-11-26 · Manuales PDF y video guía exclusivos de SITFA Lite (sin imágenes ni referencias al Asistente)
 - Cambió: retiradas `descargador_lite/docs/img/flow_lite_*.png`; regenerados `descargador_lite/docs/{SITFA_Lite_Manual_Instalacion.pdf,SITFA_Lite_Manual_Uso.pdf,SITFA_Lite_Video_Instalacion_y_Uso.mp4}` usando únicamente capturas reales de SITFA Lite (`a0..a6*.png`) y de la extensión Chrome (`r01..r07*.png`), sin comparaciones ni menciones a otras herramientas.
 - Acredita: revisión visual de las 8 páginas PDF (4 de Instalación + 4 de Uso) y video H.264 720p 30fps (49,8 s · 2,03 MB).

@@ -114,11 +114,7 @@ impl Puente {
             serde_json::json!({}),
             Duration::from_secs(15),
         )?;
-        comprobar_extension(edicion, &version)?;
-        let rapido = edicion == Edicion::Integral
-            && version["flow_rust_rapido"] == 1
-            && version["flow_rust_version"] == "2.10.0";
-        self.registrar_rapido(rapido);
+        self.registrar_capacidades(edicion, &version)?;
         serde_json::from_value::<Catalogo>(datos)
             .map_err(|_| "Chrome no devolvió un catálogo válido.".into())
     }
@@ -132,24 +128,39 @@ impl Puente {
             serde_json::json!({}),
             Duration::from_secs(15),
         )?;
-        let resultado = comprobar_extension(edicion, &version);
-        // E-Q3: las lecturas de contexto quedan habilitadas solo tras verificar la extensión Integral.
-        let ok_integral = resultado.is_ok() && edicion == Edicion::Integral;
-        self.habilitar_lecturas(ok_integral);
+        self.registrar_capacidades(edicion, &version)
+    }
+
+    fn registrar_capacidades(
+        &self,
+        edicion: Edicion,
+        version: &serde_json::Value,
+    ) -> Result<(), String> {
+        let resultado = comprobar_extension(edicion, version);
+        let validada = resultado.is_ok();
+        let integral = validada && edicion == Edicion::Integral;
+        self.habilitar_lecturas(integral);
         self.registrar_rapido(
-            ok_integral
-                && version["flow_rust_rapido"] == 1
-                && version["flow_rust_version"] == "2.10.0",
+            integral
+                && matches!(
+                    (version["flow_rust_version"].as_str(), version["flow_rust_rapido"].as_u64()),
+                    (Some("2.10.0"), Some(1)) | (Some("2.11.0"), Some(2))
+                ),
+        );
+        self.registrar_search_and_download(
+            validada && version["protocolos"]["search_and_download"] == 1,
         );
         resultado
     }
 }
 
 pub(crate) fn comprobar_extension(edicion: Edicion, version: &serde_json::Value) -> Result<(), String> {
-    let (tipo, numero, protocolos) = match edicion {
+    let (tipo, recibida, actual, compuesto, mut protocolos) = match edicion {
         Edicion::Integral => (
             "CSMP_RUS_CAPACIDADES",
-            "2.9.0",
+            version["version"] == "2.9.0",
+            "2.11.0",
+            version["flow_rust_version"] == "2.11.0",
             serde_json::json!({
                 "bitacoras_lectura": 1, "descarga_conjunta": 1, "pdf_seleccion": 1,
                 "pdf_copia_fija": 1, "calendario_lectura": 1, "historia_lectura": 1, "historico_lectura": 2,
@@ -157,20 +168,25 @@ pub(crate) fn comprobar_extension(edicion: Edicion, version: &serde_json::Value)
         ),
         Edicion::Lite => (
             "SITFA_LITE_CAPACIDADES",
-            "1.1.0",
+            matches!(version["version"].as_str(), Some("1.1.0" | "1.2.0")),
+            "1.2.0",
+            version["version"] == "1.2.0",
             serde_json::json!({
                 "descarga_xls": 1, "pdf_sin_registros": 1,
             }),
         ),
     };
+    if compuesto {
+        protocolos["search_and_download"] = serde_json::json!(1);
+    }
     if version["tipo"] == tipo
-        && version["version"] == numero
+        && recibida
         && version["protocolos"] == protocolos
         && version["escritura_rus"] == false
     {
         return Ok(());
     }
-    Err(format!("Carga en Chrome la extensión Flow Python de la edición elegida ({numero}) y vuelve a conectar."))
+    Err(format!("Carga en Chrome la extensión Flow de la edición elegida ({actual}) y vuelve a conectar."))
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

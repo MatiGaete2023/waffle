@@ -1537,7 +1537,7 @@ mod tests {
     }
 
     #[test]
-    fn modo_rapido_avisa_en_29_y_activa_en_210_con_calendarios() {
+    fn modo_rapido_avisa_en_29_y_activa_en_versiones_propias_con_calendarios() {
         let datos: Value = serde_json::from_str(include_str!("../../tests/datos/bitacoras.json")).unwrap();
         let caso = datos["escenarios"].as_array().unwrap().iter().find(|e| e["escenario"] == "calendario").unwrap();
         let catalogo: Catalogo = serde_json::from_value(datos["catalogo"].clone()).unwrap();
@@ -1569,6 +1569,9 @@ mod tests {
             let mut pasos = caso["guion"].as_array().unwrap().clone();
             pasos[0]["respuesta"]["flow_rust_rapido"] = json!(rapido_val);
             pasos[0]["respuesta"]["flow_rust_version"] = json!(ver);
+            if ver == "2.11.0" {
+                pasos[0]["respuesta"]["protocolos"]["search_and_download"] = json!(1);
+            }
             let dir = raiz.join(sub); std::fs::create_dir(&dir).unwrap();
             let guion = Guion { pasos, pedidos: RefCell::default() };
             let avisos = RefCell::new(Vec::<String>::new());

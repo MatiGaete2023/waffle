@@ -2,6 +2,16 @@
 
 Vigente desde el 24 de noviembre de 2026. Reemplaza al [plan del 20 de noviembre](historico/PLAN_20261120.md) y a los [encargos](historico/ENCARGOS_IA.md). El estado de cada capacidad está en [ESTADO.md](ESTADO.md).
 
+## Tanda 3 · Decisiones del 27 de noviembre de 2026
+
+El [plan técnico del 27](PLAN_TANDA_3_20261127.md) conserva las decisiones D1-A a D6-C y los criterios de cada encargo. El orden de integración es B, C y A.
+
+- A · E-P3-A1: aprendizaje de destinatarios al guardar borradores, importación de tribunales y sugerencias que el usuario acepta en Correos.
+- B · E-P3-B1: comprobante JSON para consultas vacías en Meta 4 y modo rápido de SITFA Lite con la extensión 1.2.0.
+- C · E-P3-C1 y E-X3: modo rápido del Descargador Integral con la extensión 2.11.0, comprobante JSON y diagnóstico de encabezados HTML y XLS.
+
+La Tanda 4 contempla un piloto WebView2 y evaluar la extracción directa de HTML según los encabezados observados en SITFA real. La validación de esta tanda sigue en [ESTADO.md](ESTADO.md).
+
 ## Objetivo y corte
 
 - Flow Rust reemplaza a Flow Python cuando el ciclo mensual completo corre en `flow_rust.exe` y el usuario lo deja en un acta.

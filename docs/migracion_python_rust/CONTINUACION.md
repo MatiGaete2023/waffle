@@ -2,6 +2,10 @@
 
 Para continuar la coordinación como **Orquestador (Antigravity)** con tres agentes ChatGPT en paralelo (**A**, **B**, **C**) en modo ZIP + `.patch`. La fuente del estado es [ESTADO.md](ESTADO.md); este archivo resume el proyecto, el reparto, el procedimiento y las lecciones.
 
+## Relevo del 27 de noviembre de 2026
+
+La [Tanda 3](PLAN_TANDA_3_20261127.md) sucede al resumen del 26. Los encargos A, B y C se integraron en el orden B, C y A. Las tareas son confirmar la CI, preparar el ejecutable de Windows y probar los flujos reales con la extensión Integral 2.11.0 y la Lite 1.2.0. El resultado de la comparación de encabezados HTML y XLS determina el alcance de la Tanda 4.
+
 ## Resumen
 
 **Hechos (26-nov, CI Linux + Windows + regeneración de oráculos en verde — run `45894872026`, commit `60cdfce` en `MatiGaete2023/waffle`)**

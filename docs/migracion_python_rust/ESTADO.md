@@ -6,6 +6,13 @@ Actualizado: 26 de noviembre de 2026. Las **Tandas 1 y 2** (`E-P0-C1`, `E-P0-B1`
 - Rama única: `estudio/paridad-python-rust-20261119`.
 - Estados: **Sí** (existe y tiene contraste con Python), **Parcial** (falta lo que se indica), **No** (ausente). Ninguno significa «aceptado»: eso solo lo declara el usuario en un acta.
 
+## Tanda 3 · 27 de noviembre de 2026
+
+Los tres encargos se integraron sobre `a34eddb`. Falta confirmar la CI del conjunto y la prueba operativa. Los cambios incluyen destinatarios inteligentes en Correos, comprobantes JSON para consultas vacías en Meta 4 y el modo rápido para SITFA Lite e Integral. Integral usa la extensión 2.11.0 y Lite la 1.2.0.
+
+- [Plan técnico original](PLAN_TANDA_3_20261127.md)
+- Informes de [Correos](informes/AGENTE_A_20261127_correos.md), [Meta 4 y SITFA Lite](informes/AGENTE_B_20261127_meta4_lite.md) y [Descargador Integral](informes/AGENTE_C_20261127_descargador.md).
+
 ## Siguiente paso
 
 1. **Generar entrega `--release` en CI (`workflow_dispatch`, `entrega=true`):** lanzar el flujo `Flow Rust local · Windows` con `entrega=true` sobre `estudio/paridad-python-rust-20261119` para obtener el ejecutable `--release`, el instalador Inno Setup, las capturas de Windows y el contraste V1 con `rust/`.
