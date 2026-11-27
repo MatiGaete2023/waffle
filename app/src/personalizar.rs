@@ -35,6 +35,30 @@ pub fn correos(texto: &str) -> Result<Vec<String>, String> {
     Ok(v)
 }
 
+fn extraer_tribunal(nombre: &str) -> Option<&str> {
+    let t = nombre.trim();
+    if t.len() >= 9 && t[..9].eq_ignore_ascii_case("tribunal:") {
+        Some(t[9..].trim())
+    } else {
+        None
+    }
+}
+
+fn clave_tribunal(raw_trib: &str) -> String {
+    crate::util::tribunal(raw_trib)
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::util::normalizar(raw_trib).to_uppercase())
+}
+
+fn aplicar_tribunal_dinamico(r: &mut Config, raw_trib: &str, direccion: String) {
+    let clave = clave_tribunal(raw_trib);
+    let t = r.tribunales.entry(clave).or_insert_with(|| crate::config::Tribunal {
+        nombre: raw_trib.trim().to_string(),
+        para: String::new(),
+    });
+    t.para = direccion;
+}
+
 /// `save_contact`: guarda un contacto (o los destinatarios de un tribunal) con sus alias, sin pisar otro contacto.
 pub fn guardar_contacto(cfg: &Config, nombre: &str, direccion: &str, alias: &[String], previo: Option<&str>) -> Result<Config, String> {
     let mut r = cfg.clone();
@@ -43,12 +67,14 @@ pub fn guardar_contacto(cfg: &Config, nombre: &str, direccion: &str, alias: &[St
         return Err("Indica un nombre para el contacto.".into());
     }
     let direccion = correos(direccion)?.join("; ");
-    if let Some(clave) = nombre.strip_prefix("Tribunal: ") {
-        let t = r.tribunales.get_mut(clave).ok_or("Tribunal no reconocido.")?;
-        t.para = direccion;
+    if let Some(raw_trib) = extraer_tribunal(nombre) {
+        if crate::util::perfil_tribunal(raw_trib).is_none() {
+            return Err("Tribunal no reconocido.".into());
+        }
+        aplicar_tribunal_dinamico(&mut r, raw_trib, direccion);
         return Ok(r);
     }
-    if previo.is_some_and(|p| p.starts_with("Tribunal: ")) {
+    if previo.is_some_and(|p| extraer_tribunal(p).is_some()) {
         return Err("La clave del tribunal se conserva; selecciona Nuevo para crear un programa.".into());
     }
     let n = normalizar(nombre);
@@ -163,10 +189,8 @@ pub struct ImportacionContactos {
     pub conflictos: Vec<String>,
 }
 
-/// `_import_contacts` de Flow Python. Un `.json` entrega contactos con la regla de `parse_contacts` (las entradas
-/// «Tribunal: X» de un tribunal conocido actualizan sus destinatarios); un catastro (Excel u otra tabla) pasa por
-/// `importar_catastro`. Extensión de Rust: en tablas que no son Excel (CSV, HTML), una fila «Tribunal: X» también
-/// actualiza los destinatarios del tribunal, para releer lo que exporta Contactos.
+/// `_import_contacts` de Flow Python + D2-A: en `.json` y en tablas (`.xlsx`, `.xls`, `.csv`, `.html`), las
+/// entradas «Tribunal: X» válidas según `perfil_tribunal` actualizan o crean dinámicamente el tribunal en `tribunales`.
 pub fn importar_contactos_archivo(cfg: &Config, extension: &str, bytes: &[u8]) -> Result<ImportacionContactos, String> {
     let mut r = cfg.clone();
     let mut conflictos = Vec::new();
@@ -174,8 +198,11 @@ pub fn importar_contactos_archivo(cfg: &Config, extension: &str, bytes: &[u8]) -
     if extension == "json" {
         let texto = std::str::from_utf8(bytes).map_err(|_| "El archivo de contactos no está en UTF-8.".to_string())?;
         for (nombre, direccion) in parse_contactos(texto)? {
-            if let Some(t) = nombre.strip_prefix("Tribunal: ").map(str::to_uppercase).and_then(|k| r.tribunales.get_mut(&k)) {
-                t.para = correos(&direccion)?.join("; ");
+            if let Some(raw_trib) = extraer_tribunal(&nombre) {
+                if crate::util::perfil_tribunal(raw_trib).is_some() {
+                    let dir_norm = correos(&direccion)?.join("; ");
+                    aplicar_tribunal_dinamico(&mut r, raw_trib, dir_norm);
+                }
                 continue;
             }
             if r.contactos.get(&nombre).is_some_and(|previa| *previa != direccion) {
@@ -190,14 +217,17 @@ pub fn importar_contactos_archivo(cfg: &Config, extension: &str, bytes: &[u8]) -
     let hoja = hojas.first().ok_or("El archivo no tiene hojas.")?;
     let filas: Vec<Vec<String>> = hoja.rows.iter().map(|f| f.iter().map(|c| c.display()).collect()).collect();
     let mut catastro = importar_catastro(&r.contactos, &filas)?;
-    if !["xlsx", "xls"].contains(&extension.as_str()) {
-        let tribunales: Vec<String> = catastro.contactos.keys().filter_map(|k| k.strip_prefix("Tribunal: ")).map(str::to_uppercase).collect();
-        let conocidos: Vec<String> = tribunales.into_iter().filter(|k| r.tribunales.contains_key(k)).collect();
-        for clave in conocidos {
-            let nombre = catastro.contactos.keys().find(|k| k.strip_prefix("Tribunal: ").is_some_and(|x| x.to_uppercase() == clave)).cloned().unwrap();
-            let direccion = catastro.contactos.remove(&nombre).unwrap_or_default();
-            if let Some(t) = r.tribunales.get_mut(&clave) {
-                t.para = direccion;
+    let claves_tribunal: Vec<String> = catastro
+        .contactos
+        .keys()
+        .filter(|k| extraer_tribunal(k).is_some())
+        .cloned()
+        .collect();
+    for nombre in claves_tribunal {
+        let direccion = catastro.contactos.remove(&nombre).unwrap_or_default();
+        if let Some(raw_trib) = extraer_tribunal(&nombre) {
+            if crate::util::perfil_tribunal(raw_trib).is_some() {
+                aplicar_tribunal_dinamico(&mut r, raw_trib, direccion);
             }
         }
     }
@@ -450,7 +480,7 @@ mod pruebas {
         v.as_str().unwrap_or_default().to_string()
     }
 
-    fn contacto(caso: &Value) -> Vec<String> {
+    fn contacto_con_d2a(caso: &Value, aceptadas: &mut Vec<String>) -> Vec<String> {
         let cfg = cfg_base(&caso["contactos"], &caso["aliases"]);
         let alias: Vec<String> = caso["alias"].as_array().unwrap().iter().map(texto).collect();
         let previo = caso["previo"].as_str();
@@ -458,8 +488,32 @@ mod pruebas {
         match (r, caso.get("error"), caso.get("resultado")) {
             (Err(e), Some(esperado), _) if e == texto(esperado) => vec![],
             (Ok(c), None, Some(esperado)) if estado(&c) == *esperado => vec![],
+            (Ok(c), Some(esperado), None)
+                if caso["nombre"] == "Tribunal: INEXISTENTE"
+                    && texto(esperado) == "Tribunal no reconocido."
+                    && estado(&c) == serde_json::json!({"contactos": {}, "aliases": {}, "tribunales": {"INEXISTENTE": "x@ejemplo.cl"}}) =>
+            {
+                // D2-A (decisión del usuario, 27-nov-2026): tribunales dinámicos permiten crear tribunales válidos
+                // en `r.tribunales` en lugar de rechazar `"Tribunal: INEXISTENTE"` como en Flow Python.
+                aceptadas.push(format!(
+                    "D2-A contacto {}: Python error {:?} / Rust tribunales[\"INEXISTENTE\"]={:?}",
+                    caso["nombre"],
+                    esperado,
+                    estado(&c)["tribunales"]["INEXISTENTE"]
+                ));
+                vec![]
+            }
             (otro, e, r) => vec![format!("Rust {otro:?} · Python error {e:?} resultado {r:?}")],
         }
+    }
+
+    fn contacto(caso: &Value) -> Vec<String> {
+        let mut ignoradas = Vec::new();
+        let d = contacto_con_d2a(caso, &mut ignoradas);
+        if d.is_empty() && !ignoradas.is_empty() {
+            return vec![format!("diferencia inesperada sin contexto D2-A: {ignoradas:?}")];
+        }
+        d
     }
 
     fn plantilla(caso: &Value) -> Vec<String> {
@@ -569,7 +623,7 @@ mod pruebas {
         let raiz = perfil.join("personalizacion");
         let _ = std::fs::remove_dir_all(&raiz);
         std::fs::create_dir_all(&raiz).unwrap();
-        let (mut total, mut fallos) = (0, Vec::new());
+        let (mut total, mut fallos, mut aceptadas) = (0, Vec::new(), Vec::new());
         let mut anotar = |nombre: String, d: Vec<String>| {
             total += 1;
             if !d.is_empty() {
@@ -577,7 +631,8 @@ mod pruebas {
             }
         };
         for (i, c) in datos["contactos"].as_array().unwrap().iter().enumerate() {
-            anotar(format!("contacto {i} {}", c["nombre"]), contacto(c));
+            let d = contacto_con_d2a(c, &mut aceptadas);
+            anotar(format!("contacto {i} {}", c["nombre"]), d);
         }
         for (i, c) in datos["plantillas"].as_array().unwrap().iter().enumerate() {
             anotar(format!("plantilla {i} {} {}", c["operacion"], c["clave"]), plantilla(c));
@@ -588,11 +643,15 @@ mod pruebas {
         for (i, c) in datos["matrices"].as_array().unwrap().iter().enumerate() {
             anotar(format!("matrices {i}"), matrices(c, &raiz, i));
         }
+        for a in &aceptadas {
+            println!("DIFERENCIA_ACEPTADA {a}");
+        }
         for f in &fallos {
             println!("FALLA {f}");
         }
-        println!("AJUSTES: {}/{total}, fallos {}", total - fallos.len(), fallos.len());
+        println!("AJUSTES: {}/{total}, fallos {}, aceptadas {}", total - fallos.len() - aceptadas.len(), fallos.len(), aceptadas.len());
         let _ = std::fs::remove_dir_all(&raiz);
+        assert_eq!(aceptadas.len(), 1, "solo la diferencia D2-A (Tribunal: INEXISTENTE) está aceptada");
         assert_eq!(total, 44, "el oráculo debe traer 44 casos");
         assert!(fallos.is_empty());
     }
@@ -622,7 +681,7 @@ mod pruebas {
     }
 
     // ---- E-A6: importación de contactos
-    fn catastro_de_python(caso: &Value) -> Vec<String> {
+    fn catastro_de_python_con_d2a(caso: &Value, aceptadas: &mut Vec<String>) -> Vec<String> {
         use base64::Engine;
         let previos: BTreeMap<String, String> =
             caso["contactos"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), texto(v))).collect();
@@ -632,10 +691,37 @@ mod pruebas {
             (Err(e), Some(esperado), _) if e == texto(esperado) => vec![],
             (Ok(r), None, Some(esperado)) => {
                 let obtenido = serde_json::json!({"contactos": r.cfg.contactos, "conflictos": r.conflictos});
-                if obtenido == *esperado { vec![] } else { vec![format!("Rust {obtenido} · Python {esperado}")] }
+                if obtenido == *esperado {
+                    vec![]
+                } else if caso["contactos"] == serde_json::json!({})
+                    && caso["filas"] == serde_json::json!([["Nombre", "Mail"], ["Tribunal: LAJA", "laja@ejemplo.cl"]])
+                    && r.cfg.contactos.is_empty()
+                    && r.conflictos.is_empty()
+                    && r.cfg.tribunales.get("LAJA").map(|t| t.para.as_str()) == Some("laja@ejemplo.cl")
+                {
+                    // D2-A (decisión del usuario, 27-nov-2026): `.xlsx`/`.xls` procesan filas `Tribunal: X` en
+                    // `r.tribunales` en lugar de dejarlas en `r.contactos` como en Flow Python.
+                    aceptadas.push(format!(
+                        "D2-A catastro Tribunal: LAJA (xlsx): Python contactos {:?} / Rust tribunales[\"LAJA\"]={:?}",
+                        esperado["contactos"],
+                        r.cfg.tribunales["LAJA"].para
+                    ));
+                    vec![]
+                } else {
+                    vec![format!("Rust {obtenido} · Python {esperado}")]
+                }
             }
             (otro, e, r) => vec![format!("Rust {otro:?} · Python error {e:?} resultado {r:?}")],
         }
+    }
+
+    fn catastro_de_python(caso: &Value) -> Vec<String> {
+        let mut ignoradas = Vec::new();
+        let d = catastro_de_python_con_d2a(caso, &mut ignoradas);
+        if d.is_empty() && !ignoradas.is_empty() {
+            return vec![format!("diferencia inesperada sin contexto D2-A: {ignoradas:?}")];
+        }
+        d
     }
 
     fn texto_de_python(caso: &Value) -> Vec<String> {
@@ -649,10 +735,10 @@ mod pruebas {
     #[test]
     fn importacion_de_contactos_igual_a_python() {
         let datos: Value = serde_json::from_str(include_str!("../tests/datos/catastro.json")).unwrap();
-        let (mut total, mut fallos) = (0, Vec::new());
+        let (mut total, mut fallos, mut aceptadas) = (0, Vec::new(), Vec::new());
         for (i, c) in datos["catastros"].as_array().unwrap().iter().enumerate() {
             total += 1;
-            let d = catastro_de_python(c);
+            let d = catastro_de_python_con_d2a(c, &mut aceptadas);
             if !d.is_empty() {
                 fallos.push(format!("catastro {i}: {}", d.join(" ")));
             }
@@ -666,8 +752,12 @@ mod pruebas {
         }
         let errores = datos["catastros"].as_array().unwrap().iter().filter(|c| c.get("error").is_some()).count();
         let conflictos: usize = datos["catastros"].as_array().unwrap().iter().filter_map(|c| c["resultado"]["conflictos"].as_array()).map(Vec::len).sum();
-        println!("CATASTRO: {}/{total}, fallos {}", total - fallos.len(), fallos.len());
+        for a in &aceptadas {
+            println!("DIFERENCIA_ACEPTADA {a}");
+        }
+        println!("CATASTRO: {}/{total}, fallos {}, aceptadas {}", total - fallos.len() - aceptadas.len(), fallos.len(), aceptadas.len());
         assert!(fallos.is_empty(), "{}", fallos.join("\n"));
+        assert_eq!(aceptadas.len(), 1, "solo la diferencia D2-A (Tribunal: LAJA en xlsx) está aceptada");
         assert_eq!((total, errores, conflictos), (36, 5, 4), "conteos del oráculo");
     }
 
@@ -690,14 +780,15 @@ mod pruebas {
         let mut cfg = Config::default();
         cfg.tribunales.insert("LAJA".into(), crate::config::Tribunal { nombre: "Laja".into(), para: String::new() });
         cfg.contactos.insert("Programa Uno".into(), "uno@ejemplo.cl".into());
-        let json = r#"[{"Nombre":"Tribunal: LAJA","Mail":"laja@ejemplo.cl, laja2@ejemplo.cl"},{"Nombre":"Tribunal: OTRO","Mail":"x@ejemplo.cl"},
+        let json = r#"[{"Nombre":"Tribunal: LAJA","Mail":"laja@ejemplo.cl, laja2@ejemplo.cl"},{"Nombre":"Tribunal: CORONEL","Mail":"x@ejemplo.cl"},
             {"Nombre":"Programa Uno","Mail":"distinto@ejemplo.cl"},{"Nombre":"Programa Dos","Mail":"dos@ejemplo.cl"}]"#;
         let r = importar_contactos_archivo(&cfg, "json", json.as_bytes()).unwrap();
         assert_eq!(r.cfg.tribunales["LAJA"].para, "laja@ejemplo.cl; laja2@ejemplo.cl");
         assert_eq!(r.conflictos, ["Programa Uno"]);
         assert_eq!(r.cfg.contactos["Programa Uno"], "uno@ejemplo.cl");
         assert_eq!(r.cfg.contactos["Programa Dos"], "dos@ejemplo.cl");
-        assert_eq!(r.cfg.contactos["Tribunal: OTRO"], "x@ejemplo.cl", "un tribunal desconocido es un contacto más, como en Python");
+        assert_eq!(r.cfg.tribunales["CORONEL"].para, "x@ejemplo.cl");
+        assert!(!r.cfg.contactos.contains_key("Tribunal: CORONEL"));
         assert!(cfg.tribunales["LAJA"].para.is_empty() && !cfg.contactos.contains_key("Programa Dos"), "la original no cambia");
         assert!(importar_contactos_archivo(&cfg, "json", b"[{").is_err());
     }
@@ -713,5 +804,43 @@ mod pruebas {
         let malo = "Nombre;Mail\nPrograma Uno;uno@ejemplo.cl\nPrograma Dos;no es correo\n";
         let e = importar_contactos_archivo(&cfg, "csv", malo.as_bytes()).unwrap_err();
         assert_eq!(e, "Dirección inválida: no es correo");
+    }
+
+    #[test]
+    fn guardar_e_importar_tribunal_adicional_desde_excel_y_json() {
+        let base = Config::default();
+        // 1. guardar_contacto crea tribunal dinámico válido y rechaza marcadores inválidos.
+        let c1 = guardar_contacto(&base, "Tribunal: Juzgado de Familia de Coronel", "coronel@example.test", &[], None).unwrap();
+        assert_eq!(c1.tribunales["JUZGADO DE FAMILIA DE CORONEL"].nombre, "Juzgado de Familia de Coronel");
+        assert_eq!(c1.tribunales["JUZGADO DE FAMILIA DE CORONEL"].para, "coronel@example.test");
+        assert_eq!(guardar_contacto(&base, "Tribunal: SIN DATO", "x@example.test", &[], None).unwrap_err(), "Tribunal no reconocido.");
+        assert_eq!(guardar_contacto(&base, "Tribunal: ", "x@example.test", &[], None).unwrap_err(), "Tribunal no reconocido.");
+
+        // 2. Importar desde .xlsx crea tribunales dinámicos y no los deja en `contactos`.
+        let mut libro = rust_xlsxwriter::Workbook::new();
+        let hoja = libro.add_worksheet();
+        hoja.write_string(0, 0, "Nombre").unwrap();
+        hoja.write_string(0, 1, "Mail").unwrap();
+        hoja.write_string(1, 0, "Tribunal: Talcahuano").unwrap();
+        hoja.write_string(1, 1, "talcahuano@example.test").unwrap();
+        hoja.write_string(2, 0, "PRM Ficticio").unwrap();
+        hoja.write_string(2, 1, "prm@example.test").unwrap();
+        let xlsx_bytes = libro.save_to_buffer().unwrap();
+        let imp_xlsx = importar_contactos_archivo(&base, "xlsx", &xlsx_bytes).unwrap();
+        assert_eq!(imp_xlsx.cfg.tribunales["TALCAHUANO"].para, "talcahuano@example.test");
+        assert_eq!(imp_xlsx.cfg.contactos["PRM Ficticio"], "prm@example.test");
+        assert!(!imp_xlsx.cfg.contactos.contains_key("Tribunal: Talcahuano"));
+
+        // 3. Importar desde .xls (HTML tabular SITFA/Excel) procesa también tribunales dinámicos.
+        let xls_html = "<table><tr><th>Nombre</th><th>Mail</th></tr><tr><td>Tribunal: Concepcion</td><td>conce@example.test</td></tr></table>";
+        let imp_xls = importar_contactos_archivo(&base, "xls", xls_html.as_bytes()).unwrap();
+        assert_eq!(imp_xls.cfg.tribunales["CONCEPCION"].para, "conce@example.test");
+
+        // 4. Importar desde .json crea tribunales dinámicos y omite marcadores inválidos.
+        let json = r#"[{"Nombre":"Tribunal: Chiguayante","Mail":"chiguayante@example.test"},{"Nombre":"Tribunal: SIN DATO","Mail":"x@example.test"}]"#;
+        let imp_json = importar_contactos_archivo(&base, "json", json.as_bytes()).unwrap();
+        assert_eq!(imp_json.cfg.tribunales["CHIGUAYANTE"].para, "chiguayante@example.test");
+        assert!(!imp_json.cfg.tribunales.contains_key("SIN DATO"));
+        assert!(!imp_json.cfg.contactos.contains_key("Tribunal: SIN DATO"));
     }
 }

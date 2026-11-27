@@ -296,23 +296,150 @@ impl Config {
         }
     }
 
-    pub fn tribunal_nombre(&self, clave: &str, original: &str) -> String {
-        self.tribunales.get(clave).map(|t| t.nombre.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| original.to_string())
+    pub fn tribunal_nombre(&self, clave_trib: &str, original: &str) -> String {
+        let exact = self
+            .tribunales
+            .get(clave_trib)
+            .filter(|t| !t.nombre.is_empty())
+            .map(|t| t.nombre.clone());
+        exact
+            .or_else(|| {
+                let k = crate::util::clave(clave_trib);
+                if k.is_empty() {
+                    return None;
+                }
+                self.tribunales
+                    .iter()
+                    .find(|(tk, t)| {
+                        !t.nombre.is_empty()
+                            && (crate::util::clave(tk) == k || crate::util::clave(&t.nombre) == k)
+                    })
+                    .map(|(_, t)| t.nombre.clone())
+            })
+            .unwrap_or_else(|| original.to_string())
     }
 
-    /// Correo de un programa (comparación sin tildes ni mayúsculas).
-    /// Correos de un programa; si el nombre es un alias, los del contacto al que apunta.
+    fn buscar_contacto_clave(&self, k: &str) -> Option<String> {
+        if k.is_empty() {
+            return None;
+        }
+        let mut directos: BTreeSet<String> = self
+            .contactos
+            .iter()
+            .filter(|(n, v)| !v.trim().is_empty() && crate::util::clave(n) == k)
+            .map(|(_, v)| v.clone())
+            .collect();
+        if directos.len() == 1 {
+            return directos.pop_first();
+        }
+        if directos.len() > 1 {
+            return None;
+        }
+        let mut por_alias: BTreeSet<String> = BTreeSet::new();
+        for (a, destino) in &self.aliases {
+            if crate::util::clave(a) == k {
+                let dk = crate::util::clave(destino);
+                for (n, v) in &self.contactos {
+                    if !v.trim().is_empty() && crate::util::clave(n) == dk {
+                        por_alias.insert(v.clone());
+                    }
+                }
+            }
+        }
+        if por_alias.len() == 1 {
+            por_alias.pop_first()
+        } else {
+            None
+        }
+    }
+
+    /// Correos de un programa (comparación sin tildes ni mayúsculas):
+    /// 1) coincidencia exacta por `clave()` en `contactos` o `aliases`;
+    /// 2) coincidencia tras `sin_parentesis(programa)`, solo si produce una única dirección inequívoca.
     pub fn contacto_programa(&self, programa: &str) -> String {
-        let buscar = |nombre: &str| {
-            let k = crate::util::clave(nombre);
-            self.contactos.iter().find(|(n, _)| crate::util::clave(n) == k).map(|(_, v)| v.clone())
+        let k_exacta = crate::util::clave(programa);
+        if let Some(v) = self.buscar_contacto_clave(&k_exacta) {
+            return v;
+        }
+        let limpio = crate::util::sin_parentesis(programa);
+        let k_limpia = crate::util::clave(&limpio);
+        if !k_limpia.is_empty() && k_limpia != k_exacta {
+            if let Some(v) = self.buscar_contacto_clave(&k_limpia) {
+                return v;
+            }
+        }
+        String::new()
+    }
+
+    /// Sugiere hasta `max` contactos existentes por tokens compartidos o prefijo de sigla.
+    pub fn sugerir_contactos(&self, programa: &str, max: usize) -> Vec<(String, String)> {
+        if max == 0 || programa.trim().is_empty() {
+            return Vec::new();
+        }
+        const STOPWORDS: &[&str] = &["de", "del", "la", "las", "el", "los", "y", "en", "a", "con", "por", "para"];
+        let tokenizar = |txt: &str| -> (String, String, Vec<String>) {
+            let limpio = crate::util::sin_parentesis(txt);
+            let k = crate::util::clave(&limpio);
+            let todos: Vec<String> = k.split_whitespace().map(str::to_string).collect();
+            let sigla = todos.first().cloned().unwrap_or_default();
+            let significativos: Vec<String> = todos
+                .iter()
+                .filter(|t| t.len() >= 2 && !STOPWORDS.contains(&t.as_str()))
+                .cloned()
+                .collect();
+            let base = if significativos.is_empty() { todos } else { significativos };
+            (k, sigla, base)
         };
-        buscar(programa)
-            .or_else(|| {
-                let k = crate::util::clave(programa);
-                self.aliases.iter().find(|(a, _)| crate::util::clave(a) == k).and_then(|(_, destino)| buscar(destino))
-            })
-            .unwrap_or_default()
+
+        let k_exacta = crate::util::clave(programa);
+        let (k_prog, sigla_q, tokens_q) = tokenizar(programa);
+        if tokens_q.is_empty() {
+            return Vec::new();
+        }
+        let q_set: BTreeSet<&str> = tokens_q.iter().map(String::as_str).collect();
+        let mut candidatos: Vec<(usize, usize, usize, String, String)> = Vec::new();
+
+        for (nombre, correo) in &self.contactos {
+            if correo.trim().is_empty() {
+                continue;
+            }
+            if crate::util::clave(nombre) == k_exacta {
+                continue;
+            }
+            let (k_cand, sigla_c, tokens_c) = tokenizar(nombre);
+            if tokens_c.is_empty() {
+                continue;
+            }
+            let c_set: BTreeSet<&str> = tokens_c.iter().map(String::as_str).collect();
+            let comunes = q_set.intersection(&c_set).count();
+            let misma_sigla = !sigla_q.is_empty() && sigla_q == sigla_c;
+            let prefijo_sigla = !misma_sigla
+                && sigla_q.len() >= 2
+                && sigla_c.len() >= 2
+                && (sigla_c.starts_with(&sigla_q) || sigla_q.starts_with(&sigla_c));
+            let mut score = comunes * 10;
+            if misma_sigla {
+                score += 8;
+            } else if prefijo_sigla {
+                score += 4;
+            }
+            if !k_prog.is_empty() && !k_cand.is_empty() && (k_cand.contains(&k_prog) || k_prog.contains(&k_cand)) {
+                score += 6;
+            }
+            if score == 0 {
+                continue;
+            }
+            let diff_len = tokens_q.len().abs_diff(tokens_c.len());
+            candidatos.push((score, comunes, usize::MAX - diff_len, nombre.clone(), correo.clone()));
+        }
+
+        candidatos.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| b.2.cmp(&a.2))
+                .then_with(|| a.3.cmp(&b.3))
+        });
+        candidatos.into_iter().take(max).map(|(_, _, _, n, c)| (n, c)).collect()
     }
 
     pub fn cc(&self) -> String {
@@ -357,6 +484,16 @@ pub fn config_path() -> PathBuf {
     data_dir().join("config.json")
 }
 
+fn leer_archivos_python() -> (Option<String>, Option<String>) {
+    let Some(base) = std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("HOME")) else {
+        return (None, None);
+    };
+    let base = PathBuf::from(base).join("CSMP_Personal");
+    let catastro = std::fs::read_to_string(base.join("contactos.json")).ok();
+    let configuracion = std::fs::read_to_string(base.join("configuracion.json")).ok();
+    (catastro, configuracion)
+}
+
 pub fn load() -> (Config, Option<String>) {
     let path = config_path();
     let (mut c, mut aviso, persistir) = match std::fs::read_to_string(&path) {
@@ -374,10 +511,8 @@ pub fn load() -> (Config, Option<String>) {
         Err(e) => (Config::default(), None, e.kind() == std::io::ErrorKind::NotFound),
     };
     if !c.catastro_python_migrado || !c.configuracion_python_migrada {
-        if let Some(base) = std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("HOME")) {
-            let base = PathBuf::from(base).join("CSMP_Personal");
-            let catastro = std::fs::read_to_string(base.join("contactos.json")).ok();
-            let configuracion = std::fs::read_to_string(base.join("configuracion.json")).ok();
+        let (catastro, configuracion) = leer_archivos_python();
+        if catastro.is_some() || configuracion.is_some() {
             let antes = (c.catastro_python_migrado, c.configuracion_python_migrada);
             let n = c.migrar_contactos_python(catastro.as_deref(), configuracion.as_deref());
             if persistir && antes != (c.catastro_python_migrado, c.configuracion_python_migrada) {
@@ -393,6 +528,15 @@ pub fn load() -> (Config, Option<String>) {
 }
 
 impl Config {
+    /// Reinicia las banderas de migración y reimporta contactos desde Flow Python sin sobrescribir los locales existentes.
+    pub fn reimportar_contactos_python(&mut self) -> usize {
+        self.catastro_python_migrado = false;
+        self.configuracion_python_migrada = false;
+        self.contactos_python_migrados = false;
+        let (catastro, configuracion) = leer_archivos_python();
+        self.migrar_contactos_python(catastro.as_deref(), configuracion.as_deref())
+    }
+
     /// Completa los contactos de Rust con la configuración efectiva de Python y después con su catastro.
     fn migrar_contactos_python(&mut self, catastro: Option<&str>, configuracion: Option<&str>) -> usize {
         use crate::util::clave;
@@ -455,8 +599,23 @@ impl Config {
         let mut n = 0;
         for (k, candidato) in candidatos {
             let Some((nombre, correo)) = candidato else { continue };
-            if let Some(tribunal) = k.strip_prefix("tribunal:") {
-                if let Some(t) = self.tribunales.get_mut(&tribunal.trim().to_uppercase()) {
+            if let Some(tribunal_raw) = k.strip_prefix("tribunal:") {
+                let trib_trim = tribunal_raw.trim();
+                if crate::util::perfil_tribunal(trib_trim).is_some() {
+                    let nombre_limpio = nombre
+                        .trim()
+                        .get(9..)
+                        .filter(|_| nombre.trim().len() >= 9 && nombre.trim()[..9].eq_ignore_ascii_case("tribunal:"))
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(trib_trim);
+                    let clave_trib = crate::util::tribunal(trib_trim)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| crate::util::normalizar(trib_trim).to_uppercase());
+                    let t = self.tribunales.entry(clave_trib).or_insert_with(|| Tribunal {
+                        nombre: nombre_limpio.to_string(),
+                        para: String::new(),
+                    });
                     if t.para.trim().is_empty() {
                         t.para = correo;
                         n += 1;
@@ -561,5 +720,53 @@ mod pruebas_contactos {
         let mut persistida: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(persistida.migrar_contactos_python(Some(catastro), Some(cfg)), 0);
         assert!(persistida.contacto_programa("Otro programa").is_empty());
+    }
+
+    #[test]
+    fn contacto_programa_resuelve_sin_parentesis_y_sugiere_candidatos() {
+        let mut c = Config::default();
+        c.contactos.insert("PRM Concepción".into(), "prm.conce@example.test".into());
+        c.contactos.insert("PIE Concepción Sur".into(), "pie.conce@example.test".into());
+        c.contactos.insert("PRM Laja".into(), "prm.laja@example.test".into());
+        c.contactos.insert("FAE BioBio".into(), "fae.biobio@example.test".into());
+        c.aliases.insert("PRM Talcahuano".into(), "PRM Concepción".into());
+
+        // 1. Coincidencia exacta y alias exacto.
+        assert_eq!(c.contacto_programa("PRM Concepción"), "prm.conce@example.test");
+        assert_eq!(c.contacto_programa("PRM Talcahuano"), "prm.conce@example.test");
+
+        // 2. Cascada tras `sin_parentesis`: resuelve cuando es único e inequívoco.
+        assert_eq!(c.contacto_programa("PRM Concepción (Turno 2)"), "prm.conce@example.test");
+        assert_eq!(c.contacto_programa("PRM Talcahuano (Sede Norte)"), "prm.conce@example.test");
+
+        // Si `sin_parentesis` produce ambigüedad (dos contactos distintos bajo la misma clave), no adivina.
+        let mut ambiguo = c.clone();
+        ambiguo.contactos.insert("prm  concepcion".into(), "otra@example.test".into());
+        assert!(ambiguo.contacto_programa("PRM Concepción (Turno 2)").is_empty());
+
+        // 3. Sugerencias ordenadas por tokens compartidos y sigla, acotadas a `max`.
+        let sug = c.sugerir_contactos("PRM Concepción Norte (Anexo)", 3);
+        assert!(!sug.is_empty() && sug.len() <= 3);
+        assert_eq!(sug[0].0, "PRM Concepción");
+        assert!(sug.iter().all(|(nombre, _)| nombre != "FAE BioBio"));
+
+        // 4. Reimportación desde Flow Python (incluyendo tribunal dinámico) sin sobrescribir locales.
+        let (_candado, perfil) = crate::prueba_entorno::perfil_aislado();
+        let csmp = perfil.join("CSMP_Personal");
+        std::fs::create_dir_all(&csmp).unwrap();
+        std::fs::write(
+            csmp.join("contactos.json"),
+            r#"[{"Nombre":"PRM Concepción","Mail":"python.conce@example.test"},{"Nombre":"PRM Coronel","Mail":"coronel@example.test"},{"Nombre":"Tribunal: CORONEL","Mail":"trib.coronel@example.test"}]"#,
+        )
+        .unwrap();
+        c.catastro_python_migrado = true;
+        c.configuracion_python_migrada = true;
+        c.contactos_python_migrados = true;
+        let agregados = c.reimportar_contactos_python();
+        assert_eq!(agregados, 2);
+        assert_eq!(c.contacto_programa("PRM Concepción"), "prm.conce@example.test");
+        assert_eq!(c.contacto_programa("PRM Coronel"), "coronel@example.test");
+        assert_eq!(c.tribunales["CORONEL"].para, "trib.coronel@example.test");
+        let _ = std::fs::remove_dir_all(&csmp);
     }
 }

@@ -279,6 +279,113 @@ fn permite_correo(r: &Registro) -> bool {
     !t.is_empty() && !negativos.iter().any(|n| t.contains(n)) && t.contains("correo")
 }
 
+fn tribunal_para(cfg: &Config, trib_clave: &str, trib_nombre: &str) -> String {
+    if let Some(t) = cfg.tribunales.get(trib_clave) {
+        return t.para.clone();
+    }
+    let k_clave = clave(trib_clave);
+    let k_nombre = clave(trib_nombre);
+    cfg.tribunales
+        .iter()
+        .find(|(k, t)| {
+            let tk = clave(k);
+            let tn = clave(&t.nombre);
+            (!k_clave.is_empty() && (tk == k_clave || tn == k_clave))
+                || (!k_nombre.is_empty() && (tk == k_nombre || tn == k_nombre))
+        })
+        .map(|(_, t)| t.para.clone())
+        .unwrap_or_default()
+}
+
+/// Direcciones válidas escritas a mano en borradores de programas o tribunales sin contacto previo
+/// (`outputs.learned_contacts` de Flow Python + tribunales dinámicos D2-A). Nunca sobrescribe contactos
+/// existentes ni guarda direcciones ambiguas o inválidas.
+pub fn contactos_aprendidos(cfg: &Config, borradores: &[Borrador]) -> BTreeMap<String, String> {
+    let conocidos: BTreeSet<String> = cfg.contactos.keys().map(|k| clave(k)).collect();
+    let aliases: BTreeMap<String, String> = cfg.aliases.iter().map(|(k, v)| (clave(k), clave(v))).collect();
+    let mut hallados: BTreeMap<String, (String, BTreeSet<String>)> = BTreeMap::new();
+
+    for b in borradores {
+        let Ok(lista) = crate::personalizar::correos(&b.para) else {
+            continue;
+        };
+        if lista.is_empty() {
+            continue;
+        }
+        let dir = lista.join("; ");
+        let prog = b.programa.trim();
+        if !prog.is_empty() {
+            let k = clave(prog);
+            if k.is_empty()
+                || conocidos.contains(&k)
+                || aliases.get(&k).is_some_and(|d| conocidos.contains(d))
+                || !cfg.contacto_programa(prog).is_empty()
+            {
+                continue;
+            }
+            hallados
+                .entry(format!("p:{k}"))
+                .or_insert_with(|| (prog.to_string(), BTreeSet::new()))
+                .1
+                .insert(dir);
+            continue;
+        }
+        let trib = b.tribunal.trim();
+        if trib.is_empty() || trib == "[TRIBUNAL]" || crate::util::perfil_tribunal(trib).is_none() {
+            continue;
+        }
+        let trib_key = crate::util::tribunal(trib)
+            .map(str::to_string)
+            .or_else(|| {
+                let kt = clave(trib);
+                cfg.tribunales
+                    .iter()
+                    .find(|(k, t)| clave(k) == kt || clave(&t.nombre) == kt)
+                    .map(|(k, _)| k.clone())
+            })
+            .unwrap_or_else(|| normalizar(trib).to_uppercase());
+        if !tribunal_para(cfg, &trib_key, trib).trim().is_empty() {
+            continue;
+        }
+        let etiqueta = if cfg.tribunales.contains_key(&trib_key) {
+            format!("Tribunal: {trib_key}")
+        } else {
+            format!("Tribunal: {trib}")
+        };
+        hallados
+            .entry(format!("t:{}", clave(&trib_key)))
+            .or_insert_with(|| (etiqueta, BTreeSet::new()))
+            .1
+            .insert(dir);
+    }
+
+    hallados
+        .into_values()
+        .filter(|(_, dirs)| dirs.len() == 1)
+        .filter_map(|(nombre, mut dirs)| dirs.pop_first().map(|d| (nombre, d)))
+        .collect()
+}
+
+/// Incorpora en `cfg` los contactos aprendidos (programas en `contactos`, tribunales en `tribunales`),
+/// sin sobrescribir entradas existentes no vacías.
+pub fn aplicar_contactos_aprendidos(cfg: &mut Config, aprendidos: &BTreeMap<String, String>) {
+    for (nombre, correo) in aprendidos {
+        if let Some(raw_trib) = nombre.strip_prefix("Tribunal: ") {
+            let clave_trib = crate::util::tribunal(raw_trib)
+                .map(str::to_string)
+                .unwrap_or_else(|| normalizar(raw_trib).to_uppercase());
+            if !cfg.tribunales.get(&clave_trib).is_none_or(|t| t.para.trim().is_empty()) {
+                continue;
+            }
+            if let Ok(nuevo) = crate::personalizar::guardar_contacto(cfg, nombre, correo, &[], None) {
+                *cfg = nuevo;
+            }
+        } else if !cfg.contactos.keys().any(|k| clave(k) == clave(nombre)) {
+            cfg.contactos.insert(nombre.clone(), correo.clone());
+        }
+    }
+}
+
 /// Prepara los borradores automáticos (programas y medidas) y el informativo de la etapa a cada tribunal.
 pub fn preparar_borradores(w: &Trabajo, cfg: &Config, o: &OpcionesCorreo) -> Vec<Borrador> {
     let fecha = crate::util::hoy().format("%d/%m/%Y").to_string();
@@ -309,7 +416,7 @@ pub fn preparar_borradores(w: &Trabajo, cfg: &Config, o: &OpcionesCorreo) -> Vec
             vars.insert("FECHA", fecha.clone());
             vars.insert("ALCANCE_MODALIDADES", if alcance.is_empty() { "todas las modalidades".into() } else { alcance.clone() });
             vars.insert("PERIODO", cfg.periodo.clone());
-            let para = if tpl.destino == "programa" { cfg.contacto_programa(&programa) } else { cfg.tribunales.get(&trib).map(|t| t.para.clone()).unwrap_or_default() };
+            let para = if tpl.destino == "programa" { cfg.contacto_programa(&programa) } else { tribunal_para(cfg, &trib, &trib_nombre) };
             let refs: Vec<&Registro> = items.iter().map(|(_, r)| *r).collect();
             out.push(Borrador {
                 kind: kind.into(),
@@ -341,17 +448,23 @@ pub fn preparar_borradores(w: &Trabajo, cfg: &Config, o: &OpcionesCorreo) -> Vec
             if crate::util::perfil_tribunal(&trib).is_none() {
                 continue;
             }
-            let trib_nombre = cfg.tribunal_nombre(&trib, &trib);
+            let trib_orig = ids
+                .first()
+                .map(|&i| w.value(&w.registros[i], "tribunal"))
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| trib.clone());
+            let trib_nombre = cfg.tribunal_nombre(&trib, &trib_orig);
             let mut vars = BTreeMap::new();
             vars.insert("TRIBUNAL", trib_nombre.clone());
             vars.insert("FECHA", fecha.clone());
             vars.insert("ALCANCE_MODALIDADES", if alcance.is_empty() { "todas las modalidades".into() } else { alcance.clone() });
             vars.insert("PERIODO", cfg.periodo.clone());
+            let para_trib = tribunal_para(cfg, &trib, &trib_nombre);
             out.push(Borrador {
                 kind: w.mode().key().into(),
                 titulo: format!("{} · {}", tpl.nombre, trib_nombre),
-                para_automatico: Some(cfg.tribunales.get(&trib).map(|t| t.para.clone()).unwrap_or_default()),
-                para: cfg.tribunales.get(&trib).map(|t| t.para.clone()).unwrap_or_default(),
+                para_automatico: Some(para_trib.clone()),
+                para: para_trib,
                 cc: cfg.cc(),
                 asunto: render_vars(&tpl.asunto, &vars),
                 cuerpo: con_firma(&render_vars(&tpl.cuerpo, &vars), cfg),
@@ -392,11 +505,12 @@ pub fn borrador_plantilla(w: Option<&Trabajo>, cfg: &Config, kind: &str, filas: 
         let refs: Vec<&Registro> = filas.iter().filter_map(|&i| w.registros.get(i)).collect();
         nomina_para(w, "medidas", &refs)
     });
+    let para_trib = tribunal_para(cfg, &trib, &trib_nombre);
     Some(Borrador {
         kind: kind.into(),
         titulo: format!("{} · {}", tpl.nombre, trib_nombre),
-        para_automatico: Some(cfg.tribunales.get(&trib).map(|t| t.para.clone()).unwrap_or_default()),
-        para: cfg.tribunales.get(&trib).map(|t| t.para.clone()).unwrap_or_default(),
+        para_automatico: Some(para_trib.clone()),
+        para: para_trib,
         cc: cfg.cc(),
         asunto: render_vars(&tpl.asunto, &vars),
         cuerpo: con_firma(&render_vars(&tpl.cuerpo, &vars), cfg),
@@ -2889,5 +3003,74 @@ mod cotejo_correos {
         assert_eq!(w.registros[0].editada.as_deref(), Some("Nota humana"));
         assert!(w.registros[0].propuesta.is_empty() && w.registros[0].acciones.is_empty());
         assert!(w.registros[0].avisos.iter().any(|a| a.contains("Tribunal sin identificar o ambiguo")));
+    }
+
+    #[test]
+    fn aprendizaje_guarda_nuevo_y_no_pisa_existente_ni_ambiguo() {
+        let mut cfg = Config::default();
+        cfg.contactos.insert("PRM Existente".into(), "fijo@example.test".into());
+        cfg.aliases.insert("PRM Alias".into(), "PRM Existente".into());
+        cfg.tribunales.get_mut("MULCHEN").unwrap().para = "mulchen.fijo@example.test".into();
+
+        let borradores = vec![
+            // Nuevo programa válido -> se aprende.
+            Borrador { programa: "PRM Nuevo".into(), para: "nuevo@example.test, copia@example.test".into(), ..Default::default() },
+            // Ya existente -> no se sobrescribe.
+            Borrador { programa: "PRM Existente".into(), para: "otro@example.test".into(), ..Default::default() },
+            // Alias de existente -> no se sobrescribe.
+            Borrador { programa: "PRM Alias".into(), para: "otro2@example.test".into(), ..Default::default() },
+            // Ambiguo (misma clave con dos direcciones distintas) -> no se guarda.
+            Borrador { programa: "PIE Ambiguo".into(), para: "uno@example.test".into(), ..Default::default() },
+            Borrador { programa: "pie  ambiguo".into(), para: "dos@example.test".into(), ..Default::default() },
+            // Correo inválido -> no se guarda.
+            Borrador { programa: "FAE Invalido".into(), para: "no-es-correo".into(), ..Default::default() },
+            // Tribunal existente sin contacto previo -> se aprende como Tribunal: LAJA.
+            Borrador { tribunal: "Jgdo. L. y G. de Laja".into(), para: "laja@example.test".into(), ..Default::default() },
+            // Tribunal ya configurado -> no se pisa.
+            Borrador { tribunal: "Jgdo. L. y G. de Mulchén".into(), para: "otro.mulchen@example.test".into(), ..Default::default() },
+            // Tribunal dinámico nuevo -> se aprende y se aplica en `cfg.tribunales`.
+            Borrador { tribunal: "Juzgado de Familia de Coronel".into(), para: "coronel@example.test".into(), ..Default::default() },
+        ];
+
+        let aprendidos = contactos_aprendidos(&cfg, &borradores);
+        assert_eq!(aprendidos.get("PRM Nuevo").map(String::as_str), Some("nuevo@example.test; copia@example.test"));
+        assert_eq!(aprendidos.get("Tribunal: LAJA").map(String::as_str), Some("laja@example.test"));
+        assert_eq!(aprendidos.get("Tribunal: Juzgado de Familia de Coronel").map(String::as_str), Some("coronel@example.test"));
+        assert!(!aprendidos.contains_key("PRM Existente"));
+        assert!(!aprendidos.contains_key("PRM Alias"));
+        assert!(!aprendidos.contains_key("PIE Ambiguo"));
+        assert!(!aprendidos.contains_key("pie  ambiguo"));
+        assert!(!aprendidos.contains_key("FAE Invalido"));
+        assert!(!aprendidos.contains_key("Tribunal: MULCHEN"));
+
+        aplicar_contactos_aprendidos(&mut cfg, &aprendidos);
+        assert_eq!(cfg.contacto_programa("PRM Existente"), "fijo@example.test");
+        assert_eq!(cfg.contacto_programa("PRM Nuevo"), "nuevo@example.test; copia@example.test");
+        assert_eq!(cfg.tribunales["LAJA"].para, "laja@example.test");
+        assert_eq!(cfg.tribunales["MULCHEN"].para, "mulchen.fijo@example.test");
+        assert_eq!(cfg.tribunales["JUZGADO DE FAMILIA DE CORONEL"].para, "coronel@example.test");
+
+        // En el próximo lote con tribunal dinámico, `preparar_borradores` resuelve ambos destinatarios automáticamente.
+        cfg.umbrales.insert("espera_tome".into(), 50);
+        let corte = NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
+        let mut libro = rust_xlsxwriter::Workbook::new();
+        let hoja = libro.add_worksheet();
+        let _ = hoja.set_name("Espera");
+        for (c, h) in ["RIT", "TRIBUNAL", "NOMBRE", "RUT", "NOMBRE CENTRO", "T ESPERA"].iter().enumerate() {
+            hoja.write_string(0, c as u16, *h).unwrap();
+        }
+        hoja.write_string(1, 0, "X-99-2099").unwrap();
+        hoja.write_string(1, 1, "Juzgado de Familia de Coronel").unwrap();
+        hoja.write_string(1, 2, "Uno Ejemplo").unwrap();
+        hoja.write_string(1, 3, "11111111-1").unwrap();
+        hoja.write_string(1, 4, "PRM Nuevo").unwrap();
+        hoja.write_number(1, 5, 80.0).unwrap();
+        let w = Trabajo::abrir(PathBuf::from("aprendido.xlsx"), libro.save_to_buffer().unwrap(), Some(Mode::Espera), corte, &cfg).unwrap();
+        let o = OpcionesCorreo { modalidades: &["RES", "AMB", "FAE", "DCE"], tribunales: &[], solo_seleccionadas: false };
+        let siguientes = preparar_borradores(&w, &cfg, &o);
+        let prog = siguientes.iter().find(|b| b.kind == "programa_espera").unwrap();
+        let info = siguientes.iter().find(|b| b.kind == "espera").unwrap();
+        assert_eq!(prog.para, "nuevo@example.test; copia@example.test");
+        assert_eq!(info.para, "coronel@example.test");
     }
 }
