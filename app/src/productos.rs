@@ -297,6 +297,20 @@ fn tribunal_para(cfg: &Config, trib_clave: &str, trib_nombre: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Resuelve el destinatario automático actual de un borrador según `cfg` (programa o tribunal).
+pub fn destinatario_borrador(cfg: &Config, b: &Borrador) -> String {
+    let prog = b.programa.trim();
+    if !prog.is_empty() {
+        return cfg.contacto_programa(prog);
+    }
+    let trib = b.tribunal.trim();
+    if trib.is_empty() || trib == "[TRIBUNAL]" {
+        return String::new();
+    }
+    let trib_clave = crate::util::tribunal(trib).unwrap_or(trib);
+    tribunal_para(cfg, trib_clave, trib)
+}
+
 /// Direcciones válidas escritas a mano en borradores de programas o tribunales sin contacto previo
 /// (`outputs.learned_contacts` de Flow Python + tribunales dinámicos D2-A). Nunca sobrescribe contactos
 /// existentes ni guarda direcciones ambiguas o inválidas.
@@ -371,9 +385,19 @@ pub fn contactos_aprendidos(cfg: &Config, borradores: &[Borrador]) -> BTreeMap<S
 pub fn aplicar_contactos_aprendidos(cfg: &mut Config, aprendidos: &BTreeMap<String, String>) {
     for (nombre, correo) in aprendidos {
         if let Some(raw_trib) = nombre.strip_prefix("Tribunal: ") {
-            let clave_trib = crate::util::tribunal(raw_trib)
+            let clave_norm = crate::util::tribunal(raw_trib)
                 .map(str::to_string)
                 .unwrap_or_else(|| normalizar(raw_trib).to_uppercase());
+            let k_busq = clave(&clave_norm);
+            let clave_trib = if cfg.tribunales.contains_key(&clave_norm) {
+                clave_norm
+            } else {
+                cfg.tribunales
+                    .iter()
+                    .find(|(k, t)| clave(k) == k_busq || clave(&t.nombre) == k_busq)
+                    .map(|(k, _)| k.clone())
+                    .unwrap_or(clave_norm)
+            };
             if !cfg.tribunales.get(&clave_trib).is_none_or(|t| t.para.trim().is_empty()) {
                 continue;
             }
@@ -3072,5 +3096,37 @@ mod cotejo_correos {
         let info = siguientes.iter().find(|b| b.kind == "espera").unwrap();
         assert_eq!(prog.para, "nuevo@example.test; copia@example.test");
         assert_eq!(info.para, "coronel@example.test");
+    }
+
+    #[test]
+    fn aprendizaje_actualiza_clave_tribunal_en_minuscula_sin_duplicar() {
+        let mut cfg = Config::default();
+        cfg.tribunales.insert(
+            "coronel".into(),
+            crate::config::Tribunal {
+                nombre: "Coronel".into(),
+                para: String::new(),
+            },
+        );
+        let borradores = vec![Borrador {
+            tribunal: "Coronel".into(),
+            para: "coronel@example.test".into(),
+            ..Default::default()
+        }];
+        let aprendidos = contactos_aprendidos(&cfg, &borradores);
+        assert_eq!(aprendidos.get("Tribunal: coronel").map(String::as_str), Some("coronel@example.test"));
+
+        aplicar_contactos_aprendidos(&mut cfg, &aprendidos);
+        assert_eq!(cfg.tribunales["coronel"].para, "coronel@example.test");
+        assert!(!cfg.tribunales.contains_key("CORONEL"));
+
+        // Si ya tenía correo no vacío en clave minúscula, no se aprende ni sobrescribe.
+        let aprendidos2 = contactos_aprendidos(&cfg, &borradores);
+        assert!(aprendidos2.is_empty());
+        let mut manual = BTreeMap::new();
+        manual.insert("Tribunal: Coronel".into(), "otro@example.test".into());
+        aplicar_contactos_aprendidos(&mut cfg, &manual);
+        assert_eq!(cfg.tribunales["coronel"].para, "coronel@example.test");
+        assert!(!cfg.tribunales.contains_key("CORONEL"));
     }
 }

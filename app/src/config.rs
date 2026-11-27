@@ -602,16 +602,27 @@ impl Config {
             if let Some(tribunal_raw) = k.strip_prefix("tribunal:") {
                 let trib_trim = tribunal_raw.trim();
                 if crate::util::perfil_tribunal(trib_trim).is_some() {
-                    let nombre_limpio = nombre
-                        .trim()
-                        .get(9..)
-                        .filter(|_| nombre.trim().len() >= 9 && nombre.trim()[..9].eq_ignore_ascii_case("tribunal:"))
+                    let nombre_trim = nombre.trim();
+                    let nombre_limpio = nombre_trim
+                        .get(..9)
+                        .filter(|p| p.eq_ignore_ascii_case("tribunal:"))
+                        .and_then(|_| nombre_trim.get(9..))
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .unwrap_or(trib_trim);
-                    let clave_trib = crate::util::tribunal(trib_trim)
+                    let clave_norm = crate::util::tribunal(trib_trim)
                         .map(str::to_string)
                         .unwrap_or_else(|| crate::util::normalizar(trib_trim).to_uppercase());
+                    let k_norm = clave(&clave_norm);
+                    let clave_trib = if self.tribunales.contains_key(&clave_norm) {
+                        clave_norm
+                    } else {
+                        self.tribunales
+                            .iter()
+                            .find(|(tk, t)| clave(tk) == k_norm || clave(&t.nombre) == k_norm)
+                            .map(|(tk, _)| tk.clone())
+                            .unwrap_or(clave_norm)
+                    };
                     let t = self.tribunales.entry(clave_trib).or_insert_with(|| Tribunal {
                         nombre: nombre_limpio.to_string(),
                         para: String::new(),
@@ -768,5 +779,21 @@ mod pruebas_contactos {
         assert_eq!(c.contacto_programa("PRM Coronel"), "coronel@example.test");
         assert_eq!(c.tribunales["CORONEL"].para, "trib.coronel@example.test");
         let _ = std::fs::remove_dir_all(&csmp);
+
+        // Clave personalizada en minúscula en `tribunales` se completa en su sitio sin duplicar en mayúsculas,
+        // y un prefijo `Tríbunal:` con tilde no provoca panic por índice UTF-8.
+        let mut c_lower = Config::default();
+        c_lower.tribunales.insert(
+            "chiguayante".into(),
+            Tribunal {
+                nombre: "Chiguayante".into(),
+                para: String::new(),
+            },
+        );
+        let catastro_lower = r#"[{"Nombre":"Tribunal: CHIGUAYANTE","Mail":"chiguayante@example.test"},{"Nombre":"Tríbunal: TALCAHUANO","Mail":"thno@example.test"}]"#;
+        assert_eq!(c_lower.migrar_contactos_python(Some(catastro_lower), None), 2);
+        assert_eq!(c_lower.tribunales["chiguayante"].para, "chiguayante@example.test");
+        assert!(!c_lower.tribunales.contains_key("CHIGUAYANTE"));
+        assert_eq!(c_lower.tribunales["TALCAHUANO"].para, "thno@example.test");
     }
 }

@@ -37,8 +37,8 @@ pub fn correos(texto: &str) -> Result<Vec<String>, String> {
 
 fn extraer_tribunal(nombre: &str) -> Option<&str> {
     let t = nombre.trim();
-    if t.len() >= 9 && t[..9].eq_ignore_ascii_case("tribunal:") {
-        Some(t[9..].trim())
+    if t.get(..9).is_some_and(|p| p.eq_ignore_ascii_case("tribunal:")) {
+        t.get(9..).map(str::trim)
     } else {
         None
     }
@@ -50,13 +50,50 @@ fn clave_tribunal(raw_trib: &str) -> String {
         .unwrap_or_else(|| crate::util::normalizar(raw_trib).to_uppercase())
 }
 
+fn clave_tribunal_existente(r: &Config, clave_norm: &str) -> String {
+    if r.tribunales.contains_key(clave_norm) {
+        return clave_norm.to_string();
+    }
+    let k_busq = crate::util::clave(clave_norm);
+    r.tribunales
+        .iter()
+        .find(|(k, t)| crate::util::clave(k) == k_busq || crate::util::clave(&t.nombre) == k_busq)
+        .map(|(k, _)| k.clone())
+        .unwrap_or_else(|| clave_norm.to_string())
+}
+
 fn aplicar_tribunal_dinamico(r: &mut Config, raw_trib: &str, direccion: String) {
-    let clave = clave_tribunal(raw_trib);
+    let clave = clave_tribunal_existente(r, &clave_tribunal(raw_trib));
     let t = r.tribunales.entry(clave).or_insert_with(|| crate::config::Tribunal {
         nombre: raw_trib.trim().to_string(),
         para: String::new(),
     });
     t.para = direccion;
+}
+
+fn importar_tribunal_dinamico(r: &mut Config, etiqueta: &str, raw_trib: &str, direccion: String, conflictos: &mut Vec<String>) {
+    if direccion.trim().is_empty() {
+        return;
+    }
+    let clave = clave_tribunal_existente(r, &clave_tribunal(raw_trib));
+    match r.tribunales.get_mut(&clave) {
+        Some(t) => {
+            if t.para.trim().is_empty() {
+                t.para = direccion;
+            } else if t.para != direccion {
+                conflictos.push(etiqueta.to_string());
+            }
+        }
+        None => {
+            r.tribunales.insert(
+                clave,
+                crate::config::Tribunal {
+                    nombre: raw_trib.trim().to_string(),
+                    para: direccion,
+                },
+            );
+        }
+    }
 }
 
 /// `save_contact`: guarda un contacto (o los destinatarios de un tribunal) con sus alias, sin pisar otro contacto.
@@ -201,7 +238,7 @@ pub fn importar_contactos_archivo(cfg: &Config, extension: &str, bytes: &[u8]) -
             if let Some(raw_trib) = extraer_tribunal(&nombre) {
                 if crate::util::perfil_tribunal(raw_trib).is_some() {
                     let dir_norm = correos(&direccion)?.join("; ");
-                    aplicar_tribunal_dinamico(&mut r, raw_trib, dir_norm);
+                    importar_tribunal_dinamico(&mut r, &nombre, raw_trib, dir_norm, &mut conflictos);
                 }
                 continue;
             }
@@ -227,7 +264,7 @@ pub fn importar_contactos_archivo(cfg: &Config, extension: &str, bytes: &[u8]) -
         let direccion = catastro.contactos.remove(&nombre).unwrap_or_default();
         if let Some(raw_trib) = extraer_tribunal(&nombre) {
             if crate::util::perfil_tribunal(raw_trib).is_some() {
-                aplicar_tribunal_dinamico(&mut r, raw_trib, direccion);
+                importar_tribunal_dinamico(&mut r, &nombre, raw_trib, direccion, &mut conflictos);
             }
         }
     }
@@ -842,5 +879,53 @@ mod pruebas {
         assert_eq!(imp_json.cfg.tribunales["CHIGUAYANTE"].para, "chiguayante@example.test");
         assert!(!imp_json.cfg.tribunales.contains_key("SIN DATO"));
         assert!(!imp_json.cfg.contactos.contains_key("Tribunal: SIN DATO"));
+    }
+
+    #[test]
+    fn nombres_utf8_en_borde_nueve_no_paniquean_e_importacion_vacia_preserva_tribunal() {
+        let mut base = Config::default();
+        // Byte 9 cae dentro de 'í' en "Fae Biobío" y "PRM Biobío".
+        let c1 = guardar_contacto(&base, "Fae Biobío", "fae.biobio@example.test", &[], None).unwrap();
+        assert_eq!(c1.contacto_programa("Fae Biobío"), "fae.biobio@example.test");
+
+        base.tribunales.insert(
+            "CORONEL".into(),
+            crate::config::Tribunal {
+                nombre: "Coronel".into(),
+                para: "existente@example.test".into(),
+            },
+        );
+        base.tribunales.insert(
+            "TALCAHUANO".into(),
+            crate::config::Tribunal {
+                nombre: "Talcahuano".into(),
+                para: "talcahuano.fijo@example.test".into(),
+            },
+        );
+
+        let mut libro = rust_xlsxwriter::Workbook::new();
+        let hoja = libro.add_worksheet();
+        hoja.write_string(0, 0, "Nombre").unwrap();
+        hoja.write_string(0, 1, "Mail").unwrap();
+        hoja.write_string(1, 0, "PRM Biobío").unwrap();
+        hoja.write_string(1, 1, "prm.biobio@example.test").unwrap();
+        hoja.write_string(2, 0, "Tribunal: Coronel").unwrap();
+        hoja.write_string(2, 1, "").unwrap();
+        hoja.write_string(3, 0, "Tribunal: Talcahuano").unwrap();
+        hoja.write_string(3, 1, "talcahuano.otro@example.test").unwrap();
+        let xlsx_bytes = libro.save_to_buffer().unwrap();
+
+        let imp = importar_contactos_archivo(&base, "xlsx", &xlsx_bytes).unwrap();
+        assert_eq!(imp.cfg.contacto_programa("PRM Biobío"), "prm.biobio@example.test");
+        assert_eq!(imp.cfg.tribunales["CORONEL"].para, "existente@example.test");
+        assert_eq!(imp.cfg.tribunales["TALCAHUANO"].para, "talcahuano.fijo@example.test");
+        assert_eq!(imp.conflictos, ["Tribunal: Talcahuano"]);
+
+        // También en .json: correo vacío preserva y correo distinto registra conflicto sin sobrescribir.
+        let json = r#"[{"Nombre":"Tribunal: Coronel","Mail":""},{"Nombre":"Tribunal: Talcahuano","Mail":"otro@example.test"},{"Nombre":"PRM Biobío","Mail":"prm.biobio@example.test"}]"#;
+        let imp_json = importar_contactos_archivo(&base, "json", json.as_bytes()).unwrap();
+        assert_eq!(imp_json.cfg.tribunales["CORONEL"].para, "existente@example.test");
+        assert_eq!(imp_json.cfg.tribunales["TALCAHUANO"].para, "talcahuano.fijo@example.test");
+        assert_eq!(imp_json.conflictos, ["Tribunal: Talcahuano"]);
     }
 }
