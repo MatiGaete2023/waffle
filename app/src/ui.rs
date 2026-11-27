@@ -181,6 +181,7 @@ fn resellar_borradores_vigentes(w: Option<&Trabajo>, cfg: &Config, borradores: &
 struct OperacionProductos {
     work: Option<Trabajo>,
     cfg: Config,
+    borradores_para_aprender: Vec<Borrador>,
     borradores: Vec<Borrador>,
     proyectos: Vec<Proyecto>,
     productos: Vec<(PathBuf, String)>,
@@ -302,23 +303,7 @@ impl OperacionProductos {
                 self.marcar_sucio();
             }
         }
-        if !recien_guardados.is_empty() {
-            let aprendidos = productos::contactos_aprendidos(&self.cfg, &recien_guardados);
-            if !aprendidos.is_empty() {
-                let antes = estado_vigencia_borradores(self.work.as_ref(), &self.cfg, &self.borradores);
-                productos::aplicar_contactos_aprendidos(&mut self.cfg, &aprendidos);
-                resellar_borradores_vigentes(self.work.as_ref(), &self.cfg, &mut self.borradores, &antes);
-                match config::save(&self.cfg) {
-                    Ok(()) => {
-                        let lista: Vec<String> = aprendidos.iter().map(|(k, v)| format!("{k} → {v}")).collect();
-                        self.aviso(format!("Contacto guardado para el próximo lote: {}.", lista.join("; ")), false);
-                    }
-                    Err(e) => {
-                        self.aviso(format!("Se aprendieron contactos pero no se pudo guardar config.json: {e}"), true);
-                    }
-                }
-            }
-        }
+        self.borradores_para_aprender.extend(recien_guardados);
         let sin_destinatario = (0..self.borradores.len())
             .filter(|j| self.borradores[*j].guardado.is_some() && self.borradores[*j].para.trim().is_empty())
             .count();
@@ -585,6 +570,7 @@ impl App {
     fn tomar_operacion(&mut self) -> OperacionProductos {
         OperacionProductos {
             work: self.work.take(), cfg: self.cfg.clone(),
+            borradores_para_aprender: Vec::new(),
             borradores: std::mem::take(&mut self.borradores), proyectos: std::mem::take(&mut self.proyectos),
             productos: Vec::new(), avisos: Vec::new(), sucio: false,
             anon_inf: None, estado_prueba: None, manual_estado: None,
@@ -593,10 +579,20 @@ impl App {
 
     fn recuperar_operacion(&mut self, op: OperacionProductos) {
         self.work = op.work;
-        self.cfg = op.cfg;
-        self.contacto_buf.clear();
-        self.contactos_pendientes.clear();
         self.borradores = op.borradores;
+        // El trabajador usa una copia de Config. Incorporar los contactos a la
+        // configuración vigente en la UI protege las ediciones hechas durante el trabajo.
+        let aprendidos = productos::contactos_aprendidos(&self.cfg, &op.borradores_para_aprender);
+        if !aprendidos.is_empty() {
+            let antes = estado_vigencia_borradores(self.work.as_ref(), &self.cfg, &self.borradores);
+            productos::aplicar_contactos_aprendidos(&mut self.cfg, &aprendidos);
+            resellar_borradores_vigentes(self.work.as_ref(), &self.cfg, &mut self.borradores, &antes);
+            self.guardar_cfg();
+            if !self.cfg_sucia {
+                let lista: Vec<String> = aprendidos.iter().map(|(k, v)| format!("{k} → {v}")).collect();
+                self.aviso(format!("Contacto guardado para el próximo lote: {}.", lista.join("; ")), false);
+            }
+        }
         self.proyectos = op.proyectos;
         for (ruta, tipo) in op.productos { self.registrar(ruta, &tipo); }
         for (aviso, error) in op.avisos { self.aviso(aviso, error); }
@@ -627,6 +623,7 @@ impl App {
             let mut op = estado.lock().unwrap_or_else(|e| e.into_inner());
             let recuperada = OperacionProductos {
                 work: op.work.take(), cfg: op.cfg.clone(), borradores: std::mem::take(&mut op.borradores),
+                borradores_para_aprender: std::mem::take(&mut op.borradores_para_aprender),
                 proyectos: std::mem::take(&mut op.proyectos), productos: std::mem::take(&mut op.productos),
                 avisos: std::mem::take(&mut op.avisos), sucio: op.sucio,
                 anon_inf: op.anon_inf.take(), estado_prueba: op.estado_prueba.take(), manual_estado: op.manual_estado.take(),
@@ -4855,7 +4852,18 @@ mod pruebas_correos_d2a {
         // Guardar Alpha individualmente aprende su contacto sin marcar OBSOLETO a Beta (hermano sin `para`),
         // mientras Gamma conserva su obsolescencia genuina previa.
         app.borradores[idx_alpha].para = "alpha@example.test".into();
-        app.guardar_borradores(Some(idx_alpha));
+        let dir = app.carpeta_productos().unwrap();
+        let mut op = app.tomar_operacion();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        op.guardar_borradores(Some(idx_alpha), dir, &Progreso { tx, ctx: egui::Context::default() });
+        let tema_editado = !app.cfg.tema_oscuro;
+        app.cfg.tema_oscuro = tema_editado;
+        app.contacto_buf.insert("PRM Edición Concurrente".into(), ("concurrente@example.test".into(), String::new()));
+        app.contactos_pendientes.insert("PRM Edición Concurrente".into());
+        app.recuperar_operacion(op);
+        assert_eq!(app.cfg.tema_oscuro, tema_editado);
+        assert_eq!(app.contacto_buf["PRM Edición Concurrente"].0, "concurrente@example.test");
+        assert!(app.contactos_pendientes.contains("PRM Edición Concurrente"));
         assert!(app.borradores[idx_alpha].guardado.is_some());
         assert_eq!(app.cfg.contacto_programa("PRM Alpha Prueba"), "alpha@example.test");
         assert!(!crate::preparados::borrador_obsoleto(app.work.as_ref().unwrap(), &app.cfg, &app.borradores[idx_beta]));

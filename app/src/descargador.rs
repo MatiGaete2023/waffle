@@ -128,7 +128,9 @@ impl Puente {
             serde_json::json!({}),
             Duration::from_secs(15),
         )?;
-        self.registrar_capacidades(edicion, &version)
+        let resultado = self.registrar_capacidades(edicion, &version);
+        self.habilitar_lecturas(resultado.is_ok() && edicion == Edicion::Integral);
+        resultado
     }
 
     fn registrar_capacidades(
@@ -139,7 +141,6 @@ impl Puente {
         let resultado = comprobar_extension(edicion, version);
         let validada = resultado.is_ok();
         let integral = validada && edicion == Edicion::Integral;
-        self.habilitar_lecturas(integral);
         self.registrar_rapido(
             integral
                 && matches!(

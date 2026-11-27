@@ -408,7 +408,7 @@ pub fn ejecutar_con_avance(
         s.control_pausa.set(PausaAdaptativa::nueva(opciones.pausa, config));
         s.rapido = config.activado && opciones.retomar.is_none();
         if propia { s.estado["origen"]["version"] = json!(version_ext); }
-        if let Some(h) = s.historia.as_mut() { h.configurar_rapido(config, propia); }
+        if let Some(h) = s.historia.as_mut() { h.configurar_rapido(config, if propia { version_ext } else { "" }); }
         conexion.habilitar_lecturas(true);
         s.estado["extension"] = json!({"version": version["version"], "protocolos": version["protocolos"]});
         if propia { s.estado["extension"]["distribucion"] = json!(version_ext); }

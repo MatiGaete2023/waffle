@@ -5,7 +5,8 @@ import sys
 
 VERSION = '1.2.0'
 EXTENSION_TYPE = 'SITFA_LITE_CAPACIDADES'
-PROTOCOLS = {'descarga_xls': 1, 'pdf_sin_registros': 1, 'search_and_download': 1}
+LEGACY_PROTOCOLS = {'descarga_xls': 1, 'pdf_sin_registros': 1}
+PROTOCOLS = {**LEGACY_PROTOCOLS, 'search_and_download': 1}
 
 
 def extension_dir():
@@ -28,8 +29,10 @@ def verify_extension(bridge):
         not isinstance(result, dict)
         or result.get('tipo') != EXTENSION_TYPE
         or result.get('escritura_rus') is not False
-        or result.get('version') != VERSION
-        or result.get('protocolos') != PROTOCOLS
+        or (result.get('version'), result.get('protocolos')) not in (
+            ('1.1.0', LEGACY_PROTOCOLS),
+            (VERSION, PROTOCOLS),
+        )
     ):
         raise m.PocError(
             'Chrome usa otra versión de la extensión (requiere SITFA Lite '

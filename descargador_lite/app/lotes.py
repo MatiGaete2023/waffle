@@ -434,7 +434,7 @@ class BatchRunner:
                         filename_factory=filename,
                         progress=lambda item, path: self.emit('progress', {**item, 'consulta': base}),
                         initial_excel=initial_excel,
-                        adaptive_pause=True,
+                        adaptive_pause=self.modo_rapido,
                         fast_fsync=self.modo_rapido,
                     )
                 completed.append(

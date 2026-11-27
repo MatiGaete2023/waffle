@@ -16,6 +16,13 @@ Una entrada por encargo, de diez líneas como máximo, la más reciente arriba:
 
 No se copian salidas completas ni listas de mutaciones: la prueba afirma sus conteos y la CI del commit es la evidencia.
 
+## 2026-11-27 · Revisión DeepSeek de la Tanda 3
+- Correos: guardar borradores incorpora los contactos en el hilo de la interfaz y conserva las ediciones en curso.
+- SITFA Lite: se valida el contrato de la extensión 1.1.0 para activar el flujo compatible. Modo Registro conserva la pausa fija.
+- Integral: la verificación de lote habilita las lecturas de contexto. Historia registra la versión 2.10.0 o 2.11.0 que anunció la extensión.
+- Evidencia: escenarios de borradores hermanos y edición concurrente, recorrido Lite multipágina con la extensión anterior, y suite Rust de Flow.
+- Pendiente: CI de este ajuste y validación real del cambio de modo en descarga conjunta y de una cancelación en plena descarga.
+
 ## 2026-11-27 · Integración de la Tanda 3
 - Cambió: se integraron las ramas B (`cefcd77`), C (`b8ed66e`) y A (`358fed1`). El puente registra la búsqueda y descarga conjunta al validar la versión y los protocolos de la extensión.
 - Evidencia: [informe A](informes/AGENTE_A_20261127_correos.md), [informe B](informes/AGENTE_B_20261127_meta4_lite.md), [informe C](informes/AGENTE_C_20261127_descargador.md) y [plan técnico](PLAN_TANDA_3_20261127.md).

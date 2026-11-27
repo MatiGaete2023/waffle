@@ -296,6 +296,7 @@ def test_search_and_download_multipagina_y_fallback(folder):
             return super().call(command, payload, timeout)
 
     bridge_legacy = LegacyBridge('seguimiento', pages={('901', 'Cumplimiento', '2', '5'): 3})
+    assert verify_extension(bridge_legacy)['version'] == '1.1.0'
     dest_legacy = folder / 'legacy'
     dest_legacy.mkdir()
     result_legacy = BatchRunner(
