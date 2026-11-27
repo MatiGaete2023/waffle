@@ -177,7 +177,8 @@ pub struct Lectura {
 pub struct Fuente {
     pub archivo: String,
     pub lote: String,
-    /// «EXCEL» o «PDF» (evidencia de una consulta sin registros). Una consulta vacía sin su PDF no es una fuente.
+    /// «EXCEL», «PDF» (captura de consulta sin registros) o «JSON» (comprobante SHA-256 de consulta sin registros).
+    /// Una consulta vacía sin evidencia no es una fuente.
     pub tipo: &'static str,
     pub tribunal: Option<&'static str>,
     pub categoria: &'static str,
