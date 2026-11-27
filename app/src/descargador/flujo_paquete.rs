@@ -527,7 +527,7 @@ impl<'a> ReusoConsultas<'a> {
 impl Conexion for ReusoConsultas<'_> {
     fn llamar(&self, comando: &str, mut payload: Value, plazo: Duration) -> Result<Value, String> {
         let fase = self.fase.get();
-        if fase < 2 && matches!(comando, "lock" | "search" | "unlock") {
+        if fase < 2 && matches!(comando, "lock" | "search" | "search_and_download" | "unlock") {
             payload["flow_scope"] = json!(self.ambito);
             payload["flow_cache"] = json!(if fase == 0 { "record" } else { "replay" });
             if comando == "lock" { self.limpiar.set(true); }
@@ -537,6 +537,7 @@ impl Conexion for ReusoConsultas<'_> {
         r
     }
     fn habilitar_lecturas(&self, integral: bool) { self.real.habilitar_lecturas(integral); }
+    fn soporta_search_and_download(&self) -> bool { self.real.soporta_search_and_download() }
 }
 impl Drop for ReusoConsultas<'_> {
     fn drop(&mut self) {

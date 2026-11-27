@@ -313,7 +313,7 @@ impl LectorHistoria {
     }
 
     pub(super) fn configurar_rapido(&mut self, config: Rapido, propia: bool) {
-        self.version_extension = if propia { "2.10.0" } else { "2.9.0" };
+        self.version_extension = if propia { "2.11.0" } else { "2.9.0" };
         self.control_pausa = PausaAdaptativa::nueva(self.pausa, config);
         self.rapido = config.activado;
     }

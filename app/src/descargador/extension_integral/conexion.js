@@ -63,7 +63,7 @@ async function bridge(path,body) {
   return data;
 }
 const allowedCommands=new Set([
-  "catalog","capabilities","lock","unlock","prepare","search","download",
+  "catalog","capabilities","lock","unlock","prepare","search","download","search_and_download",
   "evidence_open","evidence_capture","evidence_close",
   "diary_open","history_open","calendar_open","historico_open",
 ]);
@@ -117,6 +117,15 @@ async function execute(command,payload={}) {
     }
     finally {chrome.tabs.onActivated.removeListener(activated);try {await inject("evidence_close");}catch(_) {}}
   }
+  if(command==="lock") {
+    const res=await inject(command,payload);
+    try {await chrome.tabs.update(tabId,{autoDiscardable:false});} catch (_) {}
+    return res;
+  }
+  if(command==="unlock") {
+    try {return await inject(command,payload);}
+    finally {try {await chrome.tabs.update(tabId,{autoDiscardable:true});} catch (_) {}}
+  }
   if(command!=="catalog" || !payload.screen) return inject(command,payload);
   if(!["seguimiento","litigantes","calendario_informes","calendario_medidas","carga"].includes(payload.screen)) throw failure("SCREEN_OPEN");
   const current=await inject("catalog");
@@ -138,6 +147,7 @@ async function execute(command,payload={}) {
 async function disconnect() {
   running=false;
   if (frameId!==null) {try {await execute("unlock");} catch (_) {}}
+  try {await chrome.tabs.update(tabId,{autoDiscardable:true});} catch (_) {}
   key=null;endpoint=null;frameId=null;connecting=false;
   byId("connect").disabled=false;byId("disconnect").disabled=true;byId("code").disabled=false;
 }

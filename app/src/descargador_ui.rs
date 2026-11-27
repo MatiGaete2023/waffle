@@ -1598,6 +1598,47 @@ impl Descargador {
                 }
             }
             TabDescargador::Ejecucion => {
+                theme::card(p).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    theme::seccion(ui, p, "Modo de ejecución");
+                    let modo_rapido = !self.ejecucion.evidencia;
+                    ui.add_enabled_ui(!ejecutando, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.selectable_label(modo_rapido, "Modo Rápido (2do plano, JSON sin PDF)").clicked() {
+                                self.ejecucion.evidencia = false;
+                                if self.edicion == Edicion::Integral {
+                                    self.ejecucion.contexto.rapido.activado = true;
+                                    self.ejecucion.contexto.rapido = self.ejecucion.contexto.rapido.limitado();
+                                }
+                                let ruta = Preferencias::ruta();
+                                let mut prefs = Preferencias::cargar(&ruta);
+                                prefs.pdf_sin_registros = false;
+                                if self.edicion == Edicion::Integral {
+                                    prefs.rapido = self.ejecucion.contexto.rapido;
+                                }
+                                let _ = prefs.guardar(&ruta);
+                            }
+                            if ui.selectable_label(!modo_rapido, "Modo Registro (respaldo completo con PDF)").clicked() {
+                                self.ejecucion.evidencia = true;
+                                self.ejecucion.contexto.rapido.activado = false;
+                                let ruta = Preferencias::ruta();
+                                let mut prefs = Preferencias::cargar(&ruta);
+                                prefs.pdf_sin_registros = true;
+                                prefs.rapido.activado = false;
+                                let _ = prefs.guardar(&ruta);
+                            }
+                        });
+                    });
+                    ui.label(
+                        RichText::new(if modo_rapido {
+                            "2do plano estable: consultas sin registros acreditadas en JSON (SHA-256) sin capturar PDF ni traer Chrome al frente."
+                        } else {
+                            "Respaldo completo: captura pantallazo PDF en Chrome para cada consulta sin registros."
+                        })
+                        .color(p.muted),
+                    );
+                });
+                ui.add_space(8.0);
                 if let Some(catalogo) = &self.catalogo {
                     if catalogo.pantalla != Pantalla::Carga || self.edicion == Edicion::Integral {
                         theme::card(p).show(ui, |ui| {
@@ -1631,18 +1672,18 @@ impl Descargador {
                                     });
                                     if conectado && !ext_rapida {
                                         ui.label(
-                                            RichText::new("Aviso: Chrome sigue usando la extensión 2.9.0 y el Modo Rápido quedará desactivado. Pulsa «Instalar extensión…» y recárgala (2.10.0) en chrome://extensions.")
+                                            RichText::new("Aviso: Chrome sigue usando la extensión 2.9.0 y el Modo Rápido quedará desactivado. Pulsa «Instalar extensión…» y recárgala (2.11.0) en chrome://extensions.")
                                                 .color(p.amber)
                                                 .strong(),
                                         );
                                     } else if conectado && ext_rapida {
                                         ui.label(
-                                            RichText::new("Extensión Integral 2.10.0 activa · Modo Rápido listo.")
+                                            RichText::new("Extensión Integral 2.11.0 activa · Modo Rápido listo.")
                                                 .color(p.green),
                                         );
                                     }
                                 }
-                                ui.label("Protección de sesión SITFA: aumenta la pausa ante lentitud real y reduce a una lectura ante fallas. Requiere la extensión Integral 2.10.0 recargada en Chrome.");
+                                ui.label("Protección de sesión SITFA: aumenta la pausa ante lentitud real y reduce a una lectura ante fallas. Requiere la extensión Integral 2.11.0 recargada en Chrome.");
                             });
                             if previo != self.ejecucion.contexto.rapido {
                                 self.ejecucion.contexto.rapido = self.ejecucion.contexto.rapido.limitado();
@@ -2507,6 +2548,33 @@ mod pruebas_interfaz {
         assert!(h.query_by_label("Retomar paquete…").is_some(), "falta retomar");
         assert!(h.state().resultado.is_none());
         let _ = std::fs::remove_dir_all(&destino);
+    }
+
+    #[test]
+    fn ui_selector_modo_rapido_vs_modo_registro_sincroniza_preferencias() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let (_candado, _) = crate::prueba_entorno::perfil_aislado();
+        let pal = theme::pal(false);
+        let mut h = Harness::builder()
+            .with_size(egui::Vec2::new(1200.0, 800.0))
+            .build_ui_state(move |ui, vista: &mut Descargador| vista.mostrar(ui, &pal), Descargador::default());
+        h.run();
+        h.get_by_label("2. Ejecución y Paquete").click();
+        h.run();
+        // Por omisión: JSON sin PDF (evidencia = false).
+        assert!(!h.state().ejecucion.evidencia);
+        h.get_by_label("Modo Registro (respaldo completo con PDF)").click();
+        h.run();
+        assert!(h.state().ejecucion.evidencia);
+        assert!(!h.state().ejecucion.contexto.rapido.activado);
+        assert!(Preferencias::cargar(&Preferencias::ruta()).pdf_sin_registros);
+        h.get_by_label("Modo Rápido (2do plano, JSON sin PDF)").click();
+        h.run();
+        assert!(!h.state().ejecucion.evidencia);
+        assert!(h.state().ejecucion.contexto.rapido.activado);
+        let prefs = Preferencias::cargar(&Preferencias::ruta());
+        assert!(!prefs.pdf_sin_registros);
+        assert!(prefs.rapido.activado);
     }
 }
 

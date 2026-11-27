@@ -219,6 +219,39 @@ pub fn decodificar(datos: &[u8]) -> String {
     }
 }
 
+/// E-X3: extrae solo los encabezados de la tabla HTML de Seguimiento (nunca valores de filas).
+pub(super) fn cabeceras_tabla_seguimiento(datos: &[u8], tabla_id: &str) -> Vec<String> {
+    if datos.is_empty() || datos.len() > LIMITE_BYTES {
+        return Vec::new();
+    }
+    let raiz = Html::parse_document(&decodificar(datos));
+    for tabla in raiz.select(&TABLAS) {
+        if tabla.value().attr("id") == Some(tabla_id) {
+            if let Ok(filas) = grilla(tabla) {
+                return registros::cabeceras_desde_grilla(&filas);
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// E-X3: compara encabezados HTML vs XLS por nombre normalizado manteniendo sus rótulos originales.
+pub(super) fn diferencia_columnas(columnas_html: &[String], columnas_xls: &[String]) -> (Vec<String>, Vec<String>) {
+    let norm_html: Vec<String> = columnas_html.iter().map(|c| registros::normalizar(c)).collect();
+    let norm_xls: Vec<String> = columnas_xls.iter().map(|c| registros::normalizar(c)).collect();
+    let solo_en_xls = columnas_xls
+        .iter()
+        .filter(|c| !norm_html.contains(&registros::normalizar(c)))
+        .cloned()
+        .collect();
+    let solo_en_html = columnas_html
+        .iter()
+        .filter(|c| !norm_xls.contains(&registros::normalizar(c)))
+        .cloned()
+        .collect();
+    (solo_en_xls, solo_en_html)
+}
+
 /// `motor.fields_from_form`: valor de cada control con nombre; radios por grupo; el resto debe ser único.
 fn campos(formulario: ElementRef<'_>) -> Result<BTreeMap<String, String>, String> {
     let mut grupos: BTreeMap<String, Vec<ElementRef<'_>>> = BTreeMap::new();

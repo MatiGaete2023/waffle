@@ -396,20 +396,22 @@ pub fn ejecutar_con_avance(
         let version = s.pedir("capabilities", json!({}))?;
         super::comprobar_extension(Edicion::Integral, &version)?;
         // Una extensión antigua usa el contrato conservador, incluso si quedó marcada la preferencia rápida.
-        let propia = version["flow_rust_version"] == "2.10.0" && version["flow_rust_rapido"] == 1;
+        let version_ext = version["flow_rust_version"].as_str().unwrap_or("");
+        let propia = matches!(version_ext, "2.10.0" | "2.11.0")
+            && version["flow_rust_rapido"].as_u64().is_some_and(|v| v >= 1);
         let config = if propia { opciones.rapido.limitado() } else { Rapido::default() };
         if opciones.rapido.activado && !propia {
             (s.avance)("warning", json!(
-                "Modo Rápido desactivado: Chrome aún usa la extensión 2.9.0. Pulsa «Instalar extensión…» y recárgala (2.10.0) en chrome://extensions."
+                "Modo Rápido desactivado: Chrome aún usa la extensión 2.9.0. Pulsa «Instalar extensión…» y recárgala (2.11.0) en chrome://extensions."
             ));
         }
         s.control_pausa.set(PausaAdaptativa::nueva(opciones.pausa, config));
         s.rapido = config.activado && opciones.retomar.is_none();
-        if propia { s.estado["origen"]["version"] = json!("2.10.0"); }
+        if propia { s.estado["origen"]["version"] = json!(version_ext); }
         if let Some(h) = s.historia.as_mut() { h.configurar_rapido(config, propia); }
         conexion.habilitar_lecturas(true);
         s.estado["extension"] = json!({"version": version["version"], "protocolos": version["protocolos"]});
-        if propia { s.estado["extension"]["distribucion"] = json!("2.10.0"); }
+        if propia { s.estado["extension"]["distribucion"] = json!(version_ext); }
         s.persistir(false)?;
         s.pedir("lock", json!({}))?;
         bloqueado = true;
@@ -1561,21 +1563,23 @@ mod tests {
             if n == "warning" { avisos29.borrow_mut().push(v.as_str().unwrap_or("").to_string()); }
         }).unwrap();
         assert_eq!(r29["estado"], "COMPLETA");
-        assert!(avisos29.borrow().iter().any(|a| a.contains("2.9.0") && a.contains("2.10.0")), "avisos: {:?}", avisos29.borrow());
-        // 2) Extensión 2.10.0 con Modo Rápido + calendarios activos: sin aviso 2.9.0 y registra distribución 2.10.0.
-        let mut pasos210 = caso["guion"].as_array().unwrap().clone();
-        pasos210[0]["respuesta"]["flow_rust_rapido"] = json!(1);
-        pasos210[0]["respuesta"]["flow_rust_version"] = json!("2.10.0");
-        let d210 = raiz.join("ext210"); std::fs::create_dir(&d210).unwrap();
-        let guion210 = Guion { pasos: pasos210, pedidos: RefCell::default() };
-        let avisos210 = RefCell::new(Vec::<String>::new());
-        let r210 = ejecutar_con_avance(&guion210, &catalogo, &lote, &d210, &op, &AtomicBool::new(false), &|n, v| {
-            if n == "warning" { avisos210.borrow_mut().push(v.as_str().unwrap_or("").to_string()); }
-        }).unwrap();
-        assert_eq!(r210["estado"], "COMPLETA");
-        assert!(avisos210.borrow().iter().all(|a| !a.contains("2.9.0")), "avisos inesperados: {:?}", avisos210.borrow());
-        let m210: Value = serde_json::from_slice(&std::fs::read(r210["manifest"].as_str().unwrap()).unwrap()).unwrap();
-        assert_eq!(m210["origen"]["version"], "2.10.0");
+        assert!(avisos29.borrow().iter().any(|a| a.contains("2.9.0") && a.contains("2.11.0")), "avisos: {:?}", avisos29.borrow());
+        // 2) Extensión 2.10.0 y 2.11.0 con Modo Rápido + calendarios activos: sin aviso 2.9.0 y registra su distribución.
+        for (ver, rapido_val, sub) in [("2.10.0", 1, "ext210"), ("2.11.0", 2, "ext211")] {
+            let mut pasos = caso["guion"].as_array().unwrap().clone();
+            pasos[0]["respuesta"]["flow_rust_rapido"] = json!(rapido_val);
+            pasos[0]["respuesta"]["flow_rust_version"] = json!(ver);
+            let dir = raiz.join(sub); std::fs::create_dir(&dir).unwrap();
+            let guion = Guion { pasos, pedidos: RefCell::default() };
+            let avisos = RefCell::new(Vec::<String>::new());
+            let r = ejecutar_con_avance(&guion, &catalogo, &lote, &dir, &op, &AtomicBool::new(false), &|n, v| {
+                if n == "warning" { avisos.borrow_mut().push(v.as_str().unwrap_or("").to_string()); }
+            }).unwrap();
+            assert_eq!(r["estado"], "COMPLETA");
+            assert!(avisos.borrow().iter().all(|a| !a.contains("2.9.0")), "avisos inesperados: {:?}", avisos.borrow());
+            let m: Value = serde_json::from_slice(&std::fs::read(r["manifest"].as_str().unwrap()).unwrap()).unwrap();
+            assert_eq!(m["origen"]["version"], ver);
+        }
         std::fs::remove_dir_all(raiz).unwrap();
     }
 

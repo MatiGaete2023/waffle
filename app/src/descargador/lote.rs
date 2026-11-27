@@ -18,8 +18,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::LazyLock;
-use std::time::Duration;
+use std::sync::{mpsc, LazyLock};
+use std::time::{Duration, Instant};
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 pub const PLAZO: Duration = Duration::from_secs(75);
@@ -35,6 +35,10 @@ pub trait Conexion {
     fn llamar(&self, comando: &str, payload: Value, plazo: Duration) -> Result<Value, String>;
     /// E-Q3: el puente real solo acepta las lecturas de contexto tras verificar la extensión Integral.
     fn habilitar_lecturas(&self, _integral: bool) {}
+    /// V-PAG-01: la extensión Integral >= 2.11.0 anuncia `search_and_download`.
+    fn soporta_search_and_download(&self) -> bool {
+        false
+    }
 }
 
 impl Conexion for Puente {
@@ -44,6 +48,10 @@ impl Conexion for Puente {
 
     fn habilitar_lecturas(&self, integral: bool) {
         Puente::habilitar_lecturas(self, integral)
+    }
+
+    fn soporta_search_and_download(&self) -> bool {
+        Puente::soporta_search_and_download(self)
     }
 }
 
@@ -517,23 +525,112 @@ struct Lote<'a> {
     carpeta: PathBuf,
 }
 
+fn escribir_manifiesto(
+    carpeta: &Path,
+    nombre: &str,
+    caso: &(String, String),
+    archivos: &[Value],
+    total: usize,
+    estado: &str,
+) -> Result<(), String> {
+    escribir_json(
+        carpeta,
+        nombre,
+        &json!({
+            "fecha_hora": ahora(), "caso": caso.0, "consulta": caso.1, "estado": estado,
+            "paginas_esperadas": total, "paginas_verificadas": archivos.len(), "archivos": archivos,
+        }),
+    )
+}
+
+fn extraer_excel_compuesto(
+    resp: &Value,
+    pagina: &super::sitfa::Pagina,
+    plantilla_primera: &str,
+    lote: &Lote<'_>,
+) -> Result<Vec<u8>, String> {
+    if resp["excel"].is_object() {
+        if let Some(url) = resp["excel"]["url"].as_str() {
+            validar_descarga(url, plantilla_primera)?;
+            if url != pagina.excel_url {
+                return Err("El enlace Excel no coincide con la consulta actual.".into());
+            }
+        }
+        cuerpo(&resp["excel"], true)
+    } else {
+        cuerpo(
+            &lote.pedir("download", json!({"url": pagina.excel_url, "timeout": ESPERA_SITFA_MS}))?,
+            true,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn procesar_pagina_descargada(
+    carpeta: &Path,
+    verificador: &mut Verificador,
+    resultados: &mut Vec<Value>,
+    consulta: &Consulta,
+    pagina: &super::sitfa::Pagina,
+    numero: usize,
+    total: usize,
+    archivo: String,
+    datos: &[u8],
+    html_actual: &[u8],
+    listado: Option<&super::vinculos::Seleccion>,
+    caso: &(String, String),
+    manifiesto: &str,
+) -> Result<Option<Vec<String>>, String> {
+    let (libro, digest) = verificador.verificar(datos, pagina, consulta)?;
+    let columnas_xls = (numero == 1 && consulta.pantalla == Pantalla::Seguimiento)
+        .then(|| super::sitfa::registros::cabeceras_desde_grilla(libro.grilla()));
+    if Path::new(&archivo).file_name().and_then(|n| n.to_str()) != Some(archivo.as_str())
+        || !archivo.ends_with(".xls")
+    {
+        return Err("Nombre de archivo fuera de alcance.".into());
+    }
+    let ruta = carpeta.join(&archivo);
+    guardar_exclusivo(&ruta, datos)?;
+    let guardado = fs::read(&ruta).map_err(|e| error_escritura(&e, &ruta))?;
+    if guardado != datos {
+        return Err("El archivo guardado no coincide con la descarga validada.".into());
+    }
+    verificador.registrar(&libro, digest.clone())?;
+    resultados.push(json!({
+        "pagina": numero, "total": total, "archivo": archivo, "bytes": guardado.len(),
+        "sha256": digest, "formato": libro.formato,
+        "registros": if consulta.pantalla == Pantalla::Carga {
+            pagina.carga.values().sum::<usize>()
+        } else {
+            libro.registros.values().sum::<usize>()
+        },
+        "coincide_con_html": true, "estado": "OK",
+    }));
+    // `motor.run_sequence`: en Seguimiento cada página conserva los vínculos de ingreso comprobados del
+    // listado (`search_page.bindings` → `vinculos_ingreso`), que el paquete usa para la identidad remota.
+    if let Some(seleccion) = listado {
+        let vinculos: Vec<Value> = super::vinculos::extraer(html_actual, seleccion)
+            .map(|v| v.iter().filter(|v| v.bitacora_verificada).map(super::vinculos::Vinculo::bitacora_python).collect())
+            .unwrap_or_default();
+        if !vinculos.is_empty() {
+            resultados.last_mut().unwrap()["vinculos_ingreso"] = json!(vinculos);
+        }
+    }
+    escribir_manifiesto(carpeta, manifiesto, caso, resultados, total, "EN_CURSO")?;
+    Ok(columnas_xls)
+}
+
 impl Lote<'_> {
     fn pedir(&self, comando: &str, payload: Value) -> Result<Value, String> {
         self.conexion.llamar(comando, payload, PLAZO)
     }
 
     fn manifiesto(&self, nombre: &str, caso: &(String, String), archivos: &[Value], total: usize, estado: &str) -> Result<(), String> {
-        escribir_json(
-            &self.carpeta,
-            nombre,
-            &json!({
-                "fecha_hora": ahora(), "caso": caso.0, "consulta": caso.1, "estado": estado,
-                "paginas_esperadas": total, "paginas_verificadas": archivos.len(), "archivos": archivos,
-            }),
-        )
+        escribir_manifiesto(&self.carpeta, nombre, caso, archivos, total, estado)
     }
 
-    /// `motor.run_sequence`: POST(n) → XLS(n) → validar → fsync → releer → POST(n+1). Sin reintentos silenciosos.
+    /// `motor.run_sequence`: `search_and_download` + pipelining local cuando la extensión es >= 2.11.0,
+    /// o `POST(n) → XLS(n) → validar → fsync → releer → POST(n+1)` en modo legado. Sin reintentos silenciosos.
     #[allow(clippy::too_many_arguments)]
     fn paginas(
         &self,
@@ -546,92 +643,231 @@ impl Lote<'_> {
         emitir: &mut dyn FnMut(Evento),
         etiqueta_consulta: &str,
         html_primera: &[u8],
+        datos_primera: Option<Vec<u8>>,
+        latencia_primera: Duration,
         listado: Option<&super::vinculos::Seleccion>,
-    ) -> Result<Vec<Value>, String> {
+    ) -> Result<(Vec<Value>, Option<Vec<String>>), String> {
         let total = primera.total;
         let mut resultados: Vec<Value> = Vec::new();
+        let mut columnas_xls_p1: Option<Vec<String>> = None;
         self.manifiesto(manifiesto, caso, &resultados, total, "EN_CURSO")?;
-        let ejecucion = (|| -> Result<(), String> {
-            let mut verificador = Verificador::default();
-            let mut actuales = pares.clone();
-            let mut pagina = primera.clone();
-            let mut html_actual = html_primera.to_vec();
-            for numero in 1..=total {
-                cancelado(self.cancelar, CANCELADO_PAGINAS)?;
-                if numero > 1 {
-                    pausa(self.opciones.pausa, self.cancelar, CANCELADO_PAGINAS)?;
-                    actuales = siguiente_consulta(&actuales, consulta, &pagina, numero)?;
-                    let html = cuerpo(
-                        &self.pedir("search", json!({"pairs": actuales, "timeout": ESPERA_SITFA_MS}))?,
-                        false,
-                    )?;
-                    html_actual = html.clone();
-                    pagina = match validar_respuesta(&html, &actuales, consulta, Some((numero, &primera)))? {
-                        Respuesta::ConRegistros(p) => p,
-                        Respuesta::SinRegistros => {
-                            return Err("No se pudieron identificar todos los registros de la pagina.".into())
+        let usa_compuesto = self.conexion.soporta_search_and_download();
+        let ejecucion = if usa_compuesto {
+            let worker_fallo = AtomicBool::new(false);
+            let fallo_w = &worker_fallo;
+            std::thread::scope(|scope| -> Result<(), String> {
+                let (tx, rx) = mpsc::sync_channel::<(usize, super::sitfa::Pagina, Vec<u8>, Vec<u8>, String)>(1);
+                let (tx_evt, rx_evt) = mpsc::channel::<usize>();
+                let carpeta = &self.carpeta;
+                let worker = scope.spawn(move || -> (Vec<Value>, Option<Vec<String>>, Result<(), String>) {
+                    let mut verificador = Verificador::default();
+                    let mut res_local = Vec::new();
+                    let mut cols_p1 = None;
+                    let mut err = Ok(());
+                    for (numero, pagina_n, html_n, datos_n, archivo_n) in rx {
+                        match procesar_pagina_descargada(
+                            carpeta,
+                            &mut verificador,
+                            &mut res_local,
+                            consulta,
+                            &pagina_n,
+                            numero,
+                            total,
+                            archivo_n,
+                            &datos_n,
+                            &html_n,
+                            listado,
+                            caso,
+                            manifiesto,
+                        ) {
+                            Ok(cols) => {
+                                if numero == 1 {
+                                    cols_p1 = cols;
+                                }
+                                let _ = tx_evt.send(numero);
+                            }
+                            Err(e) => {
+                                fallo_w.store(true, Ordering::Release);
+                                err = Err(e);
+                                break;
+                            }
                         }
-                    };
-                }
-                validar_descarga(&pagina.excel_url, &primera.plantilla)?;
-                let datos = cuerpo(
-                    &self.pedir("download", json!({"url": pagina.excel_url, "timeout": ESPERA_SITFA_MS}))?,
-                    true,
-                )?;
-                let (libro, digest) = verificador.verificar(&datos, &pagina, consulta)?;
-                let archivo = nombre(numero, total);
-                if Path::new(&archivo).file_name().and_then(|n| n.to_str()) != Some(archivo.as_str())
-                    || !archivo.ends_with(".xls")
-                {
-                    return Err("Nombre de archivo fuera de alcance.".into());
-                }
-                let ruta = self.carpeta.join(&archivo);
-                guardar_exclusivo(&ruta, &datos)?;
-                let guardado = fs::read(&ruta).map_err(|e| error_escritura(&e, &ruta))?;
-                if guardado != datos {
-                    return Err("El archivo guardado no coincide con la descarga validada.".into());
-                }
-                verificador.registrar(&libro, digest.clone())?;
-                resultados.push(json!({
-                    "pagina": numero, "total": total, "archivo": archivo, "bytes": guardado.len(),
-                    "sha256": digest, "formato": libro.formato,
-                    "registros": if consulta.pantalla == Pantalla::Carga {
-                        pagina.carga.values().sum::<usize>()
-                    } else {
-                        libro.registros.values().sum::<usize>()
-                    },
-                    "coincide_con_html": true, "estado": "OK",
-                }));
-                // `motor.run_sequence`: en Seguimiento cada página conserva los vínculos de ingreso comprobados del
-                // listado (`search_page.bindings` → `vinculos_ingreso`), que el paquete usa para la identidad remota.
-                if let Some(seleccion) = listado {
-                    let vinculos: Vec<Value> = super::vinculos::extraer(&html_actual, seleccion)
-                        .map(|v| v.iter().filter(|v| v.bitacora_verificada).map(super::vinculos::Vinculo::bitacora_python).collect())
-                        .unwrap_or_default();
-                    if !vinculos.is_empty() {
-                        resultados.last_mut().unwrap()["vinculos_ingreso"] = json!(vinculos);
                     }
-                }
-                self.manifiesto(manifiesto, caso, &resultados, total, "EN_CURSO")?;
-                emitir(Evento::Pagina {
-                    consulta: etiqueta_consulta.into(),
-                    pagina: numero,
-                    total,
+                    (res_local, cols_p1, err)
                 });
-            }
-            if resultados.len() != total
-                || resultados
-                    .iter()
-                    .any(|r| !self.carpeta.join(r["archivo"].as_str().unwrap_or("")).is_file())
-            {
-                return Err("La cantidad de XLS no coincide con el total de paginas.".into());
-            }
-            Ok(())
-        })();
+
+                let mut datos_p1 = datos_primera;
+                let main_res = (|| -> Result<(), String> {
+                    let mut actuales = pares.clone();
+                    let mut pagina = primera.clone();
+                    let mut html_actual = html_primera.to_vec();
+                    let mut latencia_red = latencia_primera;
+                    for numero in 1..=total {
+                        cancelado(self.cancelar, CANCELADO_PAGINAS)?;
+                        if worker_fallo.load(Ordering::Acquire) {
+                            break;
+                        }
+                        for n_ok in rx_evt.try_iter() {
+                            emitir(Evento::Pagina {
+                                consulta: etiqueta_consulta.into(),
+                                pagina: n_ok,
+                                total,
+                            });
+                        }
+                        let datos = if numero == 1 {
+                            match datos_p1.take() {
+                                Some(d) => d,
+                                None => {
+                                    validar_descarga(&pagina.excel_url, &primera.plantilla)?;
+                                    cuerpo(
+                                        &self.pedir("download", json!({"url": pagina.excel_url, "timeout": ESPERA_SITFA_MS}))?,
+                                        true,
+                                    )?
+                                }
+                            }
+                        } else {
+                            let pausa_restante = self.opciones.pausa.saturating_sub(latencia_red);
+                            pausa(pausa_restante, self.cancelar, CANCELADO_PAGINAS)?;
+                            if worker_fallo.load(Ordering::Acquire) {
+                                break;
+                            }
+                            actuales = siguiente_consulta(&actuales, consulta, &pagina, numero)?;
+                            let t0 = Instant::now();
+                            let resp = self.pedir(
+                                "search_and_download",
+                                json!({
+                                    "pairs": actuales,
+                                    "timeout": ESPERA_SITFA_MS,
+                                    "index_dom": false,
+                                    "template": primera.plantilla,
+                                }),
+                            )?;
+                            latencia_red = t0.elapsed();
+                            let html = cuerpo(&resp["html"], false)?;
+                            html_actual = html.clone();
+                            pagina = match validar_respuesta(&html, &actuales, consulta, Some((numero, &primera)))? {
+                                Respuesta::ConRegistros(p) => p,
+                                Respuesta::SinRegistros => {
+                                    return Err("No se pudieron identificar todos los registros de la pagina.".into())
+                                }
+                            };
+                            validar_descarga(&pagina.excel_url, &primera.plantilla)?;
+                            extraer_excel_compuesto(&resp, &pagina, &primera.plantilla, self)?
+                        };
+                        let archivo = nombre(numero, total);
+                        if tx.send((numero, pagina.clone(), html_actual.clone(), datos, archivo)).is_err() {
+                            break;
+                        }
+                    }
+                    drop(tx);
+                    Ok(())
+                })();
+
+                let (res_local, cols_p1, res_worker) = worker.join().unwrap_or_else(|_| {
+                    (Vec::new(), None, Err("Fallo inesperado al verificar una página descargada.".into()))
+                });
+                resultados = res_local;
+                if cols_p1.is_some() {
+                    columnas_xls_p1 = cols_p1;
+                }
+                for n_ok in rx_evt.try_iter() {
+                    emitir(Evento::Pagina {
+                        consulta: etiqueta_consulta.into(),
+                        pagina: n_ok,
+                        total,
+                    });
+                }
+                res_worker?;
+                main_res?;
+                if resultados.len() != total
+                    || resultados
+                        .iter()
+                        .any(|r| !self.carpeta.join(r["archivo"].as_str().unwrap_or("")).is_file())
+                {
+                    return Err("La cantidad de XLS no coincide con el total de paginas.".into());
+                }
+                Ok(())
+            })
+        } else {
+            (|| -> Result<(), String> {
+                let mut verificador = Verificador::default();
+                let mut actuales = pares.clone();
+                let mut pagina = primera.clone();
+                let mut html_actual = html_primera.to_vec();
+                let mut datos_p1 = datos_primera;
+                for numero in 1..=total {
+                    cancelado(self.cancelar, CANCELADO_PAGINAS)?;
+                    if numero > 1 {
+                        pausa(self.opciones.pausa, self.cancelar, CANCELADO_PAGINAS)?;
+                        actuales = siguiente_consulta(&actuales, consulta, &pagina, numero)?;
+                        let html = cuerpo(
+                            &self.pedir("search", json!({"pairs": actuales, "timeout": ESPERA_SITFA_MS}))?,
+                            false,
+                        )?;
+                        html_actual = html.clone();
+                        pagina = match validar_respuesta(&html, &actuales, consulta, Some((numero, &primera)))? {
+                            Respuesta::ConRegistros(p) => p,
+                            Respuesta::SinRegistros => {
+                                return Err("No se pudieron identificar todos los registros de la pagina.".into())
+                            }
+                        };
+                    }
+                    let datos = if numero == 1 {
+                        match datos_p1.take() {
+                            Some(d) => d,
+                            None => {
+                                validar_descarga(&pagina.excel_url, &primera.plantilla)?;
+                                cuerpo(
+                                    &self.pedir("download", json!({"url": pagina.excel_url, "timeout": ESPERA_SITFA_MS}))?,
+                                    true,
+                                )?
+                            }
+                        }
+                    } else {
+                        validar_descarga(&pagina.excel_url, &primera.plantilla)?;
+                        cuerpo(
+                            &self.pedir("download", json!({"url": pagina.excel_url, "timeout": ESPERA_SITFA_MS}))?,
+                            true,
+                        )?
+                    };
+                    let archivo = nombre(numero, total);
+                    if let Some(cols) = procesar_pagina_descargada(
+                        &self.carpeta,
+                        &mut verificador,
+                        &mut resultados,
+                        consulta,
+                        &pagina,
+                        numero,
+                        total,
+                        archivo,
+                        &datos,
+                        &html_actual,
+                        listado,
+                        caso,
+                        manifiesto,
+                    )? {
+                        columnas_xls_p1 = Some(cols);
+                    }
+                    emitir(Evento::Pagina {
+                        consulta: etiqueta_consulta.into(),
+                        pagina: numero,
+                        total,
+                    });
+                }
+                if resultados.len() != total
+                    || resultados
+                        .iter()
+                        .any(|r| !self.carpeta.join(r["archivo"].as_str().unwrap_or("")).is_file())
+                {
+                    return Err("La cantidad de XLS no coincide con el total de paginas.".into());
+                }
+                Ok(())
+            })()
+        };
         match ejecucion {
             Ok(()) => {
                 self.manifiesto(manifiesto, caso, &resultados, total, "VALIDADA")?;
-                Ok(resultados)
+                Ok((resultados, columnas_xls_p1))
             }
             Err(e) => {
                 let _ = self.manifiesto(manifiesto, caso, &resultados, total, "INCOMPLETA");
@@ -934,6 +1170,7 @@ pub fn ejecutar(
         emitir(Evento::Plan(plan.consultas.len()));
     }
     let mut bloqueado = false;
+    let mut diagnostico_consultas: Vec<Value> = Vec::new();
     let ejecucion = (|| -> Result<(), String> {
         lote.pedir("lock", json!({}))?;
         bloqueado = true;
@@ -974,7 +1211,20 @@ pub fn ejecutar(
             if !calendario(perfil.pantalla) && perfil.pantalla != Pantalla::Carga {
                 validar_fechas_formulario(&pares, fechas)?;
             }
-            let html = cuerpo(&lote.pedir("search", json!({"pairs": pares, "timeout": ESPERA_SITFA_MS}))?, false)?;
+            let (html, respuesta_compuesta, latencia_p1) = if lote.conexion.soporta_search_and_download() {
+                let mut payload = json!({"pairs": pares, "timeout": ESPERA_SITFA_MS, "index_dom": false});
+                if let Some(tpl) = consulta.plantilla {
+                    payload["template"] = json!(tpl);
+                }
+                let t0 = Instant::now();
+                let resp = lote.pedir("search_and_download", payload)?;
+                let latencia = t0.elapsed();
+                let html = cuerpo(&resp["html"], false)?;
+                (html, Some(resp), latencia)
+            } else {
+                let html = cuerpo(&lote.pedir("search", json!({"pairs": pares, "timeout": ESPERA_SITFA_MS}))?, false)?;
+                (html, None, Duration::ZERO)
+            };
             let manifiesto = format!("verificacion {indice:03}.json");
             let mut evidencia = None;
             let resultado = match validar_respuesta(&html, &pares, consulta, None)? {
@@ -997,6 +1247,12 @@ pub fn ejecutar(
                 }
                 Respuesta::ConRegistros(primera) => {
                     emitir(Evento::Total(primera.total));
+                    let datos_primera = match respuesta_compuesta {
+                        Some(ref resp) if resp["excel"].is_object() => {
+                            Some(extraer_excel_compuesto(resp, &primera, &primera.plantilla, &lote)?)
+                        }
+                        _ => None,
+                    };
                     let raiz = std::cell::OnceCell::new();
                     let nombre = |numero: usize, total: usize| {
                         if integral {
@@ -1013,7 +1269,38 @@ pub fn ejecutar(
                         }),
                         _ => None,
                     };
-                    lote.paginas(&pares, primera, consulta, &caso, &manifiesto, &nombre, emitir, &rotulo, &html, listado.as_ref())?
+                    let (filas, cols_xls_p1) = lote.paginas(
+                        &pares,
+                        primera,
+                        consulta,
+                        &caso,
+                        &manifiesto,
+                        &nombre,
+                        emitir,
+                        &rotulo,
+                        &html,
+                        datos_primera,
+                        latencia_p1,
+                        listado.as_ref(),
+                    )?;
+                    if let (Alcance::Seguimiento { pestana, modalidad, .. }, Some(columnas_xls)) = (&perfil.alcance, cols_xls_p1) {
+                        let columnas_html = super::sitfa::cabeceras_tabla_seguimiento(&html, consulta.tabla);
+                        let (solo_en_xls, solo_en_html) = super::sitfa::diferencia_columnas(&columnas_html, &columnas_xls);
+                        let modalidad_nombre = MODALIDADES_LITE
+                            .iter()
+                            .find(|(c, _)| c == modalidad)
+                            .map(|(_, n)| (*n).to_string())
+                            .unwrap_or_else(|| etiqueta(&catalogo.modalidades, modalidad).to_string());
+                        diagnostico_consultas.push(json!({
+                            "pestana": pestana,
+                            "modalidad": modalidad_nombre,
+                            "columnas_html": columnas_html,
+                            "columnas_xls": columnas_xls,
+                            "solo_en_xls": solo_en_xls,
+                            "solo_en_html": solo_en_html,
+                        }));
+                    }
+                    filas
                 }
             };
             let archivos: Vec<Value> = if resultado.is_empty() {
@@ -1047,6 +1334,16 @@ pub fn ejecutar(
                 info["evidencia"] = e.clone();
             } else if resultado.is_empty() {
                 info["evidencia_omitida"] = json!(true);
+                info["comprobante_sin_registros"] = json!({
+                    "tipo": "JSON_SIN_REGISTROS",
+                    "fecha_hora": ahora(),
+                    "sha256_html": huella(&html),
+                    "contexto_consulta": if integral {
+                        contexto_integral(perfil, catalogo, fechas)
+                    } else {
+                        contexto(perfil, catalogo, fechas)
+                    },
+                });
                 hecha["evidencia_omitida"] = json!(true);
             }
             escribir_json(&carpeta, &manifiesto, &info)?;
@@ -1056,6 +1353,17 @@ pub fn ejecutar(
                 consulta: rotulo.clone(),
                 estado: completadas.last().map(|c| c["estado"].as_str().unwrap_or("").to_string()).unwrap_or_default(),
             });
+        }
+        if !diagnostico_consultas.is_empty() {
+            escribir_json(
+                &carpeta,
+                "diagnostico_columnas_html_xls.json",
+                &json!({
+                    "version": 1,
+                    "pantalla": "seguimiento",
+                    "consultas": diagnostico_consultas,
+                }),
+            )?;
         }
         Ok(())
     })();
@@ -1465,5 +1773,405 @@ mod pruebas_lote_python {
         .unwrap_err();
         assert!(err_inv.contains("invertido"), "{err_inv}");
         assert!(guion_inv.pedidos.borrow().is_empty());
+    }
+
+    struct MockMultipagina {
+        soporta_compuesto: bool,
+        total_paginas: usize,
+        vacia: bool,
+        demora: Duration,
+        incluir_rut_xls: bool,
+        xls_corrupto_p1: bool,
+        llamadas: RefCell<Vec<(String, Value)>>,
+        tiempos_sad: RefCell<Vec<(Instant, Instant)>>,
+        ultima_pagina: RefCell<usize>,
+    }
+
+    impl MockMultipagina {
+        fn nuevo(soporta_compuesto: bool, total_paginas: usize) -> Self {
+            Self {
+                soporta_compuesto,
+                total_paginas,
+                vacia: false,
+                demora: Duration::ZERO,
+                incluir_rut_xls: false,
+                xls_corrupto_p1: false,
+                llamadas: RefCell::new(Vec::new()),
+                tiempos_sad: RefCell::new(Vec::new()),
+                ultima_pagina: RefCell::new(1),
+            }
+        }
+
+        fn catalogo_seguimiento() -> Catalogo {
+            serde_json::from_value(json!({
+                "pantalla": "seguimiento",
+                "tribunales": {"901": "Juzgado de Familia Ficticio"},
+                "pestanas": ["Cumplimiento"],
+                "modalidades": {"2": "Ambulatorio"},
+                "informes": {"1": "Por vencer"},
+                "medidas": {"0": "Todas"}
+            }))
+            .unwrap()
+        }
+
+        fn plan_cumplimiento(catalogo: &Catalogo) -> PlanLote {
+            let seleccion = SeleccionLote {
+                tribunales: vec!["901".into()],
+                pestanas: vec!["Cumplimiento".into()],
+                modalidades: vec!["2".into()],
+                medidas: vec![crate::descargador::TODAS_LAS_MEDIDAS.into()],
+                ..Default::default()
+            };
+            catalogo.planificar(Edicion::Integral, &seleccion).unwrap()
+        }
+
+        fn html_pagina(&self, pagina: usize) -> Vec<u8> {
+            let url_xls = "https://familia.pjud.cl/sitfa/reportes/u1_amblistcump.xls";
+            let (cuerpo, script) = if self.vacia {
+                (
+                    "<tr><td>Sin registros</td></tr>".to_string(),
+                    String::new(),
+                )
+            } else {
+                let filas = if self.incluir_rut_xls {
+                    format!(
+                        "<tr><td>C-{pagina}1-2099</td><td>Persona Secreta Ficticia {pagina}</td><td>Programa Ficticio Norte</td></tr>\
+                        <tr><td>C-{pagina}2-2099</td><td>contacto.ficticio@example.test</td><td>Programa Ficticio Norte</td></tr>"
+                    )
+                } else {
+                    format!(
+                        "<tr><td>C-{pagina}1-2099</td><td>Persona Secreta Ficticia {pagina}</td><td>Programa Ficticio Norte</td></tr>"
+                    )
+                };
+                (
+                    filas,
+                    format!(r#"function ShowExcel(){{window.open("{url_xls}");}}"#),
+                )
+            };
+            format!(
+                r#"<html><body><form name="InformesPpalForm" method="post" action="/SITFAWEB/InformesDAction.do">
+                <select name="COD_Tribunal_sel"><option value="901" selected>901</option></select>
+                <select name="TIP_Consulta"><option value="2" selected>2</option></select>
+                <select name="TIP_Informe"><option value="0" selected>0</option></select>
+                <input name="COD_Lengueta" value="">
+                <input name="NUM_PaginaCumplimiento" value="{pagina}">
+                <input name="NUM_TotalCumplimiento" value="{}">
+                <table id="tablaCumplimiento"><tr><th>RIT</th><th>Nombre</th><th>Programa</th></tr>{cuerpo}</table>
+                </form><script>{script}</script></body></html>"#,
+                if self.vacia { 1 } else { self.total_paginas }
+            )
+            .into_bytes()
+        }
+
+        fn xls_pagina(&self, pagina: usize) -> Vec<u8> {
+            if self.incluir_rut_xls {
+                format!(
+                    "<html><table><tr><th>RIT</th><th>RUT</th><th>Nombre</th><th>Programa</th></tr>\
+                    <tr><td>C-{pagina}1-2099</td><td>11.111.111-1</td><td>Persona Secreta Ficticia {pagina}</td><td>Programa Ficticio Norte</td></tr>\
+                    <tr><td>C-{pagina}2-2099</td><td>11.111.111-1</td><td>contacto.ficticio@example.test</td><td>Programa Ficticio Norte</td></tr></table></html>"
+                )
+                .into_bytes()
+            } else {
+                format!(
+                    "<html><table><tr><th>RIT</th><th>Nombre</th><th>Programa</th></tr>\
+                    <tr><td>C-{pagina}1-2099</td><td>Persona Secreta Ficticia {pagina}</td><td>Programa Ficticio Norte</td></tr></table></html>"
+                )
+                .into_bytes()
+            }
+        }
+
+        fn pagina_de_pares(pairs: &Value) -> usize {
+            pairs
+                .as_array()
+                .and_then(|a| {
+                    a.iter()
+                        .find(|p| p[0] == "NUM_PaginaCumplimiento")
+                        .and_then(|p| p[1].as_str())
+                        .and_then(|s| s.parse::<usize>().ok())
+                })
+                .unwrap_or(1)
+        }
+    }
+
+    impl Conexion for MockMultipagina {
+        fn soporta_search_and_download(&self) -> bool {
+            self.soporta_compuesto
+        }
+
+        fn llamar(&self, comando: &str, payload: Value, _plazo: Duration) -> Result<Value, String> {
+            self.llamadas.borrow_mut().push((comando.to_string(), payload.clone()));
+            match comando {
+                "lock" | "unlock" => Ok(json!({"ok": true, "restored": true})),
+                "prepare" => Ok(json!({
+                    "pairs": [
+                        ["COD_Tribunal_sel", "901"],
+                        ["COD_Lengueta", "tdCumplimiento"],
+                        ["TIP_Consulta", "2"],
+                        ["TIP_Informe", "0"],
+                        ["NUM_PaginaCumplimiento", ""],
+                        ["NUM_TotalCumplimiento", ""],
+                        ["FLG_Consulta", "0"],
+                        ["irAccion", "Buscar medida"]
+                    ]
+                })),
+                "search" => {
+                    let pag = Self::pagina_de_pares(&payload["pairs"]);
+                    *self.ultima_pagina.borrow_mut() = pag;
+                    Ok(json!({
+                        "status": 200,
+                        "type": "text/html; charset=utf-8",
+                        "body": STANDARD.encode(self.html_pagina(pag)),
+                    }))
+                }
+                "download" => {
+                    let pag = *self.ultima_pagina.borrow();
+                    Ok(json!({
+                        "status": 200,
+                        "type": "application/vnd.ms-excel",
+                        "body": STANDARD.encode(self.xls_pagina(pag)),
+                    }))
+                }
+                "search_and_download" => {
+                    let inicio = Instant::now();
+                    if !self.demora.is_zero() {
+                        std::thread::sleep(self.demora);
+                    }
+                    let pag = Self::pagina_de_pares(&payload["pairs"]);
+                    *self.ultima_pagina.borrow_mut() = pag;
+                    let html = self.html_pagina(pag);
+                    let xls_bytes = if pag == 1 && self.xls_corrupto_p1 {
+                        b"<html><table><tr><th>RIT</th><th>Nombre</th></tr><tr><td>C-999-2099</td><td>Otro</td></tr></table></html>".to_vec()
+                    } else {
+                        self.xls_pagina(pag)
+                    };
+                    let excel = if self.vacia {
+                        Value::Null
+                    } else {
+                        json!({
+                            "status": 200,
+                            "type": "application/vnd.ms-excel",
+                            "url": "https://familia.pjud.cl/sitfa/reportes/u1_amblistcump.xls",
+                            "body": STANDARD.encode(xls_bytes),
+                        })
+                    };
+                    self.tiempos_sad.borrow_mut().push((inicio, Instant::now()));
+                    Ok(json!({
+                        "html": {
+                            "status": 200,
+                            "type": "text/html; charset=utf-8",
+                            "body": STANDARD.encode(html),
+                        },
+                        "excel": excel,
+                    }))
+                }
+                otro => Err(format!("comando inesperado: {otro}")),
+            }
+        }
+    }
+
+    #[test]
+    fn lote_multipagina_usa_search_and_download_y_pipelining() {
+        let catalogo = MockMultipagina::catalogo_seguimiento();
+        let plan = MockMultipagina::plan_cumplimiento(&catalogo);
+
+        // 1) Con 3 páginas, extensión >= 2.11.0 usa `search_and_download` con `index_dom: false` y pausa adaptativa.
+        let mut mock = MockMultipagina::nuevo(true, 3);
+        mock.demora = Duration::from_millis(160);
+        let destino = std::env::temp_dir().join(format!("flow-multipag-sad-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&destino);
+        let mut carpeta = PathBuf::new();
+        let res = ejecutar(
+            &mock,
+            &catalogo,
+            Edicion::Integral,
+            &plan,
+            &destino,
+            &Opciones {
+                evidencia: false,
+                pausa: Duration::from_millis(200),
+                ..Default::default()
+            },
+            &AtomicBool::new(false),
+            &mut |ev| {
+                if let Evento::Carpeta(c) = ev {
+                    carpeta = c;
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0]["paginas"], 3);
+        assert_eq!(res[0]["estado"], "VALIDADA");
+        let llamadas = mock.llamadas.borrow();
+        let sad_calls: Vec<_> = llamadas.iter().filter(|(c, _)| c == "search_and_download").collect();
+        assert_eq!(sad_calls.len(), 3, "debe usar search_and_download una vez por página");
+        assert!(sad_calls.iter().all(|(_, p)| p["index_dom"] == false), "debe pedir index_dom: false");
+        assert!(llamadas.iter().all(|(c, _)| c != "search" && c != "download"), "no debe llamar search/download");
+        let tiempos = mock.tiempos_sad.borrow();
+        assert_eq!(tiempos.len(), 3);
+        // La pausa configurada (200 ms) descuenta la latencia de red (~160 ms), por lo que la brecha entre p1 y p2 es < 150 ms.
+        let brecha_1_2 = tiempos[1].0.saturating_duration_since(tiempos[0].1);
+        assert!(
+            brecha_1_2 < Duration::from_millis(150),
+            "pausa adaptativa debió descontar latencia de red (~160 ms de 200 ms): {brecha_1_2:?}"
+        );
+        let verif: Value = serde_json::from_slice(&fs::read(carpeta.join("verificacion 001.json")).unwrap()).unwrap();
+        assert_eq!(verif["estado"], "VALIDADA");
+        assert_eq!(verif["archivos"].as_array().unwrap().len(), 3);
+        let _ = fs::remove_dir_all(&destino);
+
+        // 1b) Si el worker falla validando página 1 en el pipeline, propaga el error y marca INCOMPLETA.
+        let mut mock_err = MockMultipagina::nuevo(true, 3);
+        mock_err.xls_corrupto_p1 = true;
+        let destino_err = std::env::temp_dir().join(format!("flow-multipag-err-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&destino_err);
+        let mut carpeta_err = PathBuf::new();
+        let err = ejecutar(
+            &mock_err,
+            &catalogo,
+            Edicion::Integral,
+            &plan,
+            &destino_err,
+            &Opciones {
+                evidencia: false,
+                ..Default::default()
+            },
+            &AtomicBool::new(false),
+            &mut |ev| {
+                if let Evento::Carpeta(c) = ev {
+                    carpeta_err = c;
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("coinciden"), "debe propagar el error de validación de página 1: {err}");
+        let verif_err: Value =
+            serde_json::from_slice(&fs::read(carpeta_err.join("verificacion 001.json")).unwrap()).unwrap();
+        assert_eq!(verif_err["estado"], "INCOMPLETA");
+        let _ = fs::remove_dir_all(&destino_err);
+
+        // 2) Consulta vacía sin PDF emite `comprobante_sin_registros` (V-JSON-01) con SHA-256 real del HTML.
+        let mut mock_vacia = MockMultipagina::nuevo(true, 1);
+        mock_vacia.vacia = true;
+        let html_esperado = mock_vacia.html_pagina(1);
+        let destino_vacia = std::env::temp_dir().join(format!("flow-json-sin-pdf-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&destino_vacia);
+        let mut carpeta_vacia = PathBuf::new();
+        ejecutar(
+            &mock_vacia,
+            &catalogo,
+            Edicion::Integral,
+            &plan,
+            &destino_vacia,
+            &Opciones {
+                evidencia: false,
+                ..Default::default()
+            },
+            &AtomicBool::new(false),
+            &mut |ev| {
+                if let Evento::Carpeta(c) = ev {
+                    carpeta_vacia = c;
+                }
+            },
+        )
+        .unwrap();
+        let verif_vacia: Value =
+            serde_json::from_slice(&fs::read(carpeta_vacia.join("verificacion 001.json")).unwrap()).unwrap();
+        assert_eq!(verif_vacia["estado"], "SIN_RESULTADOS");
+        assert_eq!(verif_vacia["evidencia_omitida"], true);
+        let comp = &verif_vacia["comprobante_sin_registros"];
+        assert_eq!(comp["tipo"], "JSON_SIN_REGISTROS");
+        assert_eq!(comp["sha256_html"], huella(&html_esperado));
+        assert!(!comp["contexto_consulta"].as_array().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&destino_vacia);
+    }
+
+    #[test]
+    fn lote_multipagina_cae_a_search_y_download_con_extension_antigua() {
+        let catalogo = MockMultipagina::catalogo_seguimiento();
+        let plan = MockMultipagina::plan_cumplimiento(&catalogo);
+        let mock = MockMultipagina::nuevo(false, 3);
+        let destino = std::env::temp_dir().join(format!("flow-multipag-legacy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&destino);
+        let mut carpeta = PathBuf::new();
+        let res = ejecutar(
+            &mock,
+            &catalogo,
+            Edicion::Integral,
+            &plan,
+            &destino,
+            &Opciones {
+                evidencia: false,
+                ..Default::default()
+            },
+            &AtomicBool::new(false),
+            &mut |ev| {
+                if let Evento::Carpeta(c) = ev {
+                    carpeta = c;
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0]["paginas"], 3);
+        let llamadas = mock.llamadas.borrow();
+        assert!(llamadas.iter().all(|(c, _)| c != "search_and_download"));
+        assert_eq!(llamadas.iter().filter(|(c, _)| c == "search").count(), 3);
+        assert_eq!(llamadas.iter().filter(|(c, _)| c == "download").count(), 3);
+        let verif: Value = serde_json::from_slice(&fs::read(carpeta.join("verificacion 001.json")).unwrap()).unwrap();
+        assert_eq!(verif["estado"], "VALIDADA");
+        let _ = fs::remove_dir_all(&destino);
+    }
+
+    #[test]
+    fn diagnostico_columnas_html_xls_no_filtra_datos_personales() {
+        let catalogo = MockMultipagina::catalogo_seguimiento();
+        let plan = MockMultipagina::plan_cumplimiento(&catalogo);
+        let mut mock = MockMultipagina::nuevo(true, 1);
+        mock.incluir_rut_xls = true;
+        let destino = std::env::temp_dir().join(format!("flow-diag-ex3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&destino);
+        let mut carpeta = PathBuf::new();
+        ejecutar(
+            &mock,
+            &catalogo,
+            Edicion::Integral,
+            &plan,
+            &destino,
+            &Opciones {
+                evidencia: false,
+                ..Default::default()
+            },
+            &AtomicBool::new(false),
+            &mut |ev| {
+                if let Evento::Carpeta(c) = ev {
+                    carpeta = c;
+                }
+            },
+        )
+        .unwrap();
+        let diag_bytes = fs::read(carpeta.join("diagnostico_columnas_html_xls.json")).unwrap();
+        let diag_text = String::from_utf8(diag_bytes).unwrap();
+        let diag: Value = serde_json::from_str(&diag_text).unwrap();
+        assert_eq!(diag["version"], 1);
+        assert_eq!(diag["pantalla"], "seguimiento");
+        let c = &diag["consultas"][0];
+        assert_eq!(c["pestana"], "Cumplimiento");
+        assert_eq!(c["modalidad"], "Ambulatorio");
+        assert_eq!(c["columnas_html"], json!(["RIT", "Nombre", "Programa"]));
+        assert_eq!(c["columnas_xls"], json!(["RIT", "RUT", "Nombre", "Programa"]));
+        assert_eq!(c["solo_en_xls"], json!(["RUT"]));
+        assert_eq!(c["solo_en_html"], json!([]));
+        for pii in [
+            "C-11-2099",
+            "C-12-2099",
+            "Persona Secreta Ficticia",
+            "11.111.111-1",
+            "Programa Ficticio Norte",
+            "contacto.ficticio@example.test",
+        ] {
+            assert!(!diag_text.contains(pii), "el diagnóstico E-X3 filtró datos de fila: {pii}");
+        }
+        let _ = fs::remove_dir_all(&destino);
     }
 }
