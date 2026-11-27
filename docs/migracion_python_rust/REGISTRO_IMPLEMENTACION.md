@@ -16,6 +16,12 @@ Una entrada por encargo, de diez líneas como máximo, la más reciente arriba:
 
 No se copian salidas completas ni listas de mutaciones: la prueba afirma sus conteos y la CI del commit es la evidencia.
 
+## 2026-11-26 · Manuales PDF y video guía exclusivos de SITFA Lite (sin imágenes ni referencias al Asistente)
+- Cambió: retiradas `descargador_lite/docs/img/flow_lite_*.png`; regenerados `descargador_lite/docs/{SITFA_Lite_Manual_Instalacion.pdf,SITFA_Lite_Manual_Uso.pdf,SITFA_Lite_Video_Instalacion_y_Uso.mp4}` usando únicamente capturas reales de SITFA Lite (`a0..a6*.png`) y de la extensión Chrome (`r01..r07*.png`), sin comparaciones ni menciones a otras herramientas.
+- Acredita: revisión visual de las 8 páginas PDF (4 de Instalación + 4 de Uso) y video H.264 720p 30fps (49,8 s · 2,03 MB).
+- Diferencias declaradas: ninguna (material destinado exclusivamente a usuarios de SITFA Lite).
+- Pendiente: ninguno.
+
 ## 2026-11-26 · Manuales PDF y video guía de instalación y uso del Descargador Lite con capturas reales
 - Cambió: `app/src/{descargador_ui.rs,ui.rs}` (vistas `--vista descargador-lite-{alcance,ejecucion,resultados}` para capturas), `descargador_lite/build/manual_visual/generar_manuales_y_video_flow_rust.py`, 4 capturas reales (`descargador_lite/docs/img/flow_lite_*.png`), `descargador_lite/docs/{SITFA_Lite_Manual_Instalacion.pdf,SITFA_Lite_Manual_Uso.pdf,SITFA_Lite_Video_Instalacion_y_Uso.mp4}` y `docs/migracion_python_rust/REGISTRO_IMPLEMENTACION.md`.
 - Acredita: verificación visual de las 8 páginas PDF (4 de Instalación + 4 de Uso, sin rutas personales), video H.264 720p 30fps (48,6 s · 1,93 MB), compilación/pruebas `app/` y verificadores estáticos en PASA.
