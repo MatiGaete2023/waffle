@@ -47,9 +47,18 @@ async function inject(command,payload={}) {
     evidenceReasons.includes(candidates[0].result.motivo)?{motivo:candidates[0].result.motivo}:{});
   frameId=candidates[0].frameId;return candidates[0].result;
 }
-const allowedCommands=["catalog","capabilities","lock","unlock","prepare","search","download","evidence_open","evidence_capture","evidence_close"];
+const allowedCommands=["catalog","capabilities","lock","unlock","prepare","search","download","search_and_download","evidence_open","evidence_capture","evidence_close"];
 async function execute(command,payload={}) {
   if(!allowedCommands.includes(command)) throw failure("SITFA_TASK");
+  if(command==="lock") {
+    const res=await inject(command,payload);
+    try {await chrome.tabs.update(tabId,{autoDiscardable:false});} catch (_) {}
+    return res;
+  }
+  if(command==="unlock") {
+    try {return await inject(command,payload);}
+    finally {try {await chrome.tabs.update(tabId,{autoDiscardable:true});} catch (_) {}}
+  }
   if(command==="evidence_capture") {
     let changed=false,stage="pestaña";
     const activated=info=>{if(info.windowId===windowId&&info.tabId!==tabId)changed=true;};
@@ -104,6 +113,7 @@ async function execute(command,payload={}) {
 async function disconnect() {
   running=false;
   if (frameId!==null) {try {await execute("unlock");} catch (_) {}}
+  try {await chrome.tabs.update(tabId,{autoDiscardable:true});} catch (_) {}
   key=null;endpoint=null;frameId=null;connecting=false;
   byId("connect").disabled=false;byId("disconnect").disabled=true;byId("code").disabled=false;
 }

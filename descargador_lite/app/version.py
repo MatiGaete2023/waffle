@@ -3,9 +3,9 @@
 from pathlib import Path
 import sys
 
-VERSION = '1.1.0'
+VERSION = '1.2.0'
 EXTENSION_TYPE = 'SITFA_LITE_CAPACIDADES'
-PROTOCOLS = {'descarga_xls': 1, 'pdf_sin_registros': 1}
+PROTOCOLS = {'descarga_xls': 1, 'pdf_sin_registros': 1, 'search_and_download': 1}
 
 
 def extension_dir():

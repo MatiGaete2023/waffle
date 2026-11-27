@@ -117,8 +117,8 @@ class FakeBridge:
         if command == 'capabilities':
             return {
                 'tipo': 'SITFA_LITE_CAPACIDADES',
-                'version': '1.1.0',
-                'protocolos': {'descarga_xls': 1, 'pdf_sin_registros': 1},
+                'version': '1.2.0',
+                'protocolos': {'descarga_xls': 1, 'pdf_sin_registros': 1, 'search_and_download': 1},
                 'escritura_rus': False,
             }
         if command in ('lock', 'unlock', 'evidence_close'):
@@ -134,6 +134,24 @@ class FakeBridge:
             return {'status': 200, 'type': 'text/html; charset=utf-8', 'body': b64(body)}
         if command == 'download':
             return {'status': 200, 'type': 'application/vnd.ms-excel', 'body': b64(self.excel(self.current))}
+        if command == 'search_and_download':
+            p = dict(payload['pairs'])
+            self.current = p
+            body = self.page_html(p).encode('utf-8')
+            html_payload = {'status': 200, 'type': 'text/html; charset=utf-8', 'body': b64(body)}
+            if self.total(p) == 0:
+                return {'html': html_payload, 'excel': None}
+            template = TEMPLATES.get(self.screen, 'listdemo')
+            url = f'https://familia.pjud.cl/sitfa/reportes/u1_{template}.xls'
+            return {
+                'html': html_payload,
+                'excel': {
+                    'status': 200,
+                    'type': 'application/vnd.ms-excel',
+                    'url': url,
+                    'body': b64(self.excel(p)),
+                },
+            }
         if command == 'evidence_open':
             p = dict(payload['pairs'])
             # Como restoreEvidenceSelection: la copia para el PDF muestra la pestaña consultada.

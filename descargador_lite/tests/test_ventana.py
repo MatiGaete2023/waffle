@@ -205,3 +205,22 @@ def test_avance_en_el_titulo_y_carpeta_en_el_pie(app):
     app.process_event('done', {'queries': 5, 'records': 1, 'files': 1, 'pdfs': 0})
     assert app.root.title() == app.window.title
     assert app.folder_link.cget('text').startswith('Carpeta: ')
+
+
+def test_modo_rapido_por_defecto_y_cambio_a_modo_registro(app):
+    app.bridge.connected = True
+    esperar(app, lambda: app.catalog is not None)
+    assert app.prefs.data['pdf_sin_registros'] is False
+    assert app.prefs.data['modo_rapido'] is True
+    assert app.mode.get() == ('rapido',)
+    assert app.include.get() == ()
+    app.mode.set(['registro'])
+    app.toggle_mode()
+    assert app.prefs.data['pdf_sin_registros'] is True
+    assert app.prefs.data['modo_rapido'] is False
+    assert app.include.get() == ('pdf',)
+    app.mode.set(['rapido'])
+    app.toggle_mode()
+    assert app.prefs.data['pdf_sin_registros'] is False
+    assert app.prefs.data['modo_rapido'] is True
+    assert app.include.get() == ()
