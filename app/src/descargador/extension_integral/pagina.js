@@ -34,9 +34,9 @@ async function sitfaTask(command, payload) {
     form.querySelector('#ExcelInformesPorVencer1,[name="ExcelInformesPorVencer1"]')?"calendario_informes":
     form.querySelector('#ExcelMedidasPorVencer1,[name="ExcelMedidasPorVencer1"]')?"calendario_medidas":null;
   if (!screen) return null;
-  // 2.9.0 es el contrato de capacidades; el manifiesto de distribución es 2.10.0.
-  if(command==='capabilities') return {tipo:'CSMP_RUS_CAPACIDADES',version:'2.9.0',flow_rust_rapido:1,flow_rust_version:'2.10.0',
-    protocolos:{bitacoras_lectura:1,descarga_conjunta:1,pdf_seleccion:1,pdf_copia_fija:1,calendario_lectura:1,historia_lectura:1,historico_lectura:2},escritura_rus:false};
+  // 2.9.0 es el contrato base de capacidades; el manifiesto de distribución es 2.11.0.
+  if(command==='capabilities') return {tipo:'CSMP_RUS_CAPACIDADES',version:'2.9.0',flow_rust_rapido:2,flow_rust_version:'2.11.0',
+    protocolos:{bitacoras_lectura:1,descarga_conjunta:1,pdf_seleccion:1,pdf_copia_fija:1,calendario_lectura:1,historia_lectura:1,historico_lectura:2,search_and_download:1},escritura_rus:false};
   const actions={seguimiento:"Buscar medida",litigantes:"Consulta Informe",calendario_informes:"Buscar Inf.",calendario_medidas:"Buscar",carga:"Aud.Carga Func.-"};
   const menus={seguimiento:"89",litigantes:"94",calendario_informes:"91",calendario_medidas:"90",carga:"29"};
   const fields={seguimiento:`COD_Centro GLS_TribunalOrigen FLG_Consulta COD_Lengueta
@@ -650,10 +650,62 @@ async function sitfaTask(command, payload) {
       const previo=cache.paginas.get(JSON.stringify(pairs));
       if(previo){
         const bin=atob(previo.body),bytes=Uint8Array.from(bin,c=>c.charCodeAt(0));
-        asignarPagina(bytes,pairs);
+        if(payload.index_dom!==false)asignarPagina(bytes,pairs);
         return previo;
       }
     }
+  } else if (command === "search_and_download") {
+    const pairs=payload.pairs;
+    if (!validPairs(pairs))
+      throw new Error("estructura");
+    delete window.__sitfaRun.diaryDocument;delete window.__sitfaRun.diaryPairs;delete window.__sitfaRun.diaryIndex;
+    const timeoutMs=Math.min(payload.timeout||60000,60000);
+    const toBase64=buf=>{const c=[];for(let i=0;i<buf.length;i+=32768)c.push(String.fromCharCode(...buf.subarray(i,i+32768)));return btoa(c.join(""));};
+    const response=await fetch(endpoint,{method:"POST",body:new URLSearchParams(pairs),credentials:"include",cache:"no-store",redirect:"error",
+      signal:AbortSignal.timeout(timeoutMs)});
+    const bytes=await boundedBytes(response,80*1024*1024);
+    if(response.status!==200||!bytes.length)throw new Error("sesion");
+    const htmlType=response.headers.get("content-type")||"";
+    if(!htmlType.toLowerCase().includes("html"))throw new Error("estructura");
+    if(screen==="seguimiento"&&payload.index_dom!==false)asignarPagina(bytes,pairs);
+    const htmlObj={status:response.status,type:htmlType,body:toBase64(bytes)};
+    if(screen==="seguimiento"){
+      const run=window.__sitfaRun,cache=window.__sitfaReuse;
+      if(run?.cache==="record"&&payload.flow_cache==="record"&&run.ambito===payload.flow_scope&&cache?.ambito===run.ambito){
+        const llave=JSON.stringify(pairs),n=htmlObj.body.length;
+        if(!cache.paginas.has(llave)&&cache.paginas.size<128&&n<=2*1024*1024&&cache.bytes+n<=24*1024*1024){cache.paginas.set(llave,htmlObj);cache.bytes+=n;}
+      }
+    }
+    let htmlText;
+    try{htmlText=new TextDecoder("utf-8",{fatal:true}).decode(bytes);}
+    catch(_){htmlText=new TextDecoder("windows-1252").decode(bytes);}
+    const showMatch=/function\s+ShowExcel\s*\(\s*\)\s*\{/.exec(htmlText);
+    let rawUrl=null;
+    if(showMatch){
+      const after=htmlText.slice(showMatch.index+showMatch[0].length);
+      const nextFn=/\bfunction\s+\w+\s*\(/.exec(after);
+      const block=nextFn?after.slice(0,nextFn.index):after;
+      const openMatch=/window\.open\s*\(\s*["']([^"']+)["']/.exec(block);
+      if(openMatch)rawUrl=openMatch[1];
+    }
+    if(!rawUrl)return {html:htmlObj,excel:null};
+    let u;
+    try{u=new URL(rawUrl);}catch(_){throw new Error("estructura");}
+    if(u.origin!=="https://familia.pjud.cl"||u.search||u.hash||!/^\/sitfa\/reportes\/[A-Za-z0-9_-]+\.xls$/.test(u.pathname))
+      throw new Error("estructura");
+    if(typeof payload.template==="string"&&payload.template.length>0){
+      const sufijo="_"+payload.template+".xls";
+      if(!u.pathname.endsWith(sufijo)||u.pathname.length<=("/sitfa/reportes/"+sufijo).length)
+        throw new Error("estructura");
+    }
+    const xlsResp=await fetch(u.href,{method:"GET",credentials:"include",cache:"no-store",redirect:"error",
+      signal:AbortSignal.timeout(timeoutMs)});
+    const xlsBytes=await boundedBytes(xlsResp,80*1024*1024);
+    if(xlsResp.status!==200||!xlsBytes.length)throw new Error("sesion");
+    return {
+      html:htmlObj,
+      excel:{status:xlsResp.status,type:xlsResp.headers.get("content-type")||"",url:u.href,body:toBase64(xlsBytes)}
+    };
   } else if (command === "download") {
     const u=new URL(payload.url);
     if (u.origin!=="https://familia.pjud.cl" || u.search || u.hash || !/^\/sitfa\/reportes\/[A-Za-z0-9_-]+\.xls$/.test(u.pathname))
@@ -713,7 +765,7 @@ async function sitfaTask(command, payload) {
   if(command==="search" && screen==="seguimiento") {
     const type=response.headers.get("content-type")||"";
     if(!type.toLowerCase().includes("html"))throw new Error("estructura");
-    asignarPagina(bytes,payload.pairs);
+    if(payload.index_dom!==false)asignarPagina(bytes,payload.pairs);
   }
   const resultado={status:response.status,type:response.headers.get("content-type")||"",body:btoa(chunks.join("")),
     ...(diaryParams?{params:diaryParams,startedAt,digest:await sha256(bytes)}:{}),

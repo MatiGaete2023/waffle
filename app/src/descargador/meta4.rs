@@ -333,6 +333,11 @@ pub fn tribunales_disponibles(carpetas: &[PathBuf]) -> Result<Vec<&'static str>,
     Ok(flow_meta4::tribunales::TRIBUNALES.into_iter().filter(|t| presentes.contains(t)).collect())
 }
 
+enum EvidenciaVacia {
+    Pdf(String),
+    Json(String),
+}
+
 struct ConsultaMeta4 {
     etiqueta: String,
     consulta: Value,
@@ -340,7 +345,7 @@ struct ConsultaMeta4 {
     lista: &'static str,
     categoria: &'static str,
     tribunal: Option<&'static str>,
-    evidencia: Option<String>,
+    evidencia: Option<EvidenciaVacia>,
 }
 
 /// Lee los lotes de registros y las bitácoras, y calcula Meta 4. No escribe nada.
@@ -455,11 +460,21 @@ pub fn calcular_en_periodo(
                 }
                 vistas.insert(clave, nombre.clone());
             }
-            let evidencia = manifiesto["archivos"]
-                .as_array()
-                .is_none_or(Vec::is_empty)
-                .then(|| manifiesto["evidencia"]["archivo"].as_str().map(String::from))
-                .flatten();
+            let evidencia = if manifiesto["archivos"].as_array().is_none_or(Vec::is_empty) {
+                if let Some(pdf) = manifiesto["evidencia"]["archivo"].as_str() {
+                    Some(EvidenciaVacia::Pdf(pdf.to_string()))
+                } else if manifiesto["estado"] == "SIN_RESULTADOS"
+                    && (manifiesto["comprobante_sin_registros"]["tipo"] == "JSON_SIN_REGISTROS"
+                        || manifiesto["evidencia_omitida"] == true)
+                {
+                    let archivo = texto(q, "verificacion");
+                    Some(EvidenciaVacia::Json(if archivo.is_empty() { "verificacion.json".into() } else { archivo }))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             consultas.push(ConsultaMeta4 {
                 etiqueta: nombre.clone(),
                 consulta: q.clone(),
@@ -559,17 +574,31 @@ pub fn calcular_en_periodo(
             });
         }
     }
-    // Una consulta sin registros solo es evidencia con su PDF verificado (`inspect_zero_record_file`).
+    // Una consulta sin registros es evidencia con su PDF verificado o su comprobante JSON sin PDF (D1-A).
     let mut sin_evidencia: Vec<String> = Vec::new();
     let mut vacias = 0usize;
     for c in consultas.iter().filter(|c| c.evidencia.is_some() || texto(&c.consulta, "estado") == "SIN_RESULTADOS") {
         match &c.evidencia {
-            Some(pdf) => {
+            Some(EvidenciaVacia::Pdf(pdf)) => {
                 vacias += 1;
                 m.fuentes.push(FuenteMeta4 {
                     archivo: pdf.clone(),
                     lote: c.etiqueta.clone(),
                     tipo: "PDF",
+                    tribunal: c.tribunal,
+                    categoria: c.categoria,
+                    lista: c.lista,
+                    registros: 0,
+                    resultado: if c.tribunal.is_some() { "SIN REGISTROS" } else { "NO CLASIFICADO" },
+                    seleccionado: c.tribunal.is_some() && seleccionado(c.tribunal, &m),
+                });
+            }
+            Some(EvidenciaVacia::Json(verificacion)) => {
+                vacias += 1;
+                m.fuentes.push(FuenteMeta4 {
+                    archivo: verificacion.clone(),
+                    lote: c.etiqueta.clone(),
+                    tipo: "JSON",
                     tribunal: c.tribunal,
                     categoria: c.categoria,
                     lista: c.lista,
@@ -789,6 +818,114 @@ mod tests {
         let corte = NaiveDate::from_ymd_opt(2026, 10, 16).unwrap();
         let (dia, etapa, _) = flow_meta4::ultima(&[(f(10, 9), "Cumplimiento".into()), (f(12, 9), "Espera".into()), (f(14, 9), "Informes".into())], corte);
         assert_eq!((dia, etapa), (NaiveDate::from_ymd_opt(2026, 10, 12), "Espera"));
+    }
+
+    #[test]
+    fn meta4_acepta_comprobante_json_sin_pdf_sin_alerta_ni_error() {
+        let base = std::env::temp_dir().join(format!("flow-meta4-json-sin-pdf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let lote = base.join("lote");
+        let bitacoras = base.join("bitacoras");
+        std::fs::create_dir_all(&lote).unwrap();
+        std::fs::create_dir_all(&bitacoras).unwrap();
+
+        let sel_res = serde_json::json!({
+            "screen": "seguimiento", "tribunal": "49", "tribunal_nombre": "Juzgado de Familia Tomé",
+            "tab": "Cumplimiento", "modality": "1", "modalidad_nombre": "Residencia", "report": "0"
+        });
+        let sel_fae = serde_json::json!({
+            "screen": "seguimiento", "tribunal": "49", "tribunal_nombre": "Juzgado de Familia Tomé",
+            "tab": "Espera", "modality": "3", "modalidad_nombre": "FAE", "report": null
+        });
+        let resumen = serde_json::json!({
+            "version_contrato": 1,
+            "fecha_hora": "2099-03-10T10:00:00",
+            "estado": "VALIDADA",
+            "plan": [sel_res, sel_fae],
+            "consultas_esperadas": 2,
+            "consultas_completadas": 2,
+            "consultas": [
+                {
+                    "consulta": "Juzgado de Familia Tomé / Cumplimiento / Residencia",
+                    "estado": "SIN_RESULTADOS",
+                    "paginas": 0,
+                    "registros": 0,
+                    "verificacion": "verificacion 001.json",
+                    "seleccion": sel_res,
+                    "evidencia_omitida": true
+                },
+                {
+                    "consulta": "Juzgado de Familia Tomé / Espera / FAE",
+                    "estado": "SIN_RESULTADOS",
+                    "paginas": 0,
+                    "registros": 0,
+                    "verificacion": "verificacion 002.json",
+                    "seleccion": sel_fae,
+                    "evidencia_omitida": true
+                }
+            ],
+            "filtro_fecha": null,
+            "otros_filtros": "todos los registros"
+        });
+        let verif_1 = serde_json::json!({
+            "fecha_hora": "2099-03-10T10:00:00",
+            "caso": "T49-Cumplimiento-M1",
+            "consulta": "Juzgado de Familia Tomé / Cumplimiento / Residencia",
+            "estado": "SIN_RESULTADOS",
+            "paginas_esperadas": 0,
+            "paginas_verificadas": 0,
+            "archivos": [],
+            "seleccion": sel_res,
+            "filtro_fecha": null,
+            "evidencia_omitida": true,
+            "comprobante_sin_registros": {
+                "tipo": "JSON_SIN_REGISTROS",
+                "fecha_hora": "2099-03-10T10:00:00.000000",
+                "sha256_html": "a".repeat(64),
+                "contexto_consulta": [["Tribunal", "Juzgado de Familia Tomé (código 49)"]]
+            }
+        });
+        // Compatibilidad hacia atrás: solo `evidencia_omitida: true` sin `comprobante_sin_registros`.
+        let verif_2 = serde_json::json!({
+            "fecha_hora": "2099-03-10T10:00:00",
+            "caso": "T49-Espera-M3",
+            "consulta": "Juzgado de Familia Tomé / Espera / FAE",
+            "estado": "SIN_RESULTADOS",
+            "paginas_esperadas": 0,
+            "paginas_verificadas": 0,
+            "archivos": [],
+            "seleccion": sel_fae,
+            "filtro_fecha": null,
+            "evidencia_omitida": true
+        });
+        std::fs::write(lote.join("resumen.json"), serde_json::to_vec_pretty(&resumen).unwrap()).unwrap();
+        std::fs::write(lote.join("verificacion 001.json"), serde_json::to_vec_pretty(&verif_1).unwrap()).unwrap();
+        std::fs::write(lote.join("verificacion 002.json"), serde_json::to_vec_pretty(&verif_2).unwrap()).unwrap();
+
+        let bit = serde_json::json!({
+            "version": 1, "tipo": "BITACORAS_LECTURA", "estado": "COMPLETA",
+            "fecha_hora": "2099-03-10T10:05:00",
+            "consultas": [], "registros": []
+        });
+        std::fs::write(bitacoras.join("bitacoras.json"), serde_json::to_vec_pretty(&bit).unwrap()).unwrap();
+
+        let corte = NaiveDate::from_ymd_opt(2099, 3, 10).unwrap();
+        let m = calcular(&[lote.clone()], &[bitacoras.clone()], corte, corte, &["TOMÉ".into()]).unwrap();
+        assert_eq!(m.fuentes.len(), 2);
+        assert!(m.fuentes.iter().all(|f| f.tipo == "JSON" && f.registros == 0 && f.resultado == "SIN REGISTROS" && f.seleccionado));
+        assert_eq!(m.fuentes[0].archivo, "verificacion 001.json");
+        assert_eq!(m.fuentes[1].archivo, "verificacion 002.json");
+        assert!(m.avisos.iter().all(|a| !a.contains("PDF") && !a.contains("FALTANTE")), "avisos inesperados: {:?}", m.avisos);
+
+        // Negativo: sin evidencia ni `evidencia_omitida`, sí alerta falta de PDF y falla si no hay registros ni vacías válidas.
+        let mut sin_marca = verif_2.clone();
+        sin_marca.as_object_mut().unwrap().remove("evidencia_omitida");
+        std::fs::write(lote.join("verificacion 002.json"), serde_json::to_vec_pretty(&sin_marca).unwrap()).unwrap();
+        let m2 = calcular(&[lote.clone()], &[bitacoras], corte, corte, &["TOMÉ".into()]).unwrap();
+        assert_eq!(m2.fuentes.len(), 1);
+        assert!(m2.avisos.iter().any(|a| a.contains("PDF de evidencia")), "{:?}", m2.avisos);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 

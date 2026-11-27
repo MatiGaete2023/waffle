@@ -63,6 +63,20 @@ pub fn columnas(fila: &[String]) -> Result<Option<Columnas>, String> {
     }))
 }
 
+/// E-X3: devuelve únicamente los nombres de columnas de la primera fila de encabezado reconocida (cero datos de filas).
+pub fn cabeceras_desde_grilla(filas: &[Vec<String>]) -> Vec<String> {
+    for fila in filas {
+        if columnas(fila).ok().flatten().is_some() {
+            return fila
+                .iter()
+                .map(|c| c.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|c| !c.is_empty())
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
 pub fn clave(rit: &str, nombre: &str) -> Result<(String, String), String> {
     let rit = normalizar(rit).replace(['–', '—'], "-");
     let nombre = normalizar(nombre);

@@ -157,7 +157,7 @@ impl Default for Preferencias {
     fn default() -> Self {
         Self {
             destino: String::new(),
-            pdf_sin_registros: true,
+            pdf_sin_registros: false,
             pausa_consultas: PAUSA_DEFECTO_S,
             rapido: Rapido::default(),
             favoritos: BTreeMap::new(),
