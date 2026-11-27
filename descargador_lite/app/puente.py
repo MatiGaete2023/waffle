@@ -207,6 +207,7 @@ class Bridge:
             'prepare',
             'search',
             'download',
+            'search_and_download',
             'evidence_open',
             'evidence_capture',
             'evidence_close',

@@ -33,7 +33,8 @@ class Preferences:
         self.data = {
             'destino': str(Path.home() / 'Documents' / 'SITFA Lite'),
             'pausa': 1.0,
-            'pdf_sin_registros': True,
+            'pdf_sin_registros': False,
+            'modo_rapido': True,
             'selecciones': {},
         }
         try:
@@ -44,6 +45,9 @@ class Preferences:
                 self.data['pausa'] = float(stored['pausa'])
             if isinstance(stored.get('pdf_sin_registros'), bool):
                 self.data['pdf_sin_registros'] = stored['pdf_sin_registros']
+                self.data['modo_rapido'] = not stored['pdf_sin_registros']
+            if isinstance(stored.get('modo_rapido'), bool):
+                self.data['modo_rapido'] = stored['modo_rapido']
             if isinstance(stored.get('selecciones'), dict):
                 self.data['selecciones'] = stored['selecciones']
         except (OSError, ValueError, AttributeError):
@@ -184,6 +188,16 @@ class Application:
             'Período', lambda p: ui.Chips(p, [(x, x) for x in PERIODS], multi=False, command=self.refresh)
         )
         f.row('', self._range_row, name='rango')
+        self.mode = f.row(
+            'Modo',
+            lambda p: ui.Chips(
+                p,
+                [('rapido', 'Modo Rápido'), ('registro', 'Modo Registro')],
+                multi=False,
+                command=self.toggle_mode,
+            ),
+        )
+        self.mode.set(['rapido' if self.prefs.data['modo_rapido'] else 'registro'])
         self.include = f.row(
             'Incluir', lambda p: ui.Chips(p, [('pdf', 'PDF si no hay registros')], command=self.toggle_empty_pdf)
         )
@@ -280,9 +294,9 @@ class Application:
             chips.set_options([])
         screen = self.screen_code
         shown = {
-            'seguimiento': {'Tribunales', 'Pestañas', 'Modalidad', 'Período', 'Incluir'},
-            'litigantes': {'Tribunales', 'Estado', 'Período', 'Incluir'},
-        }.get(screen, {'Tribunales', 'Mes', 'Año', 'Incluir'})
+            'seguimiento': {'Tribunales', 'Pestañas', 'Modalidad', 'Período', 'Modo', 'Incluir'},
+            'litigantes': {'Tribunales', 'Estado', 'Período', 'Modo', 'Incluir'},
+        }.get(screen, {'Tribunales', 'Mes', 'Año', 'Modo', 'Incluir'})
         for name in self.form.rows:
             self.form.show(name, name in shown)
         if not initial and self.connected and not self.busy:
@@ -370,9 +384,21 @@ class Application:
         year = next((k for k, v in self.catalog.get('anios', {}).items() if v == self.year.get()), None)
         return Batch(screen, tribunals, months=self.months.get(), year=year)
 
+    def toggle_mode(self):
+        rapido = self.mode.get() == ('rapido',)
+        self.prefs.data['modo_rapido'] = rapido
+        self.empty_pdf.set(not rapido)
+        self.prefs.data['pdf_sin_registros'] = not rapido
+        self.include.set([] if rapido else ['pdf'])
+        self.prefs.save()
+        self.refresh()
+
     def toggle_empty_pdf(self):
-        self.empty_pdf.set('pdf' in self.include.get())
-        self.prefs.data['pdf_sin_registros'] = self.empty_pdf.get()
+        pdf = 'pdf' in self.include.get()
+        self.empty_pdf.set(pdf)
+        self.prefs.data['pdf_sin_registros'] = pdf
+        self.prefs.data['modo_rapido'] = not pdf
+        self.mode.set(['registro' if pdf else 'rapido'])
         self.prefs.save()
         self.refresh()
 
@@ -455,6 +481,7 @@ class Application:
             self.states,
             self.months,
             self.period,
+            self.mode,
             self.include,
         ):
             chips.enable(ready)
@@ -623,14 +650,18 @@ class Application:
                 elif command == 'catalog':
                     self.emit('catalog', self.bridge.call('catalog', {'screen': arg}))
                 elif command == 'download':
-                    verify_extension(self.bridge)
+                    caps = verify_extension(self.bridge)
+                    modo_rapido = bool(self.prefs.data.get('modo_rapido', not self.prefs.data['pdf_sin_registros']))
+                    pause = min(self.prefs.data['pausa'], 0.2) if modo_rapido else self.prefs.data['pausa']
                     BatchRunner(
                         self.bridge,
                         self.catalog,
                         self.emit,
                         self.cancel,
-                        pause=self.prefs.data['pausa'],
+                        pause=pause,
                         evidencia=self.prefs.data['pdf_sin_registros'],
+                        modo_rapido=modo_rapido,
+                        capabilities=caps,
                     ).run(*arg)
                 elif command in ('disconnect', 'exit'):
                     if self.bridge.connected:

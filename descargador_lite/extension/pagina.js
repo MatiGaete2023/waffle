@@ -28,8 +28,8 @@ async function sitfaTask(command, payload) {
     form.querySelector('#ExcelInformesPorVencer1,[name="ExcelInformesPorVencer1"]')?"calendario_informes":
     form.querySelector('#ExcelMedidasPorVencer1,[name="ExcelMedidasPorVencer1"]')?"calendario_medidas":null;
   if (!screen) return null;
-  if(command==='capabilities') return {tipo:'SITFA_LITE_CAPACIDADES',version:'1.1.0',
-    protocolos:{descarga_xls:1,pdf_sin_registros:1},escritura_rus:false};
+  if(command==='capabilities') return {tipo:'SITFA_LITE_CAPACIDADES',version:'1.2.0',
+    protocolos:{descarga_xls:1,pdf_sin_registros:1,search_and_download:1},escritura_rus:false};
   const actions={seguimiento:"Buscar medida",litigantes:"Consulta Informe",calendario_informes:"Buscar Inf.",calendario_medidas:"Buscar"};
   const menus={seguimiento:"89",litigantes:"94",calendario_informes:"91",calendario_medidas:"90"};
   const fields={seguimiento:`COD_Centro GLS_TribunalOrigen FLG_Consulta COD_Lengueta
@@ -419,6 +419,50 @@ async function sitfaTask(command, payload) {
         new Set(pairs.map(([k])=>k)).size!==pairs.length) throw new Error("estructura");
     return {pairs};
   }
+  const toBase64 = bytes => {
+    const chunks=[];
+    for (let i=0;i<bytes.length;i+=32768) chunks.push(String.fromCharCode(...bytes.subarray(i,i+32768)));
+    return btoa(chunks.join(""));
+  };
+  if (command === "search_and_download") {
+    const pairs=payload.pairs;
+    if (!validPairs(pairs)) throw new Error("estructura");
+    const timeoutMs=Math.min(payload.timeout||60000,60000);
+    const htmlResp=await fetch(endpoint,{method:"POST",body:new URLSearchParams(pairs),
+      credentials:"include",cache:"no-store",redirect:"error",signal:AbortSignal.timeout(timeoutMs)});
+    const htmlBytes=await boundedBytes(htmlResp,80*1024*1024);
+    const htmlType=htmlResp.headers.get("content-type")||"";
+    if(htmlResp.status!==200||!htmlBytes.length||!htmlType.toLowerCase().includes("html"))throw new Error("sesion");
+    const doc=new DOMParser().parseFromString(new TextDecoder().decode(htmlBytes),"text/html");
+    const scripts=Array.from(doc.querySelectorAll("script")).map(s=>s.textContent||"").join("\n");
+    const start=/function\s+ShowExcel\s*\(\s*\)\s*\{/.exec(scripts);
+    let xlsUrl=null;
+    if (start) {
+      const rest=scripts.slice(start.index+start[0].length);
+      const block=rest.split(/\bfunction\s+\w+\s*\(/,1)[0];
+      const match=/window\.open\s*\(\s*["']([^"']+)["']/.exec(block);
+      if (match) {
+        const candidate=match[1];
+        if (!/^https:\/\/familia\.pjud\.cl\/sitfa\/reportes\/[A-Za-z0-9_-]+\.xls$/.test(candidate))
+          throw new Error("estructura");
+        if (payload.template && typeof payload.template==="string") {
+          const u=new URL(candidate);
+          if (!u.pathname.endsWith("_"+payload.template+".xls")) throw new Error("estructura");
+        }
+        xlsUrl=candidate;
+      }
+    }
+    const htmlPayload={status:htmlResp.status,type:htmlType,body:toBase64(htmlBytes)};
+    if (!xlsUrl) return {html:htmlPayload,excel:null};
+    const xlsResp=await fetch(xlsUrl,{method:"GET",credentials:"include",cache:"no-store",redirect:"error",
+      signal:AbortSignal.timeout(timeoutMs)});
+    const xlsBytes=await boundedBytes(xlsResp,80*1024*1024);
+    if(xlsResp.status!==200||!xlsBytes.length)throw new Error("sesion");
+    return {
+      html:htmlPayload,
+      excel:{status:xlsResp.status,type:xlsResp.headers.get("content-type")||"",url:xlsUrl,body:toBase64(xlsBytes)},
+    };
+  }
   let url,init;
   if (command === "search") {
     const pairs=payload.pairs;
@@ -435,9 +479,7 @@ async function sitfaTask(command, payload) {
     signal:AbortSignal.timeout(Math.min(payload.timeout||60000,60000))});
   const bytes=await boundedBytes(response,80*1024*1024);
   if(response.status!==200||!bytes.length)throw new Error("sesion");
-  const chunks=[];
-  for (let i=0;i<bytes.length;i+=32768) chunks.push(String.fromCharCode(...bytes.subarray(i,i+32768)));
-  return {status:response.status,type:response.headers.get("content-type")||"",body:btoa(chunks.join(""))};
+  return {status:response.status,type:response.headers.get("content-type")||"",body:toBase64(bytes)};
   } catch (error) {
     if(command==="evidence_open"||command==="evidence_show") {
       const motivo=["estructura","sesion","cambio","pantalla","tiempo"].includes(error?.message)?error.message:"pagina";

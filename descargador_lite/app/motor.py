@@ -7,6 +7,7 @@ Informes por vencer y Medidas por vencer. No accede a cookies, contrasenas o per
 from __future__ import annotations
 
 import ast
+from concurrent.futures import ThreadPoolExecutor
 from html import unescape
 from collections import Counter
 from dataclasses import dataclass
@@ -616,7 +617,7 @@ def verify_month(info, profile):
         raise PocError('No se pudieron comprobar todas las fechas del calendario XLS.')
 
 
-def save_exclusive(path, data):
+def save_exclusive(path, data, sync=True):
     # No sobrescribe descargas anteriores. El archivo se conserva solo si fue escrito completo.
     created = False
     try:
@@ -624,7 +625,8 @@ def save_exclusive(path, data):
             created = True
             f.write(data)
             f.flush()
-            os.fsync(f.fileno())
+            if sync:
+                os.fsync(f.fileno())
     except FileExistsError:
         raise PocError("Ya existe el archivo de destino; usar una ejecucion nueva.") from None
     except OSError as exc:
@@ -681,10 +683,13 @@ def run_sequence(
     filename_factory=None,
     manifest_name="verificacion.json",
     pause=0.0,
+    initial_excel=None,
+    adaptive_pause=False,
+    fast_fsync=False,
 ):
-    """POST(n) -> XLS(n) -> validar -> fsync -> POST(n+1). Sin reintentos silenciosos.
+    """POST(n) -> XLS(n) -> validar/guardar en paralelo con POST(n+1). Sin reintentos silenciosos.
 
-    `pause` (segundos) se espera antes de cada POST de página siguiente, para no saturar SITFA."""
+    `pause` (segundos) se espera antes de cada POST de página siguiente (descontando latencia si `adaptive_pause`)."""
     total = initial_page.total
     original = invariant(initial_pairs)
     pairs = list(initial_pairs)
@@ -696,66 +701,110 @@ def run_sequence(
     def manifest(state):
         write_manifest(folder, results, total, state, profile, manifest_name)
 
+    def process_page(number, current, content, filename):
+        info, digest = verified_download(content, current, digests, record_sets, profile)
+        path = folder / filename
+        save_exclusive(path, content, sync=not fast_fsync)
+        # Verifica el archivo que efectivamente quedo en disco sin reparsear el Excel.
+        saved = path.read_bytes()
+        if saved != content:
+            raise PocError("El archivo guardado no coincide con la descarga validada.")
+        digests.add(digest)
+        record_sets.append(excel_record_rows(info))
+        item = {
+            "pagina": number,
+            "total": total,
+            "archivo": filename,
+            "bytes": len(saved),
+            "sha256": digest,
+            "formato": info.format,
+            "registros": sum(info.records.values()),
+            "coincide_con_html": True,
+            "estado": "OK",
+        }
+        results.append(item)
+        manifest("EN_CURSO")
+        return item
+
     manifest("EN_CURSO")
+    use_combined = hasattr(transport, "search_and_download") and getattr(
+        transport, "supports_search_and_download", True
+    )
+    last_net_elapsed = 0.0
     try:
-        for number in range(1, total + 1):
-            if cancel is not None and cancel.is_set():
-                raise PocError("Descarga cancelada. Las paginas ya verificadas se conservan.")
-            pairs = [(k, str(number) if k == profile.page_field else pagination.get(k, v)) for k, v in pairs]
-            if invariant(pairs) != original:
-                raise PocError("Cambio la consulta entre paginas; descarga detenida.")
-            query_pairs(urlencode(pairs), profile)
-            if number == 1:
-                # El llamador ya hizo y validó el POST inicial. SITFA reutiliza
-                # el XLS temporal: descargarlo antes de pedir otra página.
-                current = initial_page
-                if current.current != 1 or not current.records:
-                    raise PocError("La consulta inicial no corresponde a la primera pagina.")
-                validate_export_url(current.excel_url, profile)
-            else:
-                if pause > 0:
-                    if cancel is None:
-                        time.sleep(pause)
-                    elif cancel.wait(pause):
-                        raise PocError("Descarga cancelada. Las paginas ya verificadas se conservan.")
-                body = transport.search(pairs, timeout_ms)
-                current = search_page(body, pairs, number, total, profile)
-            pagination = current.pagination
-            # La URL original se usa solo en memoria. No se escribe en manifiestos o logs.
-            content = transport.download(current.excel_url, timeout_ms)
-            info, digest = verified_download(content, current, digests, record_sets, profile)
-            # El nombre reproduce lo solicitado sin identificador de usuario del servidor.
-            filename = (
-                filename_factory(number, total)
-                if filename_factory
-                else f"{now():%Y-%m-%d}_{profile.filename_prefix}_P{number:02}.xls"
-            )
-            if Path(filename).name != filename or not filename.endswith('.xls'):
-                raise PocError("Nombre de archivo fuera de alcance.")
-            path = folder / filename
-            save_exclusive(path, content)
-            # Verifica el archivo que efectivamente quedo en disco antes del siguiente POST.
-            saved = path.read_bytes()
-            if saved != content or verified_download(saved, current, set(), [], profile)[0].records != current.records:
-                raise PocError("El archivo guardado no coincide con la descarga validada.")
-            digests.add(digest)
-            record_sets.append(excel_record_rows(info))
-            results.append(
-                {
-                    "pagina": number,
-                    "total": total,
-                    "archivo": filename,
-                    "bytes": len(saved),
-                    "sha256": digest,
-                    "formato": info.format,
-                    "registros": sum(info.records.values()),
-                    "coincide_con_html": True,
-                    "estado": "OK",
-                }
-            )
-            manifest("EN_CURSO")
-            if progress is not None:
-                progress(results[-1], folder)
+        pending_future = None
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            for number in range(1, total + 1):
+                if cancel is not None and cancel.is_set():
+                    if pending_future is not None:
+                        pending_future.result()
+                    raise PocError("Descarga cancelada. Las paginas ya verificadas se conservan.")
+                pairs = [(k, str(number) if k == profile.page_field else pagination.get(k, v)) for k, v in pairs]
+                if invariant(pairs) != original:
+                    raise PocError("Cambio la consulta entre paginas; descarga detenida.")
+                query_pairs(urlencode(pairs), profile)
+                if number == 1:
+                    # El llamador ya hizo y validó el POST inicial. SITFA reutiliza
+                    # el XLS temporal: descargarlo antes de pedir otra página.
+                    current = initial_page
+                    if current.current != 1 or not current.records:
+                        raise PocError("La consulta inicial no corresponde a la primera pagina.")
+                    validate_export_url(current.excel_url, profile)
+                    if initial_excel is not None:
+                        content = initial_excel
+                    else:
+                        t0 = time.monotonic()
+                        content = transport.download(current.excel_url, timeout_ms)
+                        last_net_elapsed = time.monotonic() - t0
+                else:
+                    wait_s = max(0.0, pause - last_net_elapsed) if adaptive_pause else pause
+                    if wait_s > 0:
+                        if cancel is None:
+                            time.sleep(wait_s)
+                        elif cancel.wait(wait_s):
+                            raise PocError("Descarga cancelada. Las paginas ya verificadas se conservan.")
+                    if pending_future is not None and pending_future.done():
+                        done_item = pending_future.result()
+                        if progress is not None:
+                            progress(done_item, folder)
+                        pending_future = None
+                    t0 = time.monotonic()
+                    if use_combined:
+                        body, content = transport.search_and_download(
+                            pairs, timeout_ms, template=profile.excel_template
+                        )
+                        current = search_page(body, pairs, number, total, profile)
+                        if content is None:
+                            raise PocError("SITFA no entrego el archivo Excel de la pagina.")
+                    else:
+                        body = transport.search(pairs, timeout_ms)
+                        current = search_page(body, pairs, number, total, profile)
+                        # La URL original se usa solo en memoria. No se escribe en manifiestos o logs.
+                        content = transport.download(current.excel_url, timeout_ms)
+                    last_net_elapsed = time.monotonic() - t0
+                pagination = current.pagination
+                # El nombre reproduce lo solicitado sin identificador de usuario del servidor.
+                filename = (
+                    filename_factory(number, total)
+                    if filename_factory
+                    else f"{now():%Y-%m-%d}_{profile.filename_prefix}_P{number:02}.xls"
+                )
+                if Path(filename).name != filename or not filename.endswith('.xls'):
+                    raise PocError("Nombre de archivo fuera de alcance.")
+                if pending_future is not None:
+                    done_item = pending_future.result()
+                    if progress is not None:
+                        progress(done_item, folder)
+                    pending_future = None
+                pending_future = pool.submit(process_page, number, current, content, filename)
+            if pending_future is not None:
+                done_item = pending_future.result()
+                if progress is not None:
+                    progress(done_item, folder)
+        if fast_fsync:
+            for item in results:
+                with (folder / item["archivo"]).open("r+b") as f:
+                    os.fsync(f.fileno())
         if len(results) != total or any(not (folder / item['archivo']).is_file() for item in results):
             raise PocError("La cantidad de XLS no coincide con el total de paginas.")
         manifest("VALIDADA")

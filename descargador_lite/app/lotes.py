@@ -180,9 +180,16 @@ class Batch:
 
 
 class ChromeTransport:
-    def __init__(self, bridge, profile):
+    def __init__(self, bridge, profile, capabilities=None):
         self.bridge = bridge
         self.profile = profile
+        self.capabilities = capabilities if isinstance(capabilities, dict) else {}
+        self.last_excel_url = None
+
+    @property
+    def supports_search_and_download(self):
+        protos = self.capabilities.get('protocolos')
+        return isinstance(protos, dict) and protos.get('search_and_download') == 1
 
     @staticmethod
     def body(result, excel=False):
@@ -210,6 +217,28 @@ class ChromeTransport:
         m.validate_export_url(url, self.profile)
         return self.body(self.bridge.call('download', {'url': url, 'timeout': timeout_ms}), True)
 
+    def search_and_download(self, pairs, timeout_ms, template=None):
+        m.query_pairs(urlencode(pairs), self.profile)
+        payload = {'pairs': pairs, 'timeout': timeout_ms}
+        if template:
+            payload['template'] = template
+        result = self.bridge.call('search_and_download', payload)
+        if not isinstance(result, dict):
+            raise m.PocError('Respuesta vacía, vencida o fuera del formato permitido.')
+        html_bytes = self.body(result.get('html'))
+        excel_raw = result.get('excel')
+        self.last_excel_url = None
+        if excel_raw is None:
+            return html_bytes, None
+        if not isinstance(excel_raw, dict):
+            raise m.PocError('Respuesta vacía, vencida o fuera del formato permitido.')
+        excel_url = excel_raw.get('url')
+        if excel_url is not None:
+            prof = None if getattr(self.profile, 'excel_template', None) == 'pendiente' else self.profile
+            m.validate_export_url(excel_url, prof)
+            self.last_excel_url = excel_url
+        return html_bytes, self.body(excel_raw, True)
+
 
 def evidence_context(selection, catalog, dates):
     context = [['Tribunal', catalog['tribunales'][selection.tribunal] + ' (código ' + selection.tribunal + ')']]
@@ -230,9 +259,11 @@ def evidence_context(selection, catalog, dates):
 
 
 class BatchRunner:
-    def __init__(self, bridge, catalog, emit, cancel, pause=0.0, evidencia=True):
+    def __init__(self, bridge, catalog, emit, cancel, pause=0.0, evidencia=True, modo_rapido=False, capabilities=None):
         self.bridge = bridge
         self.evidencia = bool(evidencia)
+        self.modo_rapido = bool(modo_rapido)
+        self.capabilities = capabilities
         self.catalog = catalog
         self.emit = emit
         self.cancel = cancel
@@ -293,6 +324,13 @@ class BatchRunner:
             temp.replace(folder / 'resumen.json')
 
         summary()
+        caps = self.capabilities
+        if caps is None:
+            try:
+                res = self.bridge.call('capabilities')
+                caps = res if isinstance(res, dict) else {}
+            except Exception:
+                caps = {}
         locked = False
         try:
             self.bridge.call('lock')
@@ -339,10 +377,16 @@ class BatchRunner:
                         or fields.get('CHK_Consulta') != 'on'
                     ):
                         raise m.PocError('Las fechas enviadas no coinciden con la selección.')
-                transport = ChromeTransport(self.bridge, desired)
-                profile, first = response_profile(transport.search(pairs, 60000), pairs, selection, self.catalog)
+                transport = ChromeTransport(self.bridge, desired, capabilities=caps)
+                if transport.supports_search_and_download:
+                    html_bytes, initial_excel = transport.search_and_download(pairs, 60000)
+                else:
+                    html_bytes = transport.search(pairs, 60000)
+                    initial_excel = None
+                profile, first = response_profile(html_bytes, pairs, selection, self.catalog)
                 manifest = f'verificacion {index:03}.json'
                 evidence = None
+                comprobante = None
                 if first is None:
                     self.cancelled()
                     # El pantallazo es opcional: sin él, la consulta vacía igual queda comprobada por SITFA.
@@ -350,6 +394,13 @@ class BatchRunner:
                         evidence = self.capture_empty(
                             selection, profile, pairs, dates, folder, unique(base, ' - SIN REGISTROS.pdf')
                         )
+                    else:
+                        comprobante = {
+                            'tipo': 'JSON_SIN_REGISTROS',
+                            'fecha_hora': m.now().isoformat(),
+                            'sha256_html': hashlib.sha256(html_bytes).hexdigest(),
+                            'contexto_consulta': evidence_context(selection, self.catalog, dates),
+                        }
                     m.write_manifest(folder, [], 0, 'SIN_RESULTADOS', profile, manifest)
                     if evidence:
                         self.emit('evidence', evidence)
@@ -357,6 +408,10 @@ class BatchRunner:
                         self.emit('empty', {'consulta': base})
                     result = []
                 else:
+                    if transport.last_excel_url is not None:
+                        m.validate_export_url(transport.last_excel_url, profile)
+                        if transport.last_excel_url != first.excel_url:
+                            raise m.PocError('El enlace Excel no coincide con la consulta actual.')
                     self.emit('total', first.total)
                     transport.profile = profile
                     names = {}
@@ -378,6 +433,9 @@ class BatchRunner:
                         manifest_name=manifest,
                         filename_factory=filename,
                         progress=lambda item, path: self.emit('progress', {**item, 'consulta': base}),
+                        initial_excel=initial_excel,
+                        adaptive_pause=True,
+                        fast_fsync=self.modo_rapido,
                     )
                 completed.append(
                     {
@@ -397,6 +455,8 @@ class BatchRunner:
                     info['evidencia'] = evidence
                 elif not result:
                     info['evidencia_omitida'] = True
+                    if comprobante is not None:
+                        info['comprobante_sin_registros'] = comprobante
                     completed[-1]['evidencia_omitida'] = True
                 temp = folder / (manifest + '.tmp')
                 temp.write_text(json.dumps(info, indent=2, ensure_ascii=False), encoding='utf-8')

@@ -184,7 +184,7 @@ def test_extension_lite_sin_comandos_excluidos():
         assert banned not in js
     manifest = json.loads((ROOT / 'extension' / 'manifest.json').read_text(encoding='utf-8'))
     assert manifest['permissions'] == ['activeTab', 'scripting']
-    assert manifest['version'] == '1.1.0'
+    assert manifest['version'] == '1.2.0'
 
 
 def test_selector_dinamico_de_vencimiento_sitfa():
@@ -226,3 +226,141 @@ def test_sin_registros_sin_pdf_si_se_desmarca(folder):
     assert manifest['evidencia_omitida'] is True and 'evidencia' not in manifest
     assert ('empty', {'consulta': result[1]['consulta']}) in events
     assert events[-1][1]['empty'] == 1 and events[-1][1]['pdfs'] == 0
+
+
+def test_comprobante_json_sin_pdf_tiene_sha256_html(folder):
+    import hashlib
+
+    bridge = FakeBridge('seguimiento', pages={('902', 'Espera', '1', None): 0})
+    batch = Batch('seguimiento', ('901', '902'), modalities=('1',), tabs=('Espera',))
+    result = BatchRunner(bridge, CATALOGS['seguimiento'], lambda *e: None, PauseGate(), evidencia=False).run(
+        batch, folder
+    )
+    lot = next(folder.iterdir())
+    assert [r['estado'] for r in result] == ['VALIDADA', 'SIN_RESULTADOS']
+    assert names(lot, '.pdf') == []
+    manifest = json.loads((lot / 'verificacion 002.json').read_text(encoding='utf-8'))
+    assert manifest['estado'] == 'SIN_RESULTADOS'
+    assert manifest['evidencia_omitida'] is True
+    comp = manifest['comprobante_sin_registros']
+    assert comp['tipo'] == 'JSON_SIN_REGISTROS'
+    assert isinstance(comp['fecha_hora'], str) and len(comp['fecha_hora']) >= 19
+    assert re.fullmatch(r'[0-9a-f]{64}', comp['sha256_html'])
+    expected_html = bridge.page_html(dict(bridge.prepare(batch.plan(CATALOGS['seguimiento'])[1].__dict__, None))).encode(
+        'utf-8'
+    )
+    assert comp['sha256_html'] == hashlib.sha256(expected_html).hexdigest()
+    assert comp['contexto_consulta'] == [
+        ['Tribunal', 'Juzgado de Familia Ficticio Sur (código 902)'],
+        ['Consulta', 'Seguimiento'],
+        ['Pestaña', 'Espera'],
+        ['Modalidad', 'Residencia'],
+        ['Fechas', 'Sin filtro de fechas'],
+    ]
+
+
+def test_search_and_download_multipagina_y_fallback(folder):
+    batch = Batch(
+        'seguimiento',
+        ('901',),
+        modalities=('2',),
+        tabs=('Cumplimiento',),
+        medidas=('5',),
+        dates=Dates('01/10/2026', '30/10/2026'),
+    )
+    # 1. Extensión 1.2.0: usa search_and_download multipágina sin llamar a search/download sueltos.
+    bridge_fast = FakeBridge('seguimiento', pages={('901', 'Cumplimiento', '2', '5'): 3})
+    dest_fast = folder / 'fast'
+    dest_fast.mkdir()
+    result_fast = BatchRunner(
+        bridge_fast, CATALOGS['seguimiento'], lambda *e: None, PauseGate(), evidencia=False, modo_rapido=True
+    ).run(batch, dest_fast)
+    assert len(result_fast) == 1 and result_fast[0]['paginas'] == 3 and result_fast[0]['registros'] == 9
+    assert bridge_fast.calls.count('search_and_download') == 3
+    assert 'search' not in bridge_fast.calls and 'download' not in bridge_fast.calls
+    lot_fast = next(dest_fast.iterdir())
+    assert len(names(lot_fast, '.xls')) == 3
+
+    # 2. Extensión antigua (1.1.0 sin search_and_download): fallback automático a search + download.
+    class LegacyBridge(FakeBridge):
+        def call(self, command, payload=None, timeout=75):
+            if command == 'capabilities':
+                return {
+                    'tipo': 'SITFA_LITE_CAPACIDADES',
+                    'version': '1.1.0',
+                    'protocolos': {'descarga_xls': 1, 'pdf_sin_registros': 1},
+                    'escritura_rus': False,
+                }
+            if command == 'search_and_download':
+                raise AssertionError('No debe invocar search_and_download en extensión 1.1.0')
+            return super().call(command, payload, timeout)
+
+    bridge_legacy = LegacyBridge('seguimiento', pages={('901', 'Cumplimiento', '2', '5'): 3})
+    dest_legacy = folder / 'legacy'
+    dest_legacy.mkdir()
+    result_legacy = BatchRunner(
+        bridge_legacy, CATALOGS['seguimiento'], lambda *e: None, PauseGate(), evidencia=False
+    ).run(batch, dest_legacy)
+    assert len(result_legacy) == 1 and result_legacy[0]['paginas'] == 3 and result_legacy[0]['registros'] == 9
+    assert 'search_and_download' not in bridge_legacy.calls
+    assert bridge_legacy.calls.count('search') == 3 and bridge_legacy.calls.count('download') == 3
+
+
+def test_pipelining_detecta_error_validacion_en_pagina_anterior(folder):
+    import time
+
+    class BadPage1Bridge(FakeBridge):
+        def call(self, command, payload=None, timeout=75):
+            if command == 'search_and_download':
+                p = dict(payload['pairs'])
+                if self.page(p) == 2:
+                    time.sleep(0.05)
+            return super().call(command, payload, timeout)
+
+        def excel(self, p):
+            if self.page(p) == 1:
+                return b'<html><table><tr><td>RIT</td><td>Nombre</td></tr><tr><td>Z-999-2099</td><td>Persona Alterada</td></tr></table></html>'
+            return super().excel(p)
+
+    bridge = BadPage1Bridge('seguimiento', pages={('901', 'Cumplimiento', '2', '5'): 3})
+    batch = Batch('seguimiento', ('901',), modalities=('2',), tabs=('Cumplimiento',), medidas=('5',))
+    with pytest.raises(m.PocError, match='no coinciden con la pagina HTML'):
+        BatchRunner(bridge, CATALOGS['seguimiento'], lambda *e: None, PauseGate(), evidencia=False).run(batch, folder)
+    lot = next(folder.iterdir())
+    resumen = json.loads((lot / 'resumen.json').read_text(encoding='utf-8'))
+    verif = json.loads((lot / 'verificacion 001.json').read_text(encoding='utf-8'))
+    assert resumen['estado'] == 'INCOMPLETA'
+    assert verif['estado'] == 'INCOMPLETA' and verif['paginas_verificadas'] == 0
+
+
+def test_no_reparsea_xls_al_releer_disco(folder, monkeypatch):
+    read_calls = 0
+    original_read_excel = m.read_excel
+
+    def spy_read_excel(data, record_reader=None):
+        nonlocal read_calls
+        read_calls += 1
+        return original_read_excel(data, record_reader)
+
+    monkeypatch.setattr(m, 'read_excel', spy_read_excel)
+    bridge = FakeBridge('seguimiento', pages={('901', 'Cumplimiento', '2', '5'): 2})
+    batch = Batch('seguimiento', ('901',), modalities=('2',), tabs=('Cumplimiento',), medidas=('5',))
+    dest_ok = folder / 'ok'
+    dest_ok.mkdir()
+    result = BatchRunner(bridge, CATALOGS['seguimiento'], lambda *e: None, PauseGate(), evidencia=False).run(
+        batch, dest_ok
+    )
+    assert result[0]['paginas'] == 2
+    assert read_calls == 2
+
+    # Comprueba que la verificación byte a byte en disco sigue detectando corrupción sin reparsear.
+    orig_read_bytes = Path.read_bytes
+    monkeypatch.setattr(
+        Path, 'read_bytes', lambda self: b'corrupto' if self.suffix == '.xls' else orig_read_bytes(self)
+    )
+    dest_bad = folder / 'bad'
+    dest_bad.mkdir()
+    with pytest.raises(m.PocError, match='no coincide con la descarga validada'):
+        BatchRunner(bridge, CATALOGS['seguimiento'], lambda *e: None, PauseGate(), evidencia=False).run(
+            batch, dest_bad
+        )

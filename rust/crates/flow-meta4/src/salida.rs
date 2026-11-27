@@ -400,6 +400,8 @@ fn celda_matriz(m: &Meta4, clave: (&str, &str, &str)) -> String {
         texto
     } else if fuentes.iter().any(|f| f.tipo == "PDF") {
         "PDF · 0 registros".into()
+    } else if fuentes.iter().any(|f| f.tipo == "JSON") {
+        "JSON · 0 registros".into()
     } else {
         "FALTANTE".into()
     }

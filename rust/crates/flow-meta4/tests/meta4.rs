@@ -505,6 +505,42 @@ fn consulta_vacia_sin_pdf_de_evidencia_queda_faltante() {
     assert!(calcular(&[vacio], dia("2026-10-16"), dia("2026-10-16"), &[]).is_err());
 }
 
+#[test]
+fn fuente_json_sin_registros_se_refleja_en_inventario_y_matriz() {
+    let t = Temporal::nueva();
+    let carpeta = t.0.join("Lote JSON");
+    lote_con_vacia(&carpeta, true);
+    let mut m = calcular(std::slice::from_ref(&carpeta), dia("2026-10-16"), dia("2026-10-16"), &["Yumbel".into()]).unwrap();
+    // Reemplaza la evidencia PDF por un comprobante JSON equivalente (V-JSON-01).
+    for f in m.fuentes.iter_mut().filter(|f| f.tipo == "PDF") {
+        f.archivo = "verificacion 002.json".into();
+        f.tipo = "JSON";
+    }
+    let inv = salida::inventario(&m);
+    assert!(inv.iter().any(|fila| {
+        fila[1].texto() == "verificacion 002.json"
+            && fila[3].texto() == "JSON"
+            && fila[7].entero() == Some(0)
+            && fila[9].texto() == "SIN REGISTROS"
+    }));
+    let mat = salida::matriz(&m);
+    assert!(mat[1][0].texto().starts_with("Cobertura: 2/4 · Faltantes: 2"), "{}", mat[1][0].texto());
+    let destino = t.0.join("Salida JSON");
+    salida::publicar(&m, &destino).unwrap();
+    let libro = flow_tabular::leer(&destino.join("Registros.xlsx")).unwrap();
+    let inventario = libro.hojas.iter().find(|h| h.nombre == "INVENTARIO_ARCHIVOS").unwrap();
+    assert!(inventario.filas.iter().any(|fila| {
+        fila[1].texto() == "verificacion 002.json"
+            && fila[3].texto() == "JSON"
+            && fila[9].texto() == "SIN REGISTROS"
+    }));
+    let matriz = libro.hojas.iter().find(|h| h.nombre == "MATRIZ_COBERTURA").unwrap();
+    let fila = matriz.filas.iter().find(|f| f.first().is_some_and(|c| c.texto() == "YUMBEL")).unwrap();
+    assert_eq!(fila[1].texto(), "JSON · 0 registros");
+    assert_eq!(fila[2].texto(), "EXCEL · 1 registro(s)");
+    assert_eq!(fila[3].texto(), "FALTANTE");
+}
+
 /// M6: Registros.xlsx trae INVENTARIO_ARCHIVOS y MATRIZ_COBERTURA; «Control de lecturas» va por bitácora (también las
 /// que no corresponden a una fila) con RUT y LECTURA; «Observaciones del mes» incluye bitácoras leídas antes del corte.
 #[test]
