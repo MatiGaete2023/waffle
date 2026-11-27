@@ -525,6 +525,11 @@ impl<'a> ReusoConsultas<'a> {
     }
 }
 impl Conexion for ReusoConsultas<'_> {
+    fn ejecutar_distribuido(
+        &self, solicitud: &lote::Solicitud<'_>, emitir: &mut dyn FnMut(EventoLote),
+    ) -> Option<Result<Vec<Value>, String>> {
+        self.real.ejecutar_distribuido(solicitud, emitir)
+    }
     fn llamar(&self, comando: &str, mut payload: Value, plazo: Duration) -> Result<Value, String> {
         let fase = self.fase.get();
         if fase < 2 && matches!(comando, "lock" | "search" | "search_and_download" | "unlock") {
@@ -631,6 +636,7 @@ fn correr(
             let mut relé = |evento: EventoLote| match evento {
                 EventoLote::Carpeta(c) => carpeta = Some(c),
                 EventoLote::Aviso(a) => emitir(Evento::Aviso(a)),
+                EventoLote::Estado(t) => emitir(Evento::Estado(t)),
                 EventoLote::Consulta { indice, total, etiqueta } => {
                     emitir(Evento::Estado(format!("Consultando {indice} de {total}: {etiqueta}")))
                 }
@@ -1905,6 +1911,72 @@ pub(crate) mod pruebas {
         assert!(diferencias.is_empty(), "{}", diferencias.join("\n"));
         assert_eq!((casos.len(), paquetes), (4, 6), "conteos del orÃ¡culo por hoja");
         println!("oraculo por hoja: {} casos, {paquetes} paquetes", casos.len());
+    }
+
+    #[test]
+    fn multiventana_conserva_el_paquete_con_todas_las_fuentes_y_su_rango() {
+        use crate::descargador::multiventana;
+        use std::sync::Mutex;
+
+        struct Pestaña(Mutex<Doble>);
+        impl Conexion for Pestaña {
+            fn llamar(&self, comando: &str, carga: Value, plazo: Duration) -> Result<Value, String> {
+                self.0.lock().unwrap().llamar(comando, carga, plazo)
+            }
+        }
+        struct Tres {
+            principal: Doble,
+            listados: [Pestaña; 3],
+        }
+        impl Conexion for Tres {
+            fn llamar(&self, comando: &str, carga: Value, plazo: Duration) -> Result<Value, String> {
+                self.principal.llamar(comando, carga, plazo)
+            }
+            fn ejecutar_distribuido(
+                &self, solicitud: &lote::Solicitud<'_>, emitir: &mut dyn FnMut(EventoLote),
+            ) -> Option<Result<Vec<Value>, String>> {
+                let n = solicitud.plan.consultas.len().min(3);
+                let canales: Vec<multiventana::Canal<'_>> = self.listados[..n].iter()
+                    .map(|p| (p as &(dyn Conexion + Sync), solicitud.catalogo.clone())).collect();
+                Some(multiventana::ejecutar_preparado(&canales, &multiventana::repartir(solicitud.plan, n), solicitud, emitir))
+            }
+        }
+        let fechas = Some(("2026-10-01".parse().unwrap(), "2026-11-27".parse().unwrap()));
+        let catalogo: Catalogo = serde_json::from_value(catalogo_json("seguimiento")).unwrap();
+        let lote = SeleccionLote {
+            tribunales: vec!["901".into()], pestanas: vec!["Cumplimiento".into()], modalidades: vec!["2".into()],
+            medidas: vec![TODAS_LAS_MEDIDAS.into(), "4".into(), "5".into()], fechas, ..Default::default()
+        };
+        let plan = catalogo.planificar(Edicion::Integral, &lote).unwrap();
+        let alcance = LoteBitacoras {
+            tribunales: lote.tribunales, modalidades: lote.modalidades, pestanas: lote.pestanas, fechas,
+        };
+        let op = Opciones {
+            pausa: Duration::ZERO, pdf_vacias: false, calendarios: true, historia: true, historico: true,
+            informes: true, fecha_informes: "2026-11-27".parse().unwrap(),
+            rapido: super::super::preferencias::Rapido { activado: true, pausa_ms: 150, concurrencia: 3 },
+            ..Default::default()
+        };
+        let tres = Tres {
+            principal: Doble::nuevo(), listados: std::array::from_fn(|_| Pestaña(Mutex::new(Doble::nuevo()))),
+        };
+        let base = carpeta("multiventana-paquete");
+        let ejecutar_en = |conexion: &dyn Conexion, nombre: &str| ejecutar(
+            conexion, &catalogo, Edicion::Integral, &plan, &alcance, &base.join(nombre), &op,
+            &AtomicBool::new(false), &mut |_| {},
+        ).unwrap();
+        let uno = ejecutar_en(&Doble::nuevo(), "uno");
+        let tres = ejecutar_en(&tres, "tres");
+        let listados = paquete::cargar_lote(&tres.consultas).unwrap();
+        assert_eq!(listados.resumen["pestanas_conectadas"], 3);
+        assert_eq!(listados.consultas.len(), 3);
+        assert_eq!(rango_comprobado_lote(&tres.consultas, &listados.resumen).unwrap(), fechas);
+        assert_eq!(uno.parcial, tres.parcial);
+        let a = zip(uno.paquete.parent().unwrap()).unwrap();
+        let b = zip(tres.paquete.parent().unwrap()).unwrap();
+        let (a, b) = normalizar_zip(&a, &b);
+        assert_eq!(a, b, "el paquete distribuido debe conservar la cobertura y las tablas del habitual");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Una sola hoja en el flujo por hoja debe dar lo mismo que `run`: mismas fases, proceso y ZIP.

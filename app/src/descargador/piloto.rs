@@ -74,7 +74,7 @@ fn repartir(plan: &PlanLote, n: usize) -> Result<Vec<PlanLote>, String> {
     Ok(partes)
 }
 
-fn registrar_documento(
+pub(super) fn registrar_documento(
     capacidades: &Value,
     documentos: &mut BTreeSet<String>,
 ) -> Result<(), String> {
@@ -82,7 +82,7 @@ fn registrar_documento(
     let doc = capacidades["documento_piloto"]
         .as_str()
         .filter(|s| !s.is_empty() && s.len() <= 128)
-        .ok_or("Actualiza y recarga la extensión Integral 2.11.1 en Chrome para usar el piloto.")?;
+        .ok_or("Actualiza y recarga la extensión Integral 2.11.1 en Chrome para usar varias pestañas.")?;
     if documentos.insert(doc.to_owned()) {
         Ok(())
     } else {

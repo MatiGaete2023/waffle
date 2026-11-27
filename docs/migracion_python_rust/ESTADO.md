@@ -15,6 +15,14 @@ Los tres encargos se integraron sobre `a34eddb`. Falta confirmar la CI del conju
 
 La revisión posterior corrigió la persistencia de contactos durante trabajos en segundo plano, la compatibilidad de Lite con Chrome 1.1.0 y la habilitación de lecturas y registro de versión en Integral. Queda por validar el cambio de modo en descarga conjunta y la cancelación durante una descarga en curso.
 
+## Descarga con tres pestañas
+
+El usuario confirmó el piloto de Seguimiento con tres pestañas. En «1. Conexión y Alcance» → «Descarga con tres pestañas», activa el modo y conecta un código distinto por pestaña con la extensión Integral 2.11.1. Usa «Descargar lote», «Consultar y crear paquete» o «Descarga conjunta CSMP» como de costumbre.
+
+Los listados compatibles de Seguimiento, Litigantes, Calendario de informes, Calendario de medidas y Carga se reparten por consultas completas. El resultado tiene un solo resumen de Flow, con el alcance, los originales y los comprobantes verificados. Si una pestaña falla, el lote queda incompleto y se conservan las consultas y los archivos recuperables.
+
+Las bitácoras, historia e histórico de Protección y los calendarios asociados a una causa mantienen la sesión principal y su concurrencia de lectura. Los listados con captura PDF o filtros adicionales del formulario se hacen en la pestaña principal. Falta validar en SITFA real las pantallas y fases que se añadieron después del piloto.
+
 ## Piloto de tres pestañas · Seguimiento
 
 En Descargador → Ejecución y Paquete → «Piloto · tres pestañas de Seguimiento», la extensión Integral 2.11.1 permite medir un mismo plan con una y con tres pestañas. Elige al menos tres consultas, abre Seguimiento en las tres pestañas y pega un código de conexión distinto en cada una. La primera usa la conexión de Alcance. Corre primero «Medir con una pestaña» y luego «Ejecutar con tres pestañas» con las mismas fechas, alcance y pausa. Pulsa «Comparar con la última medición de una pestaña». Cada medición se guarda como conjunto con las fases del lote.

@@ -32,6 +32,13 @@ const CANCELADO_PAGINAS: &str = "Descarga cancelada. Las paginas ya verificadas 
 
 /// Orden local hacia la extensión. `Puente` la implementa; las pruebas usan un SITFA ficticio.
 pub trait Conexion {
+    /// Los motores que envuelven un puente pueden ejecutar un lote en varias pestañas independientes.
+    fn ejecutar_distribuido(
+        &self, _solicitud: &Solicitud<'_>, _emitir: &mut dyn FnMut(Evento),
+    ) -> Option<Result<Vec<Value>, String>> {
+        None
+    }
+
     fn llamar(&self, comando: &str, payload: Value, plazo: Duration) -> Result<Value, String>;
     /// E-Q3: el puente real solo acepta las lecturas de contexto tras verificar la extensión Integral.
     fn habilitar_lecturas(&self, _integral: bool) {}
@@ -53,6 +60,15 @@ impl Conexion for Puente {
     fn soporta_search_and_download(&self) -> bool {
         Puente::soporta_search_and_download(self)
     }
+}
+
+pub struct Solicitud<'a> {
+    pub catalogo: &'a Catalogo,
+    pub edicion: Edicion,
+    pub plan: &'a PlanLote,
+    pub destino: &'a Path,
+    pub opciones: &'a Opciones,
+    pub cancelar: &'a AtomicBool,
 }
 
 #[derive(Clone, Debug)]
@@ -159,7 +175,7 @@ pub fn nombre_tribunal(valor: &str) -> String {
     v
 }
 
-fn fecha_sitfa(d: NaiveDate) -> String {
+pub(super) fn fecha_sitfa(d: NaiveDate) -> String {
     d.format("%d/%m/%Y").to_string()
 }
 
@@ -403,7 +419,7 @@ fn contexto_integral(perfil: &Perfil, catalogo: &Catalogo, fechas: Option<(Naive
     c
 }
 
-fn ahora() -> String {
+pub(super) fn ahora() -> String {
     chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, false)
 }
 
@@ -952,7 +968,7 @@ pub struct Pendientes {
     pub fechas: Option<(NaiveDate, NaiveDate)>,
 }
 
-fn sin_fecha_descarga(v: &Value) -> Value {
+pub(super) fn sin_fecha_descarga(v: &Value) -> Value {
     let mut v = v.clone();
     if let Some(o) = v.as_object_mut() {
         o.remove("fecha_descarga");
@@ -1055,6 +1071,30 @@ pub(super) fn validar_fechas_formulario(
     Ok(())
 }
 
+/// Selecciones del plan que se registran en el resumen y en las verificaciones.
+pub(super) fn selecciones_plan(plan: &PlanLote, catalogo: &Catalogo, edicion: Edicion) -> Vec<Value> {
+    let integral = edicion == Edicion::Integral;
+    plan
+        .consultas
+        .iter()
+        .map(|p| {
+            let mut s = seleccion_edicion(p, edicion);
+            s["tribunal_nombre"] = json!(etiqueta(&catalogo.tribunales, &p.tribunal));
+            if integral {
+                let modalidad = match &p.alcance {
+                    Alcance::Seguimiento { modalidad, .. } => modalidad.as_str(),
+                    _ => "",
+                };
+                s["modalidad_nombre"] = json!(MODALIDADES_LITE.iter().find(|(c, _)| *c == modalidad).map_or("", |(_, n)| n));
+                s["fecha_descarga"] = json!(ahora());
+            } else {
+                s["etiquetas"] = json!(partes_consulta(p, catalogo, plan.fechas));
+            }
+            s
+        })
+        .collect()
+}
+
 /// Ejecuta el plan en una carpeta nueva dentro de `destino`. Devuelve las consultas completadas.
 #[allow(clippy::too_many_arguments)]
 pub fn ejecutar(
@@ -1076,6 +1116,12 @@ pub fn ejecutar(
     }
     if plan.fechas.is_some_and(|(a, b)| a > b) {
         return Err("El rango de fechas está invertido (fecha inicial posterior a la final).".into());
+    }
+    if integral && !opciones.evidencia && !opciones.conservar_filtros && plan.consultas.len() > 1 {
+        let solicitud = Solicitud { catalogo, edicion, plan, destino, opciones, cancelar };
+        if let Some(resultado) = conexion.ejecutar_distribuido(&solicitud, emitir) {
+            return resultado;
+        }
     }
     let consultas: Vec<Consulta> = plan.consultas.iter().map(Consulta::desde).collect::<Result<_, _>>()?;
     let carpeta = carpeta_nueva(destino)?;
@@ -1117,25 +1163,7 @@ pub fn ejecutar(
             base.to_string()
         }
     };
-    let planificadas: Vec<Value> = plan
-        .consultas
-        .iter()
-        .map(|p| {
-            let mut s = seleccion_edicion(p, edicion);
-            s["tribunal_nombre"] = json!(etiqueta(&catalogo.tribunales, &p.tribunal));
-            if integral {
-                let modalidad = match &p.alcance {
-                    Alcance::Seguimiento { modalidad, .. } => modalidad.as_str(),
-                    _ => "",
-                };
-                s["modalidad_nombre"] = json!(MODALIDADES_LITE.iter().find(|(c, _)| *c == modalidad).map_or("", |(_, n)| n));
-                s["fecha_descarga"] = json!(ahora());
-            } else {
-                s["etiquetas"] = json!(partes_consulta(p, catalogo, plan.fechas));
-            }
-            s
-        })
-        .collect();
+    let planificadas = selecciones_plan(plan, catalogo, edicion);
     let mut completadas: Vec<Value> = Vec::new();
     let filtro_fecha = plan.fechas.map(|(a, b)| json!({"start": fecha_sitfa(a), "end": fecha_sitfa(b)}));
     let resumen = |estado: &str, completadas: &[Value]| -> Result<(), String> {

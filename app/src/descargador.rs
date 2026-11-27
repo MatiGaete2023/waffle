@@ -17,6 +17,7 @@ pub mod lecturas;
 pub mod vinculos;
 pub mod lote;
 pub mod meta4;
+pub mod multiventana;
 pub mod excel;
 pub mod paquete;
 pub mod piloto;

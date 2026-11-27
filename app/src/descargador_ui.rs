@@ -82,7 +82,7 @@ fn evento_conjunto(evento: Evento) -> String {
 }
 
 impl FlujoConjunto {
-    fn lanzar(&mut self, ctx: &egui::Context, puente: Arc<Puente>, destino: PathBuf, tribunales: Vec<String>, modalidades: Vec<String>, modo: String, fecha: chrono::NaiveDate, dias: u32, recuperar: Option<PathBuf>, pausa: f32) {
+    fn lanzar(&mut self, ctx: &egui::Context, puente: Arc<Puente>, conexion: Arc<dyn lote::Conexion + Send + Sync>, destino: PathBuf, tribunales: Vec<String>, modalidades: Vec<String>, modo: String, fecha: chrono::NaiveDate, dias: u32, recuperar: Option<PathBuf>, pausa: f32) {
         let (envio, recepcion) = mpsc::channel();
         let cancelar = Arc::new(AtomicBool::new(false));
         self.recepcion = Some(recepcion);
@@ -91,7 +91,7 @@ impl FlujoConjunto {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let opciones = lote::Opciones { pausa: Duration::from_secs_f64(preferencias::limitar_pausa(f64::from(pausa))), ..Default::default() };
-            let resultado = puente.verificar(Edicion::Integral).and_then(|_| flow_rust::descargador::flujo_csmp::ejecutar(puente.as_ref(), &tribunales, &modalidades, &modo, &destino, fecha, dias, recuperar.as_deref(), &opciones, &cancelar, &mut |evento| {
+            let resultado = puente.verificar(Edicion::Integral).and_then(|_| flow_rust::descargador::flujo_csmp::ejecutar(conexion.as_ref(), &tribunales, &modalidades, &modo, &destino, fecha, dias, recuperar.as_deref(), &opciones, &cancelar, &mut |evento| {
                 let _ = envio.send(Ok(evento_conjunto(evento)));
                 ctx.request_repaint();
             }));
@@ -100,7 +100,7 @@ impl FlujoConjunto {
         });
     }
 
-    fn retomar(&mut self, ctx: &egui::Context, puente: Arc<Puente>, carpeta: PathBuf, pausa: f32) -> Result<(), String> {
+    fn retomar(&mut self, ctx: &egui::Context, puente: Arc<Puente>, conexion: Arc<dyn lote::Conexion + Send + Sync>, carpeta: PathBuf, pausa: f32) -> Result<(), String> {
         let datos: Value = serde_json::from_slice(&std::fs::read(carpeta.join("flujo.json")).map_err(|e| e.to_string())?).map_err(|_| "Resumen JSON inválido.")?;
         let seleccion = &datos["seleccion"];
         let lista = |k: &str| -> Result<Vec<String>, String> { seleccion[k].as_array().ok_or("Resumen JSON inválido.")?.iter().map(|v| v.as_str().map(str::to_owned).ok_or_else(|| "Resumen JSON inválido.".into())).collect() };
@@ -109,7 +109,7 @@ impl FlujoConjunto {
         let modo = seleccion["modo"].as_str().ok_or("Resumen JSON inválido.")?.to_string();
         let fecha = chrono::NaiveDate::parse_from_str(seleccion["corte"].as_str().ok_or("Resumen JSON inválido.")?, "%Y-%m-%d").map_err(|_| "Resumen JSON inválido.")?;
         let dias = seleccion["dias_firmas"].as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(60);
-        self.lanzar(ctx, puente, carpeta.clone(), tribunales, modalidades, modo, fecha, dias, Some(carpeta), pausa);
+        self.lanzar(ctx, puente, conexion, carpeta.clone(), tribunales, modalidades, modo, fecha, dias, Some(carpeta), pausa);
         Ok(())
     }
 
@@ -1007,6 +1007,7 @@ impl Ejecucion {
         &mut self,
         ctx: &egui::Context,
         puente: Arc<Puente>,
+        conexion: Arc<dyn lote::Conexion + Send + Sync>,
         edicion: Edicion,
         catalogo: Catalogo,
         plan: PlanLote,
@@ -1051,7 +1052,7 @@ impl Ejecucion {
             };
             let resultado = puente.verificar(edicion).and_then(|()| {
                 lote::ejecutar(
-                    puente.as_ref(),
+                    conexion.as_ref(),
                     &catalogo,
                     edicion,
                     &plan,
@@ -1076,14 +1077,14 @@ impl Ejecucion {
         plan: Option<&PlanLote>,
         plan_visible: Option<&PlanLote>,
         puente: Option<Arc<Puente>>,
+        conexion: Option<Arc<dyn lote::Conexion + Send + Sync>>,
         remoto: bool,
         lote: &SeleccionLote,
         opciones_paquete: flujo_paquete::Opciones,
     ) {
         let conectado = puente.as_ref().is_some_and(|b| b.conectado());
-        let conexion: Option<Arc<dyn lote::Conexion + Send + Sync>> = puente.clone().map(|p| p as Arc<dyn lote::Conexion + Send + Sync>);
         let disponible_flujo = conectado && edicion == Edicion::Integral && remoto && !self.activa() && !self.contexto.activa();
-        self.flujo.mostrar(ui, p, disponible_flujo, catalogo, lote, plan_visible, &self.destino, f64::from(self.pausa), opciones_paquete, conexion);
+        self.flujo.mostrar(ui, p, disponible_flujo, catalogo, lote, plan_visible, &self.destino, f64::from(self.pausa), opciones_paquete, conexion.clone());
         ui.add_space(8.0);
         theme::seccion(ui, p, "Avanzado · pasos sueltos");
         let activa = self.activa();
@@ -1150,8 +1151,8 @@ impl Ejecucion {
                 let listo = impedimento.is_none();
                 let boton = ui.add_enabled_ui(listo, |ui| theme::primary(ui, p, "Descargar lote")).inner;
                 if boton.clicked() {
-                    if let (Some(puente), Some(plan)) = (puente.clone(), plan) {
-                        self.iniciar(ui.ctx(), puente, edicion, catalogo.clone(), plan.clone());
+                    if let (Some(puente), Some(conexion), Some(plan)) = (puente.clone(), conexion.clone(), plan) {
+                        self.iniciar(ui.ctx(), puente, conexion, edicion, catalogo.clone(), plan.clone());
                     }
                 }
                 if let Some(texto) = impedimento {
@@ -1460,7 +1461,7 @@ impl Descargador {
         self.piloto.recibir();
         if let Some(carpeta) = flow_rust::descargador::flujo_csmp::tomar_solicitud() {
             if let Some(puente) = self.conexion.puente.clone().filter(|p| p.conectado() && self.conjunta.recepcion.is_none() && !self.piloto.activo() && !self.ejecucion.activa() && !self.ejecucion.contexto.activa() && !self.ejecucion.flujo.activa()) {
-                if let Err(error) = self.conjunta.retomar(ui.ctx(), puente, carpeta, self.ejecucion.pausa) { self.conjunta.mensajes.push(error); }
+                if let Err(error) = self.conjunta.retomar(ui.ctx(), puente.clone(), self.piloto.conexion(puente), carpeta, self.ejecucion.pausa) { self.conjunta.mensajes.push(error); }
             } else {
                 self.conjunta.mensajes.push("Conecta Chrome y termina la operación actual antes de retomar un flujo.".into());
             }
@@ -1496,7 +1497,12 @@ impl Descargador {
                 theme::seccion(ui, p, "1. Alcance y filtros");
                 theme::card(p).show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.add_enabled_ui(!ejecutando, |ui| self.mostrar_perfiles(ui, p));
+                    ui.add_enabled_ui(!ejecutando, |ui| {
+                        self.mostrar_perfiles(ui, p);
+                        if self.edicion == Edicion::Integral {
+                            self.piloto.mostrar_conexiones(ui, p);
+                        }
+                    });
                 });
                 if let Some(catalogo) = &self.catalogo {
                     if catalogo.pantalla != Pantalla::Carga || self.edicion == Edicion::Integral {
@@ -1721,6 +1727,7 @@ impl Descargador {
                                     plan,
                                     plan_visible,
                                     self.conexion.puente.clone(),
+                                    self.conexion.puente.clone().map(|puente| self.piloto.conexion(puente)),
                                     self.catalogo_remoto,
                                     &self.lote,
                                     opciones_paquete,
@@ -1753,12 +1760,12 @@ impl Descargador {
                             } else if !matches!(rango_visible(Pantalla::Seguimiento, &self.lote_desde, &self.lote_hasta, self.todas_las_fechas), Ok(None)) {
                                 self.conjunta.mensajes.push("La descarga conjunta CSMP usa todas las fechas. Marca esa opción expresamente o utiliza Consultar y crear paquete para un rango de ingresos.".into());
                             } else if let Some(puente) = self.conexion.puente.clone() {
-                                self.conjunta.lanzar(ui.ctx(), puente, PathBuf::from(&self.ejecucion.destino), self.lote.tribunales.clone(), self.lote.modalidades.clone(), self.lote.pestanas[0].clone(), chrono::Local::now().date_naive(), 60, None, self.ejecucion.pausa);
+                                self.conjunta.lanzar(ui.ctx(), puente.clone(), self.piloto.conexion(puente), PathBuf::from(&self.ejecucion.destino), self.lote.tribunales.clone(), self.lote.modalidades.clone(), self.lote.pestanas[0].clone(), chrono::Local::now().date_naive(), 60, None, self.ejecucion.pausa);
                             }
                         }
                         if ui.add_enabled(!ejecutando && conectado, egui::Button::new("Retomar flujo…")).clicked() {
                             if let (Some(carpeta), Some(puente)) = (rfd::FileDialog::new().set_title("Elegir carpeta de descarga conjunta").pick_folder(), self.conexion.puente.clone()) {
-                                if let Err(error) = self.conjunta.retomar(ui.ctx(), puente, carpeta, self.ejecucion.pausa) { self.conjunta.mensajes.push(error); }
+                                if let Err(error) = self.conjunta.retomar(ui.ctx(), puente.clone(), self.piloto.conexion(puente), carpeta, self.ejecucion.pausa) { self.conjunta.mensajes.push(error); }
                             }
                         }
                         if let Some(cancelar) = &self.conjunta.cancelar {

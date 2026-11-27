@@ -1,6 +1,6 @@
 use crate::theme::Pal;
 use egui::{RichText, Ui};
-use flow_rust::descargador::{piloto, PlanLote, Puente};
+use flow_rust::descargador::{lote, multiventana, piloto, PlanLote, Puente};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -15,6 +15,7 @@ enum Mensaje {
 #[derive(Default)]
 pub struct Piloto {
     adicionales: [Option<Arc<Puente>>; 2],
+    usar_tres: bool,
     recepcion: Option<mpsc::Receiver<Mensaje>>,
     cancelar: Option<Arc<AtomicBool>>,
     avance: [String; piloto::PESTANAS],
@@ -112,6 +113,57 @@ impl Piloto {
         });
     }
 
+    pub fn conexion(&self, principal: Arc<Puente>) -> Arc<dyn lote::Conexion + Send + Sync> {
+        match (&self.adicionales, self.usar_tres) {
+            ([Some(dos), Some(tres)], true) => Arc::new(multiventana::Conexion {
+                principal,
+                adicionales: [dos.clone(), tres.clone()],
+            }),
+            _ => principal,
+        }
+    }
+
+    pub fn mostrar_conexiones(&mut self, ui: &mut Ui, p: &Pal) {
+        let actual = self
+            .adicionales
+            .iter()
+            .flatten()
+            .filter(|p| p.conectado())
+            .count();
+        egui::CollapsingHeader::new("Descarga con tres pestañas")
+            .default_open(self.usar_tres)
+            .show(ui, |ui| {
+                ui.checkbox(&mut self.usar_tres, "Usar tres pestañas en las descargas");
+                ui.label("La pestaña 1 usa la conexión principal. Abre SITFA en otras dos pestañas y pega un código distinto en cada una. Extensión Integral 2.11.1 o posterior.");
+                ui.label("Los listados se reparten entre las conexiones. Las bitácoras, historia e histórico usan la sesión principal. Con PDF o filtros del formulario se usa la pestaña principal.");
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
+                for (i, extra) in self.adicionales.iter_mut().enumerate() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!("Pestaña {}", i + 2));
+                        if let Some(puente) = extra {
+                            if ui.button(format!("Copiar código {}", i + 2)).clicked() {
+                                ui.ctx().copy_text(puente.codigo_conexion());
+                            }
+                            ui.label(if puente.conectado() { "Conectada" } else { "Por conectar" });
+                            if ui.button(format!("Cerrar conexión {}", i + 2)).clicked() {
+                                puente.cerrar();
+                                *extra = None;
+                            }
+                        } else if ui.button(format!("Abrir conexión {}", i + 2)).clicked() {
+                            match Puente::abrir() {
+                                Ok(puente) => { *extra = Some(Arc::new(puente)); self.error = None; }
+                                Err(e) => self.error = Some(e),
+                            }
+                        }
+                    });
+                }
+                if let Some(e) = &self.error { ui.colored_label(p.red, e); }
+            });
+        if self.usar_tres && actual < 2 {
+            ui.colored_label(p.amber, "Conecta las pestañas 2 y 3 para repartir la descarga. Mientras tanto se usa la principal.");
+        }
+    }
+
     pub fn mostrar(
         &mut self,
         ui: &mut Ui,
@@ -123,7 +175,7 @@ impl Piloto {
         pausa: Duration,
     ) {
         egui::CollapsingHeader::new("Piloto · tres pestañas de Seguimiento").show(ui, |ui| {
-            ui.label("Recarga la extensión Integral 2.11.1. Abre Seguimiento en tres pestañas distintas y conecta un código por pestaña.");
+            ui.label("Abre Seguimiento en las tres pestañas y conéctalas desde «1. Conexión y Alcance».");
             ui.label("Usa el mismo alcance para ambas mediciones. El piloto usa la pausa indicada, JSON para consultas vacías y los filtros del lote.");
             ui.label(RichText::new("Si las pestañas comparten sesión de SITFA, compara las filas antes de usar el resultado.").color(p.muted));
             let activa = self.activo();
@@ -133,29 +185,6 @@ impl Piloto {
             } else {
                 ui.label("Pestaña 1 · conexión de Alcance");
             }
-            ui.ctx().request_repaint_after(Duration::from_millis(500));
-            ui.add_enabled_ui(!ocupado && !activa, |ui| {
-                for (i, extra) in self.adicionales.iter_mut().enumerate() {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(format!("Pestaña {}", i + 2));
-                        if let Some(puente) = extra {
-                            if ui.button(format!("Copiar código {}", i + 2)).clicked() {
-                                ui.ctx().copy_text(puente.codigo_conexion());
-                            }
-                            ui.label(if puente.conectado() { "Conectada" } else { "Por conectar" });
-                            if ui.button("Cerrar").clicked() {
-                                puente.cerrar();
-                                *extra = None;
-                            }
-                        } else if ui.button(format!("Abrir conexión {}", i + 2)).clicked() {
-                            match Puente::abrir() {
-                                Ok(puente) => *extra = Some(Arc::new(puente)),
-                                Err(e) => self.error = Some(e),
-                            }
-                        }
-                    });
-                }
-            });
             let alcanzable = plan.filter(|p| !p.consultas.is_empty());
             let extras: Vec<_> = self.adicionales.iter().flatten().filter(|p| p.conectado()).cloned().collect();
             let listo = !ocupado && !activa && principal.is_some() && alcanzable.is_some() && !destino.trim().is_empty();

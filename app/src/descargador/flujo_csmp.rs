@@ -104,7 +104,7 @@ pub fn reunir_fase(lotes: &[paquete::Lote], esperadas: &[Value], destino: &Path)
     Ok(carpeta)
 }
 
-fn copiar_original(origen: &Path, destino: &Path, indice: usize, item: &mut Value) -> Result<(), String> {
+pub(super) fn copiar_original(origen: &Path, destino: &Path, indice: usize, item: &mut Value) -> Result<(), String> {
     let bytes = paquete::comprobar(origen, item)?;
     let nombre = item["archivo"].as_str().ok_or("El manifiesto contiene una ruta fuera del lote.")?;
     let nuevo = format!("{indice:03}-{nombre}");

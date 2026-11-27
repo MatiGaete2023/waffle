@@ -16,6 +16,13 @@ Una entrada por encargo, de diez líneas como máximo, la más reciente arriba:
 
 No se copian salidas completas ni listas de mutaciones: la prueba afirma sus conteos y la CI del commit es la evidencia.
 
+## 2026-11-27 · Tres pestañas en el Descargador Integral
+- Cambió: Descarga con tres pestañas en el flujo habitual, incluidos listados, empaquetado, descarga conjunta y recuperación.
+- Reúne los listados en un lote estándar, valida alcance y huellas y conserva fases de respaldo, comprobantes y diagnósticos.
+- Contexto, PDFs y filtros privados mantienen la pestaña principal. Si falla la comprobación de conexiones auxiliares, el lote se ejecuta desde la principal.
+- Evidencia: prueba sintética de cinco pantallas, recuperación de un lote parcial y cotejo de tablas y cobertura del paquete.
+- Pendiente: CI del conjunto y prueba en SITFA real de las fases añadidas.
+
 ## 2026-11-27 · Piloto de tres pestañas
 - Cambió: comparación local de una y tres conexiones de Seguimiento, reparto de consultas completas y guardado de cada fase con su cobertura.
 - Evidencia: SITFA ficticio compara cuatro consultas en ambas corridas y detecta tres filas ausentes al retirar una página. La prevalidación rechaza dos códigos de la misma pestaña.
