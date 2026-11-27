@@ -447,7 +447,10 @@ impl Resultados {
             if self.parcial != antes && !self.carpeta.trim().is_empty() {
                 self.cargar(ui.ctx());
             }
-            if ui.add_enabled(!self.ocupado && carpeta_indice == self.ruta() && tipo == Some(Tipo::Conjunto), egui::Button::new("Ver descarga conjunta")).clicked() {
+            let piloto = self.indice.as_ref().and_then(|i| i.flujo.as_ref())
+                .is_some_and(|flujo| flujo["tipo"] == flow_rust::descargador::piloto::TIPO);
+            let boton = if piloto { "Ver medición del piloto" } else { "Ver descarga conjunta" };
+            if ui.add_enabled(!self.ocupado && carpeta_indice == self.ruta() && tipo == Some(Tipo::Conjunto), egui::Button::new(boton)).clicked() {
                 self.conjunta = true;
             }
         });
@@ -494,11 +497,19 @@ impl Resultados {
             let carpeta = self.ruta();
             let flujo = self.indice.as_ref().and_then(|i| i.flujo.clone());
             let mut abierta = self.conjunta;
-            egui::Window::new("Resultados · descarga conjunta CSMP").open(&mut abierta).show(ui.ctx(), |ui| {
+            let piloto = flujo.as_ref().is_some_and(|f| f["tipo"] == flow_rust::descargador::piloto::TIPO);
+            let titulo = if piloto { "Resultados · piloto de pestañas" } else { "Resultados · descarga conjunta CSMP" };
+            egui::Window::new(titulo).open(&mut abierta).show(ui.ctx(), |ui| {
                 if let Some(datos) = flujo {
                     ui.label(datos["estado"].as_str().unwrap_or("DESCONOCIDO"));
-                    ui.label(format!("{} completo · corte {} · informes del mes actual y siguiente", datos["seleccion"]["modo"].as_str().unwrap_or(""), datos["seleccion"]["corte"].as_str().unwrap_or("")));
-                    ui.label("La consulta de resoluciones firmadas se retiró de la descarga conjunta. No se acredita ausencia de movimientos.");
+                    if piloto {
+                        if let Ok(m) = serde_json::from_value::<flow_rust::descargador::piloto::Medidas>(datos["medidas"].clone()) {
+                            ui.label(format!("{} pestañas · {:.1} s · {} consultas · {} filas", m.pestanas, m.tiempo_ms as f64 / 1000.0, m.consultas, m.registros));
+                        }
+                    } else {
+                        ui.label(format!("{} completo · corte {} · informes del mes actual y siguiente", datos["seleccion"]["modo"].as_str().unwrap_or(""), datos["seleccion"]["corte"].as_str().unwrap_or("")));
+                        ui.label("La consulta de resoluciones firmadas se retiró de la descarga conjunta. No se acredita ausencia de movimientos.");
+                    }
                     if let Some(fases) = datos["fases"].as_object() {
                         for (nombre, fase) in fases {
                             if ui.button(format!("{} · {}", nombre, fase["estado"].as_str().unwrap_or(""))).clicked()
@@ -521,7 +532,7 @@ impl Resultados {
                         }
                     }
                     if ui.button("Abrir carpeta").clicked() { crate::ui::abrir_en_sistema(&carpeta); }
-                    if ui.button("Retomar pendientes").clicked() { flow_rust::descargador::flujo_csmp::solicitar_retomar(carpeta.clone()); }
+                    if !piloto && ui.button("Retomar pendientes").clicked() { flow_rust::descargador::flujo_csmp::solicitar_retomar(carpeta.clone()); }
                 }
             });
             self.conjunta = abierta;

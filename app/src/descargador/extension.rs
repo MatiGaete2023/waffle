@@ -184,7 +184,7 @@ mod tests {
     fn integral_incluye_extension_propia_y_manifest_actualizado() {
         let a = archivos(Edicion::Integral);
         let m: serde_json::Value = serde_json::from_slice(a.iter().find(|(n, _)| *n == "manifest.json").unwrap().1).unwrap();
-        assert_eq!(m["version"], "2.11.0");
+        assert_eq!(m["version"], "2.11.1");
         let js = std::str::from_utf8(a.iter().find(|(n, _)| *n == "pagina.js").unwrap().1).unwrap();
         assert!(js.contains("flow_rust_rapido") && js.contains("diaryIndex") && js.contains("search_and_download"));
         assert!(std::str::from_utf8(a.iter().find(|(n, _)| *n == "conexion.js").unwrap().1).unwrap().contains("Math.min(3"));
@@ -194,7 +194,7 @@ mod tests {
     fn instala_las_dos_ediciones_con_sus_versiones_y_es_idempotente() {
         let base = carpeta_temporal();
         assert!(matches!(version(Edicion::Lite).as_str(), "1.1.0" | "1.2.0"));
-        assert_eq!(version(Edicion::Integral), "2.11.0");
+        assert_eq!(version(Edicion::Integral), "2.11.1");
         let lite = instalar(Edicion::Lite, &base).unwrap();
         assert!(lite.ends_with("extension-lite"), "la carpeta es fija: no lleva la versión");
         assert!(lite.join("icons/icono128.png").is_file());
@@ -229,7 +229,7 @@ mod tests {
         std::fs::write(primera.carpeta.join("manifest.json"), manifest.to_string()).unwrap();
         let segunda = instalar_en_el_lugar(Edicion::Integral, &base).unwrap();
         assert_eq!(segunda.carpeta, primera.carpeta, "la carpeta no cambia");
-        assert_eq!(segunda.cambio, Cambio::Actualizada { de: "2.8.0".into(), a: "2.11.0".into() });
+        assert_eq!(segunda.cambio, Cambio::Actualizada { de: "2.8.0".into(), a: "2.11.1".into() });
         assert!(!segunda.carpeta.join("restos.js").exists());
         assert_eq!(instalar_en_el_lugar(Edicion::Integral, &base).unwrap().cambio, Cambio::SinCambios);
         let _ = std::fs::remove_dir_all(&base);

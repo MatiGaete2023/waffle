@@ -19,6 +19,7 @@ pub mod lote;
 pub mod meta4;
 pub mod excel;
 pub mod paquete;
+pub mod piloto;
 pub mod preferencias;
 pub mod resultados;
 mod puente;
@@ -145,7 +146,7 @@ impl Puente {
             integral
                 && matches!(
                     (version["flow_rust_version"].as_str(), version["flow_rust_rapido"].as_u64()),
-                    (Some("2.10.0"), Some(1)) | (Some("2.11.0"), Some(2))
+                    (Some("2.10.0"), Some(1)) | (Some("2.11.0" | "2.11.1"), Some(2))
                 ),
         );
         self.registrar_search_and_download(
@@ -160,8 +161,8 @@ pub(crate) fn comprobar_extension(edicion: Edicion, version: &serde_json::Value)
         Edicion::Integral => (
             "CSMP_RUS_CAPACIDADES",
             version["version"] == "2.9.0",
-            "2.11.0",
-            version["flow_rust_version"] == "2.11.0",
+            "2.11.1",
+            matches!(version["flow_rust_version"].as_str(), Some("2.11.0" | "2.11.1")),
             serde_json::json!({
                 "bitacoras_lectura": 1, "descarga_conjunta": 1, "pdf_seleccion": 1,
                 "pdf_copia_fija": 1, "calendario_lectura": 1, "historia_lectura": 1, "historico_lectura": 2,

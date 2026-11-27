@@ -34,8 +34,8 @@ async function sitfaTask(command, payload) {
     form.querySelector('#ExcelInformesPorVencer1,[name="ExcelInformesPorVencer1"]')?"calendario_informes":
     form.querySelector('#ExcelMedidasPorVencer1,[name="ExcelMedidasPorVencer1"]')?"calendario_medidas":null;
   if (!screen) return null;
-  // 2.9.0 es el contrato base de capacidades; el manifiesto de distribución es 2.11.0.
-  if(command==='capabilities') return {tipo:'CSMP_RUS_CAPACIDADES',version:'2.9.0',flow_rust_rapido:2,flow_rust_version:'2.11.0',
+  // 2.9.0 es el contrato base de capacidades; el manifiesto de distribución es 2.11.1.
+  if(command==='capabilities') return {tipo:'CSMP_RUS_CAPACIDADES',version:'2.9.0',flow_rust_rapido:2,flow_rust_version:'2.11.1',
     protocolos:{bitacoras_lectura:1,descarga_conjunta:1,pdf_seleccion:1,pdf_copia_fija:1,calendario_lectura:1,historia_lectura:1,historico_lectura:2,search_and_download:1},escritura_rus:false};
   const actions={seguimiento:"Buscar medida",litigantes:"Consulta Informe",calendario_informes:"Buscar Inf.",calendario_medidas:"Buscar",carga:"Aud.Carga Func.-"};
   const menus={seguimiento:"89",litigantes:"94",calendario_informes:"91",calendario_medidas:"90",carga:"29"};

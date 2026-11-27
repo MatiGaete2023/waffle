@@ -15,6 +15,12 @@ Los tres encargos se integraron sobre `a34eddb`. Falta confirmar la CI del conju
 
 La revisión posterior corrigió la persistencia de contactos durante trabajos en segundo plano, la compatibilidad de Lite con Chrome 1.1.0 y la habilitación de lecturas y registro de versión en Integral. Queda por validar el cambio de modo en descarga conjunta y la cancelación durante una descarga en curso.
 
+## Piloto de tres pestañas · Seguimiento
+
+En Descargador → Ejecución y Paquete → «Piloto · tres pestañas de Seguimiento», la extensión Integral 2.11.1 permite medir un mismo plan con una y con tres pestañas. Elige al menos tres consultas, abre Seguimiento en las tres pestañas y pega un código de conexión distinto en cada una. La primera usa la conexión de Alcance. Corre primero «Medir con una pestaña» y luego «Ejecutar con tres pestañas» con las mismas fechas, alcance y pausa. Pulsa «Comparar con la última medición de una pestaña». Cada medición se guarda como conjunto con las fases del lote.
+
+Se comparan todas las filas y su multiplicidad, los encabezados y el alcance. El tiempo se cuenta desde el inicio del lote, después de comprobar las conexiones. Las consultas vacías generan comprobante JSON. Una fase fallida detiene el piloto y conserva los archivos verificados. Pendiente medir con SITFA real, especialmente para pestañas que comparten sesión.
+
 ## Siguiente paso
 
 1. **Generar entrega `--release` en CI (`workflow_dispatch`, `entrega=true`):** lanzar el flujo `Flow Rust local · Windows` con `entrega=true` sobre `estudio/paridad-python-rust-20261119` para obtener el ejecutable `--release`, el instalador Inno Setup, las capturas de Windows y el contraste V1 con `rust/`.

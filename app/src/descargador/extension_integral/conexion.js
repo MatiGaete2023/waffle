@@ -80,7 +80,12 @@ async function inject(command,payload={}) {
   if (candidates.length!==1) throw failure("MULTIPLE_FORMS");
   if(candidates[0].result?.__sitfaError) throw Object.assign(failure(Object.hasOwn(messages,candidates[0].result.__sitfaError)?candidates[0].result.__sitfaError:"SITFA_TASK"),
     evidenceReasons.includes(candidates[0].result.motivo)?{motivo:candidates[0].result.motivo}:{});
-  frameId=candidates[0].frameId;return candidates[0].result;
+  const candidate=candidates[0];
+  frameId=candidate.frameId;
+  if (command==="capabilities" && payload.documento_piloto===true) {
+    return {...candidate.result, documento_piloto:candidate.documentId};
+  }
+  return candidate.result;
 }
 async function execute(command,payload={}) {
   if(!allowedCommands.has(command)) throw failure("SITFA_TASK");

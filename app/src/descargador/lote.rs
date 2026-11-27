@@ -445,7 +445,7 @@ pub fn guardar_exclusivo(ruta: &Path, datos: &[u8]) -> Result<(), String> {
 }
 
 /// Escritura atómica: temporal y reemplazo. `resumen.json` usa `resumen.tmp`; los manifiestos, `<nombre>.tmp`.
-fn escribir_json(carpeta: &Path, nombre: &str, valor: &Value) -> Result<(), String> {
+pub(super) fn escribir_json(carpeta: &Path, nombre: &str, valor: &Value) -> Result<(), String> {
     let temporal = match nombre.strip_suffix(".json").filter(|_| nombre == "resumen.json") {
         Some(raiz) => carpeta.join(format!("{raiz}.tmp")),
         None => carpeta.join(format!("{nombre}.tmp")),
@@ -499,7 +499,7 @@ fn pausa(duracion: Duration, cancelar: &AtomicBool, mensaje: &str) -> Result<(),
     cancelado(cancelar, mensaje)
 }
 
-fn carpeta_nueva(destino: &Path) -> Result<PathBuf, String> {
+pub(super) fn carpeta_nueva(destino: &Path) -> Result<PathBuf, String> {
     let ahora = chrono::Local::now();
     let mut carpeta = destino.join(ahora.format("%Y-%m-%d %H-%M-%S").to_string());
     if carpeta.exists() {

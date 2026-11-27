@@ -614,7 +614,7 @@ fn alcance_comparable(lote: &Lote) -> Result<String, String> {
     Ok(paquete::json_python(&json!([partes, lote.resumen.get("filtro_fecha").cloned().unwrap_or(Value::Null)]), true))
 }
 
-fn limpio(s: &Value) -> Value {
+pub(super) fn limpio(s: &Value) -> Value {
     let mut s = s.clone();
     if let Some(o) = s.as_object_mut() {
         for k in ["fecha_descarga", "tribunal_nombre", "modalidad_nombre"] {

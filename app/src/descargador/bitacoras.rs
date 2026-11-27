@@ -397,12 +397,12 @@ pub fn ejecutar_con_avance(
         super::comprobar_extension(Edicion::Integral, &version)?;
         // Una extensión antigua usa el contrato conservador, incluso si quedó marcada la preferencia rápida.
         let version_ext = version["flow_rust_version"].as_str().unwrap_or("");
-        let propia = matches!(version_ext, "2.10.0" | "2.11.0")
+        let propia = matches!(version_ext, "2.10.0" | "2.11.0" | "2.11.1")
             && version["flow_rust_rapido"].as_u64().is_some_and(|v| v >= 1);
         let config = if propia { opciones.rapido.limitado() } else { Rapido::default() };
         if opciones.rapido.activado && !propia {
             (s.avance)("warning", json!(
-                "Modo Rápido desactivado: Chrome aún usa la extensión 2.9.0. Pulsa «Instalar extensión…» y recárgala (2.11.0) en chrome://extensions."
+                "Modo Rápido desactivado: Chrome aún usa la extensión 2.9.0. Pulsa «Instalar extensión…» y recárgala (2.11.1) en chrome://extensions."
             ));
         }
         s.control_pausa.set(PausaAdaptativa::nueva(opciones.pausa, config));
@@ -1563,13 +1563,13 @@ mod tests {
             if n == "warning" { avisos29.borrow_mut().push(v.as_str().unwrap_or("").to_string()); }
         }).unwrap();
         assert_eq!(r29["estado"], "COMPLETA");
-        assert!(avisos29.borrow().iter().any(|a| a.contains("2.9.0") && a.contains("2.11.0")), "avisos: {:?}", avisos29.borrow());
+        assert!(avisos29.borrow().iter().any(|a| a.contains("2.9.0") && a.contains("2.11.1")), "avisos: {:?}", avisos29.borrow());
         // 2) Extensión 2.10.0 y 2.11.0 con Modo Rápido + calendarios activos: sin aviso 2.9.0 y registra su distribución.
-        for (ver, rapido_val, sub) in [("2.10.0", 1, "ext210"), ("2.11.0", 2, "ext211")] {
+        for (ver, rapido_val, sub) in [("2.10.0", 1, "ext210"), ("2.11.0", 2, "ext211"), ("2.11.1", 2, "ext2111")] {
             let mut pasos = caso["guion"].as_array().unwrap().clone();
             pasos[0]["respuesta"]["flow_rust_rapido"] = json!(rapido_val);
             pasos[0]["respuesta"]["flow_rust_version"] = json!(ver);
-            if ver == "2.11.0" {
+            if rapido_val == 2 {
                 pasos[0]["respuesta"]["protocolos"]["search_and_download"] = json!(1);
             }
             let dir = raiz.join(sub); std::fs::create_dir(&dir).unwrap();

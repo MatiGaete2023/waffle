@@ -16,6 +16,12 @@ Una entrada por encargo, de diez líneas como máximo, la más reciente arriba:
 
 No se copian salidas completas ni listas de mutaciones: la prueba afirma sus conteos y la CI del commit es la evidencia.
 
+## 2026-11-27 · Piloto de tres pestañas
+- Cambió: comparación local de una y tres conexiones de Seguimiento, reparto de consultas completas y guardado de cada fase con su cobertura.
+- Evidencia: SITFA ficticio compara cuatro consultas en ambas corridas y detecta tres filas ausentes al retirar una página. La prevalidación rechaza dos códigos de la misma pestaña.
+- Diferencia: el piloto usa JSON para consultas vacías, descarta filtros adicionales de formulario y requiere la extensión Integral 2.11.1 recargada.
+- Pendiente: CI y medición con SITFA real antes de adoptar la concurrencia en el flujo habitual.
+
 ## 2026-11-27 · Revisión DeepSeek de la Tanda 3
 - Correos: guardar borradores incorpora los contactos en el hilo de la interfaz y conserva las ediciones en curso.
 - SITFA Lite: se valida el contrato de la extensión 1.1.0 para activar el flujo compatible. Modo Registro conserva la pausa fija.

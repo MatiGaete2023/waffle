@@ -1,3 +1,5 @@
+mod piloto;
+
 use crate::descargador_resultados_ui::Resultados;
 use crate::theme::{self, Pal};
 use crate::util::parse_date_text;
@@ -52,6 +54,7 @@ pub struct Descargador {
     favorito_mensaje: Option<Result<String, String>>,
     resultados: Resultados,
     conjunta: FlujoConjunto,
+    piloto: piloto::Piloto,
     estaba_ejecutando: bool,
 }
 
@@ -1438,6 +1441,8 @@ impl Descargador {
     pub fn activo_barra(&self) -> Option<&'static str> {
         if self.ejecucion.flujo.activa() {
             Some("Creando paquete CSMP…")
+        } else if self.piloto.activo() {
+            Some("Piloto de pestañas en curso…")
         } else if self.ejecucion.activa() {
             Some("Descargando lote…")
         } else if self.ejecucion.contexto.activa() {
@@ -1452,8 +1457,9 @@ impl Descargador {
     pub fn mostrar(&mut self, ui: &mut Ui, p: &Pal) {
         self.ejecucion.recibir();
         self.conjunta.recibir();
+        self.piloto.recibir();
         if let Some(carpeta) = flow_rust::descargador::flujo_csmp::tomar_solicitud() {
-            if let Some(puente) = self.conexion.puente.clone().filter(|p| p.conectado() && self.conjunta.recepcion.is_none() && !self.ejecucion.activa() && !self.ejecucion.contexto.activa() && !self.ejecucion.flujo.activa()) {
+            if let Some(puente) = self.conexion.puente.clone().filter(|p| p.conectado() && self.conjunta.recepcion.is_none() && !self.piloto.activo() && !self.ejecucion.activa() && !self.ejecucion.contexto.activa() && !self.ejecucion.flujo.activa()) {
                 if let Err(error) = self.conjunta.retomar(ui.ctx(), puente, carpeta, self.ejecucion.pausa) { self.conjunta.mensajes.push(error); }
             } else {
                 self.conjunta.mensajes.push("Conecta Chrome y termina la operación actual antes de retomar un flujo.".into());
@@ -1462,7 +1468,7 @@ impl Descargador {
         if let Some(catalogo) = self.conexion.catalogo() {
             self.usar_catalogo(Some(catalogo), true);
         }
-        let ejecutando = self.ejecucion.activa() || self.ejecucion.contexto.activa() || self.ejecucion.flujo.activa() || self.conjunta.recepcion.is_some();
+        let ejecutando = self.ejecucion.activa() || self.ejecucion.contexto.activa() || self.ejecucion.flujo.activa() || self.conjunta.recepcion.is_some() || self.piloto.activo();
         if self.estaba_ejecutando && !ejecutando { self.resultados.invalidar_indice(); }
         self.estaba_ejecutando = ejecutando;
         self.resultados.solo_originales = self.edicion == Edicion::Lite;
@@ -1672,18 +1678,18 @@ impl Descargador {
                                     });
                                     if conectado && !ext_rapida {
                                         ui.label(
-                                            RichText::new("Aviso: Chrome sigue usando la extensión 2.9.0 y el Modo Rápido quedará desactivado. Pulsa «Instalar extensión…» y recárgala (2.11.0) en chrome://extensions.")
+                                            RichText::new("Aviso: Chrome sigue usando la extensión 2.9.0 y el Modo Rápido quedará desactivado. Pulsa «Instalar extensión…» y recárgala (2.11.1) en chrome://extensions.")
                                                 .color(p.amber)
                                                 .strong(),
                                         );
                                     } else if conectado && ext_rapida {
                                         ui.label(
-                                            RichText::new("Extensión Integral 2.11.0 activa · Modo Rápido listo.")
+                                            RichText::new("Extensión Integral con modo rápido activa · Modo Rápido listo.")
                                                 .color(p.green),
                                         );
                                     }
                                 }
-                                ui.label("Protección de sesión SITFA: aumenta la pausa ante lentitud real y reduce a una lectura ante fallas. Requiere la extensión Integral 2.11.0 recargada en Chrome.");
+                                ui.label("Protección de sesión SITFA: aumenta la pausa ante lentitud real y reduce a una lectura ante fallas. Usa la extensión Integral actualizada en Chrome.");
                             });
                             if previo != self.ejecucion.contexto.rapido {
                                 self.ejecucion.contexto.rapido = self.ejecucion.contexto.rapido.limitado();
@@ -1706,18 +1712,27 @@ impl Descargador {
                                 reutilizar: false,
                                 rapido: self.ejecucion.contexto.rapido,
                             };
-                            self.ejecucion.mostrar(
-                                ui,
-                                p,
-                                self.edicion,
-                                catalogo,
-                                plan,
-                                plan_visible,
-                                self.conexion.puente.clone(),
-                                self.catalogo_remoto,
-                                &self.lote,
-                                opciones_paquete,
-                            );
+                            ui.add_enabled_ui(!self.piloto.activo() && self.conjunta.recepcion.is_none(), |ui| {
+                                self.ejecucion.mostrar(
+                                    ui,
+                                    p,
+                                    self.edicion,
+                                    catalogo,
+                                    plan,
+                                    plan_visible,
+                                    self.conexion.puente.clone(),
+                                    self.catalogo_remoto,
+                                    &self.lote,
+                                    opciones_paquete,
+                                );
+                            });
+                            if self.edicion == Edicion::Integral && seguimiento {
+                                let ocupado = self.ejecucion.activa() || self.ejecucion.contexto.activa()
+                                    || self.ejecucion.flujo.activa() || self.conjunta.recepcion.is_some();
+                                let pausa = Duration::from_secs_f64(preferencias::limitar_pausa(f64::from(self.ejecucion.pausa)));
+                                self.piloto.mostrar(ui, p, self.conexion.puente.clone(), plan_visible, ocupado,
+                                    &self.ejecucion.destino, pausa);
+                            }
                         });
                         ui.add_space(8.0);
                     }
@@ -1761,7 +1776,7 @@ impl Descargador {
                 });
             }
         }
-        self.estaba_ejecutando |= self.ejecucion.activa() || self.ejecucion.contexto.activa() || self.ejecucion.flujo.activa() || self.conjunta.recepcion.is_some();
+        self.estaba_ejecutando |= self.ejecucion.activa() || self.ejecucion.contexto.activa() || self.ejecucion.flujo.activa() || self.conjunta.recepcion.is_some() || self.piloto.activo();
     }
 
     fn mostrar_perfiles(&mut self, ui: &mut Ui, p: &Pal) {
